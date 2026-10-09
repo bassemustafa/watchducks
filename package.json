@@ -1,0 +1,16 @@
+{
+  "name": "watchducks",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude Code mod: a flock of spy ducks watching your delegated work.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "validate": "claude plugin validate .",
+    "test": "claude plugin test ."
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

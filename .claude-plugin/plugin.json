@@ -1,0 +1,10 @@
+{
+  "name": "watchducks",
+  "version": "0.1.0",
+  "description": "A flock of spy ducks watching your delegated work: every subagent, relay and background run from this session with tokens, cache, cost, model, effort and reviews.",
+  "author": { "name": "bassemustafa", "url": "https://github.com/bassemustafa" },
+  "homepage": "https://github.com/bassemustafa/watchducks",
+  "repository": "https://github.com/bassemustafa/watchducks",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
