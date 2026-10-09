@@ -2,9 +2,86 @@
   "name": "watchducks",
   "version": "0.1.0",
   "description": "A flock of spy ducks watching your delegated work: every subagent, relay and background run from this session with tokens, cache, cost, model, effort and reviews.",
-  "author": { "name": "bassemustafa", "url": "https://github.com/bassemustafa" },
+  "author": {
+    "name": "bassemustafa",
+    "url": "https://github.com/bassemustafa"
+  },
   "homepage": "https://github.com/bassemustafa/watchducks",
   "repository": "https://github.com/bassemustafa/watchducks",
   "license": "MIT",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "glyphs": {
+      "type": "string",
+      "title": "Glyphs",
+      "description": "emoji draws the duck and status dots as emoji; ascii uses >o) and * + x ~ ? for terminals that draw emoji at the wrong width",
+      "default": "emoji",
+      "options": [
+        "emoji",
+        "ascii"
+      ]
+    },
+    "motion": {
+      "type": "string",
+      "title": "Motion",
+      "description": "Animate the radar and status pulses",
+      "default": "on",
+      "options": [
+        "on",
+        "off"
+      ]
+    },
+    "autoOpen": {
+      "type": "string",
+      "title": "Auto-open sidebar",
+      "description": "Open the sidebar beside a fullscreen transcript when the first operative deploys",
+      "default": "on",
+      "options": [
+        "on",
+        "off"
+      ]
+    },
+    "notify": {
+      "type": "string",
+      "title": "Toasts",
+      "description": "Show a toast (codename only) when an operative finishes",
+      "default": "off",
+      "options": [
+        "on",
+        "off"
+      ]
+    },
+    "relayRoots": {
+      "type": "string",
+      "title": "Extra relay roots",
+      "description": "Extra directories (separated by the platform path-list separator) where relay --out-dir folders may live; the temp dir and the session root are always allowed",
+      "default": ""
+    },
+    "priceOverrides": {
+      "type": "string",
+      "title": "Price overrides",
+      "description": "JSON object: { \"<model>\": { \"input\": n, \"output\": n, \"cacheRead\": n, \"cacheWrite\": n } } in USD per million tokens",
+      "default": ""
+    },
+    "recordHeadless": {
+      "type": "string",
+      "title": "Record headless sessions",
+      "description": "Write history from headless sessions (claude -p); off avoids double counting relay children",
+      "default": "off",
+      "options": [
+        "on",
+        "off"
+      ]
+    },
+    "showEngineOverhead": {
+      "type": "string",
+      "title": "Show engine overhead",
+      "description": "Show usage of the engine's own loops (compaction, memory) as one line",
+      "default": "off",
+      "options": [
+        "on",
+        "off"
+      ]
+    }
+  }
 }
