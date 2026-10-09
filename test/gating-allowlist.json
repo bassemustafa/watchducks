@@ -1,0 +1,62 @@
+[
+  {
+    "module": "./register.tsx",
+    "pattern": "agent.spawn",
+    "hook": "agent.spawn",
+    "hasCatch": true
+  },
+  {
+    "module": "./register.tsx",
+    "pattern": "classic.Stop",
+    "hook": "classic.Stop",
+    "hasCatch": true
+  },
+  {
+    "module": "./register.tsx",
+    "pattern": "classic.SubagentStop",
+    "hook": "classic.SubagentStop",
+    "hasCatch": true
+  },
+  {
+    "module": "./register.tsx",
+    "pattern": "tool.call",
+    "hook": "tool.call{tool=Bash}",
+    "hasCatch": true
+  },
+  {
+    "module": "./register.tsx",
+    "pattern": "tool.call",
+    "hook": "tool.call{tool=Edit}",
+    "hasCatch": true
+  },
+  {
+    "module": "./register.tsx",
+    "pattern": "tool.call",
+    "hook": "tool.call{tool=NotebookEdit}",
+    "hasCatch": true
+  },
+  {
+    "module": "./register.tsx",
+    "pattern": "tool.call",
+    "hook": "tool.call{tool=ReportFindings}",
+    "hasCatch": true
+  },
+  {
+    "module": "./register.tsx",
+    "pattern": "tool.call",
+    "hook": "tool.call{tool=Write}",
+    "hasCatch": true
+  },
+  {
+    "module": "./register.tsx",
+    "pattern": "tool.call",
+    "hook": "tool.call{tool=mcp__watchducks__roster}",
+    "hasCatch": true
+  },
+  {
+    "module": "./register.tsx",
+    "pattern": "tool.call",
+    "hook": "tool.call{tool=mcp__watchducks__verdict}",
+    "hasCatch": true
+  }
+]

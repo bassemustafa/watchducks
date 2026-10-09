@@ -313,8 +313,8 @@ function reduceBgSnapshot(ledger: Ledger, a: Extract<Action, { type: 'bgSnapshot
   for (const [taskId, runId] of Object.entries(ledger.bgSeen)) {
     const run = getRun(ledger, runId)
     if (!run || run.status !== 'running' || present.has(taskId)) continue
-    // a relay with an out-dir waits for its result.json (the collector bounds the wait)
-    if (run.kind === 'relay' && run.outDir !== undefined) continue
+    // gone from the snapshot: returned, outcome unknown; a relay's result.json
+    // (read for a grace period after endedAt) can still give the real status
     changed.push(finish(run, 'ended', a.at))
   }
   if (changed.length === 0) return ledger

@@ -1,11 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
-import type { HistoryRecord, Ledger } from '../types'
+import type { HistoryRecord, Ledger, RelayProjection } from '../types'
+import { RELAY_POLL_MS, allowedRoots, duePolls, relayRoots, resultPath } from './collect/relay'
 import { HISTORY_PREFIX, pruneHistory, recordFromLedger } from './history'
 import { emptyLedger, isKnownLoop, reduce, type Action } from './ledger'
 import type { PriceTable } from './price'
+import { MAX_RESULT_BYTES, isInsideRoots, projectRelayResult } from './relay-result'
 import { INITIAL_LEDGER, isHistoryRecord, recordsHeadless } from './state'
+import { ROSTER_SPEC, VERDICT_SPEC } from './tools'
 
 const ledgerAtom = atom({ plugin: 'watchducks', key: 'ledger' } as const, INITIAL_LEDGER)
 
@@ -20,13 +23,19 @@ const SAVE_MS = 60_000
 
 let agentTimer: Timer | undefined
 let saveTimer: Timer | undefined
+let relayTimer: Timer | undefined
 let pollingAgents = false
+let pollingRelays = false
+/** Relay runs whose result.json was already read: the 120 s grace window must not read it again. */
+const relaysRead = new Set<string>()
 
 function stopTimers(): void {
   agentTimer?.cancel()
   saveTimer?.cancel()
+  relayTimer?.cancel()
   agentTimer = undefined
   saveTimer = undefined
+  relayTimer = undefined
 }
 
 async function send($: EngineInterface, action: Action, table: PriceTable): Promise<void> {
@@ -101,6 +110,81 @@ async function pollAgents($: EngineInterface, table: PriceTable): Promise<void> 
   }
 }
 
+/** The relay roots, each resolved to where it really lands; a root that cannot be resolved is skipped. */
+async function resolvedRoots($: EngineInterface, options: PluginOptions): Promise<string[]> {
+  let tmpDir = '/tmp'
+  try {
+    const dir = await $.env.get('TMPDIR')
+    if (dir !== undefined && dir !== '') tmpDir = dir
+  } catch {
+    // the fixed /tmp root still applies
+  }
+  let sessionRoot = ''
+  try {
+    sessionRoot = await $.session.root()
+  } catch {
+    // no session root: only the temp roots and the option apply
+  }
+  const resolved: string[] = []
+  for (const root of relayRoots(options, tmpDir, sessionRoot)) {
+    try {
+      const stat = await $.fs.stat(root, { resolve: true })
+      if (stat.realPath !== undefined) resolved.push(stat.realPath)
+    } catch {
+      // a root that is not there allows nothing
+    }
+  }
+  return allowedRoots(resolved)
+}
+
+/** Null unless result.json is a regular file within the size cap whose real path sits under a root. */
+// A result.json older than the run (a reused --out-dir) belongs to an earlier run.
+const STALE_SLACK_MS = 5000
+
+async function readRelayResult(
+  $: EngineInterface,
+  outDir: string,
+  startedAt: number,
+  roots: readonly string[],
+): Promise<RelayProjection | null> {
+  const stat = await $.fs.stat(resultPath(outDir), { resolve: true })
+  if (stat.kind !== 'file' || stat.size > MAX_RESULT_BYTES) return null
+  if (stat.mtimeMs < startedAt - STALE_SLACK_MS) return null
+  const realPath = stat.realPath
+  if (realPath === undefined || !isInsideRoots(realPath, roots)) return null
+  // the text lives only for this projection: nothing but the allow-listed fields leaves it
+  return projectRelayResult(await $.fs.read(realPath))
+}
+
+async function pollRelays($: EngineInterface, table: PriceTable, options: PluginOptions): Promise<void> {
+  if (pollingRelays) return
+  pollingRelays = true
+  try {
+    const seen = await read($, ledgerAtom)
+    const due = duePolls(seen, Date.now()).filter(id => !relaysRead.has(id))
+    if (due.length === 0) return
+    const roots = await resolvedRoots($, options)
+    for (const id of due) {
+      const run = Object.hasOwn(seen.runs, id) ? seen.runs[id] : undefined
+      if (run?.outDir === undefined) continue
+      try {
+        const projection = await readRelayResult($, run.outDir, run.startedAt, roots)
+        if (!projection) continue
+        // a /clear or a session change while the read was pending: the result belongs to the old ledger
+        if ((await read($, ledgerAtom)).generation !== seen.generation) return
+        await send($, { type: 'relayResult', id, proj: projection, at: Date.now() }, table)
+        relaysRead.add(id)
+      } catch {
+        // not there yet, unreadable or hostile: the run keeps its status and the next tick tries again
+      }
+    }
+  } catch {
+    // the next tick tries again
+  } finally {
+    pollingRelays = false
+  }
+}
+
 async function saveWhileActive($: EngineInterface, options: PluginOptions): Promise<void> {
   try {
     const l = await read($, ledgerAtom)
@@ -119,6 +203,16 @@ export function registerLifecycle(on: On, table: PriceTable, options: PluginOpti
       // the collectors still work without the command
     }
     try {
+      await $.tool.register(ROSTER_SPEC)
+    } catch {
+      // the model just has no roster tool
+    }
+    try {
+      await $.tool.register(VERDICT_SPEC)
+    } catch {
+      // the model just has no verdict tool
+    }
+    try {
       const id = await $.session.id()
       const now = Date.now()
       // same id: a hot reload, keep the ledger; another id: a new session
@@ -131,6 +225,7 @@ export function registerLifecycle(on: On, table: PriceTable, options: PluginOpti
       stopTimers()
       agentTimer = $.clock.every(AGENT_POLL_MS, () => void pollAgents($, table))
       saveTimer = $.clock.every(SAVE_MS, () => void saveWhileActive($, options))
+      relayTimer = $.clock.every(RELAY_POLL_MS, () => void pollRelays($, table, options))
     } catch {
       // the collectors still work without the timers
     }

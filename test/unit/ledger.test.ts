@@ -76,7 +76,7 @@ test('a foreground shell command is removed when its result arrives', () => {
   expect(l.order).not.toContain('bash:tu1')
 })
 
-test('background relay with out-dir waits for its result; background cli ends on an empty snapshot', () => {
+test('background runs gone from a snapshot are ended; a relay result then gives the real status', () => {
   let l = apply(emptyLedger('s1', T0),
     { type: 'bashStart', id: 'bash:tu2', cls: { kind: 'relay', implementer: 'opencode', readOnly: true, outDir: '/tmp/o1' }, at: T0 },
     { type: 'bashStart', id: 'bash:tu3', cls: { kind: 'cli', implementer: 'codex' }, at: T0 },
@@ -86,9 +86,12 @@ test('background relay with out-dir waits for its result; background cli ends on
   expect(l.runs['bash:tu2']!.status).toBe('running')
   expect(l.runs['bash:tu3']!.status).toBe('running')
   l = reduce(l, { type: 'bgSnapshot', taskIds: [], at: T0 + 3 }, PRICES)
-  expect(l.runs['bash:tu2']!.status).toBe('running')
+  expect(l.runs['bash:tu2']!.status).toBe('ended')
+  expect(l.runs['bash:tu2']!.endedAt).toBe(T0 + 3)
   expect(l.runs['bash:tu3']!.status).toBe('ended')
   expect(l.runs['bash:tu3']!.endedAt).toBe(T0 + 3)
+  l = reduce(l, { type: 'relayResult', id: 'bash:tu2', proj: { status: 'done', readOnly: true, costReported: 0, usage: null, touchedFiles: 0 }, at: T0 + 4 }, PRICES)
+  expect(l.runs['bash:tu2']!.status).toBe('done')
 })
 
 test('a relay result with costReported 0 gives cost 0 from the report', () => {
