@@ -40,12 +40,15 @@ function memoryStore(on: On): Map<string, unknown> {
 }
 
 // The world beneath the plugin for a session: ids, surfaces, a store and a clock.
-function world(on: On, surfaces: readonly string[], sessionId: () => string = () => 'S1') {
+function world(on: On, surfaces: readonly string[], sessionId: () => string = () => 'S1', surfacesGate: () => Promise<void> = async () => {}) {
   on('command.register', async () => ({ value: { command: 'flock' } }))
   on('tool.register', async () => ({ value: { tool: 'mcp__watchducks__x' } }))
   on('session.id', async () => ({ value: sessionId() }))
   on('session.root', async () => ({ value: '/work' }))
-  on('session.surfaces', async () => ({ value: surfaces as never }))
+  on('session.surfaces', async () => {
+    await surfacesGate()
+    return { value: surfaces as never }
+  })
   on('session.start', async ($, e) => ({ cwd: e.cwd }))
   on('session.end', async () => ({ sessionId: 'S1' }))
   on('agent.spawn', async () => ({ model: 'claude-sonnet-5-5', agentId: 'l1' }))
@@ -144,6 +147,83 @@ test('a run that ends is saved to history within 2.5 s, not at the next minute t
   const record = store.get('history/v1/S1') as { days: Record<string, Record<string, { ops: number; done: number }>> }
   const counted = Object.values(record.days).flatMap(d => Object.values(d)).reduce((n, c) => n + c.done, 0)
   expect(counted).toBe(1)
+})
+
+type Counted = { done: number; vetted: number; bugs: number }
+
+function counted(value: unknown): Counted {
+  const record = value as { days: Record<string, Record<string, Counted>> }
+  const sum: Counted = { done: 0, vetted: 0, bugs: 0 }
+  for (const bucket of Object.values(record.days)) {
+    for (const c of Object.values(bucket)) {
+      sum.done += c.done
+      sum.vetted += c.vetted
+      sum.bugs += c.bugs
+    }
+  }
+  return sum
+}
+
+test('a verdict, then a replaced verdict, on a run that is already done are each saved within 2.5 s', async ($, on) => {
+  const ledger = watchLedger(on)
+  const { store, clock } = world(on, ['terminal'])
+  on('turn.complete', async () => ({ text: '' }))
+  await $.session.start(START)
+  await $.agent.spawn({ subagentType: 'Explore' } as never)
+  await $.turn.complete({ agentId: 'l1', turnId: 't1', reason: 'answer', answer: '', durationMs: 1, isAborted: false } as never)
+  await clock.advance(500) // the watch tick sees the run done and schedules one write
+  await clock.advance(2100)
+  expect(counted(store.get('history/v1/S1'))).toEqual({ done: 1, vetted: 0, bugs: 0 })
+
+  const code = ledger().runs['l1']!.codename
+  await $.tool.call({ tool: 'mcp__watchducks__verdict', target: code, bugs: 2 } as never)
+  await clock.advance(500)
+  await clock.advance(2100)
+  expect(counted(store.get('history/v1/S1'))).toEqual({ done: 1, vetted: 1, bugs: 2 })
+
+  // the same reviewer again: the review count stays 1, only the bug count moves
+  await $.tool.call({ tool: 'mcp__watchducks__verdict', target: code, bugs: 5 } as never)
+  await clock.advance(500)
+  await clock.advance(2100)
+  expect(counted(store.get('history/v1/S1'))).toEqual({ done: 1, vetted: 1, bugs: 5 })
+})
+
+test('history saves never overlap: a change during a save is saved right after it', async ($, on) => {
+  const ledger = watchLedger(on)
+  let active = 0
+  let maxActive = 0
+  let calls = 0
+  const waiting: Array<() => void> = []
+  const gate = async (): Promise<void> => {
+    calls += 1
+    active += 1
+    maxActive = Math.max(maxActive, active)
+    await new Promise<void>(resolve => waiting.push(resolve))
+    active -= 1
+  }
+  const { store, clock } = world(on, ['terminal'], () => 'S1', gate)
+  on('turn.complete', async () => ({ text: '' }))
+  await $.session.start(START)
+  await $.agent.spawn({ subagentType: 'Explore' } as never)
+  await clock.advance(500)
+  await clock.advance(2100) // the first save starts and waits on the surfaces answer
+  expect(calls).toBe(1)
+
+  await $.turn.complete({ agentId: 'l1', turnId: 't1', reason: 'answer', answer: '', durationMs: 1, isAborted: false } as never)
+  await clock.advance(500)
+  await clock.advance(2100)
+  await $.tool.call({ tool: 'mcp__watchducks__verdict', target: ledger().runs['l1']!.codename, bugs: 1 } as never)
+  await clock.advance(500)
+  await clock.advance(2100)
+  expect(maxActive).toBe(1)
+
+  for (let i = 0; i < 10; i++) {
+    while (waiting.length > 0) waiting.shift()!()
+    await clock.advance(2100)
+  }
+  expect(maxActive).toBe(1)
+  expect(calls).toBeGreaterThan(1)
+  expect(counted(store.get('history/v1/S1'))).toEqual({ done: 1, vetted: 1, bugs: 1 })
 })
 
 test('a new session id resets the UI atom; a same-id reload leaves it', async ($, on) => {

@@ -45,7 +45,10 @@ function addRun(c: Counters, run: Run): void {
   if (run.cost !== null) c.costOps += 1
   if (run.cost !== null && run.costSource === 'reported') c.costReported += run.cost
   else if (run.cost !== null && run.costSource === 'estimated') c.costEstimated += run.cost
-  else if (run.cost === null && (run.kind === 'agent' || run.kind === 'relay')) c.unknownCostOps += 1
+  else if (run.cost === null && (run.kind === 'agent' || (run.kind === 'relay' && run.implementer !== 'codex' && run.outDir !== undefined))) {
+    // a codex relay, or one without an out dir, can never report a cost (as in runCost)
+    c.unknownCostOps += 1
+  }
   if (run.reviews.length > 0) c.vetted += 1
   c.bugs += run.bugsReported
   for (const review of run.reviews) c.bugs += review.bugs ?? 0
@@ -80,6 +83,14 @@ function rowsFromBuckets(buckets: ReadonlyMap<string, Counters>): StationRow[] {
       b.ops - a.ops ||
       (a.implementer + '|' + a.model < b.implementer + '|' + b.model ? -1 : 1),
   )
+}
+
+/** A copy of `days` without the day buckets older than the 30-day window ending at `nowMs`. */
+export function dropOldDays(days: HistoryRecord['days'], nowMs: number): HistoryRecord['days'] {
+  const cutoff = utcDay(nowMs - HISTORY_DAYS * DAY_MS)
+  const out: HistoryRecord['days'] = {}
+  for (const [day, byKey] of Object.entries(days)) if (day >= cutoff) out[day] = byKey
+  return out
 }
 
 /** A copy of `days` with every run added by its UTC end day and implementer × model bucket; the input is not changed. */
@@ -127,11 +138,13 @@ export function aggregateHistory(records: readonly HistoryRecord[], nowMs: numbe
         if (key.indexOf('|') < 0) continue
         let c = buckets.get(key)
         if (!c) buckets.set(key, (c = emptyCounters()))
-        // a record written before usageOps / costOps existed counts every op as known
-        for (const k of COUNTER_KEYS) {
-          const v = counters[k]
-          c[k] += num(v === undefined && (k === 'usageOps' || k === 'costOps') ? counters.ops : v)
+        for (const k of COUNTER_KEYS) c[k] += num(counters[k])
+        // a record written before usageOps / costOps existed: its ops count as measured only when
+        // the bucket carries any tokens or cost (an all-zero bucket is raw-CLI ops with no measurement)
+        if (counters.usageOps === undefined && num(counters.uncached) + num(counters.output) + num(counters.cacheRead) + num(counters.cacheWrite) > 0) {
+          c.usageOps += num(counters.ops)
         }
+        if (counters.costOps === undefined && num(counters.costReported) + num(counters.costEstimated) > 0) c.costOps += num(counters.ops)
       }
     }
   }

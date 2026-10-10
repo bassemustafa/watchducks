@@ -64,13 +64,16 @@ async function isHeadless($: EngineInterface): Promise<boolean> {
   }
 }
 
-async function writeHistory($: EngineInterface, ledger: Ledger, options: PluginOptions): Promise<void> {
-  if (ledger.sessionId === '') return
+/** True when the record is stored, or when policy says there is nothing to store; false when the write failed. */
+async function writeHistory($: EngineInterface, ledger: Ledger, options: PluginOptions): Promise<boolean> {
+  if (ledger.sessionId === '') return true
   try {
-    if ((await isHeadless($)) && !recordsHeadless(options)) return
+    if ((await isHeadless($)) && !recordsHeadless(options)) return true
     await $.store.set(HISTORY_PREFIX + ledger.sessionId, recordFromLedger(ledger))
+    return true
   } catch {
     // history is best effort: a failed write must never reach a hook
+    return false
   }
 }
 
@@ -204,7 +207,7 @@ async function saveWhileActive($: EngineInterface, options: PluginOptions): Prom
   try {
     const l = await read($, ledgerAtom)
     if (!l.order.some(id => l.runs[id]?.status === 'running')) return
-    await writeHistory($, l, options)
+    await saveHistory($, options, true)
   } catch {
     // best effort
   }
@@ -229,23 +232,31 @@ let watchCount = 0
 let seenGeneration = -1
 let seenSession = ''
 const seenStatus = new Map<string, string>()
-const seenReviews = new Map<string, number>()
 let historyPending = false
+// history saves run one at a time; a change that arrives while one is in flight is saved right after it
+let saving = false
+let dirtyAgain = false
+// what the last successful save stored; a hot reload drops it, so the first watch tick saves once
+let savedSignature: string | undefined
 
 function seed(l: Ledger): void {
   seenGeneration = l.generation
   seenSession = l.sessionId
   seenStatus.clear()
-  seenReviews.clear()
   for (const id of l.order) {
     const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
     if (!run) continue
     seenStatus.set(id, run.status)
-    seenReviews.set(id, run.reviews.length)
   }
 }
 
-/** One history write at most every 2 s: a run that ended or was reviewed between the 60 s saves is kept at once. */
+/** The session id and the record's day buckets (counts only): it changes whenever the stored record would. */
+function historySignature(l: Ledger): { signature: string; empty: boolean } {
+  const days = JSON.stringify(recordFromLedger(l).days)
+  return { signature: `${l.sessionId}|${days}`, empty: days === '{}' }
+}
+
+/** One history write at most every 2 s: a run that ended, got usage or cost, or was reviewed between the 60 s saves is kept at once. */
 function scheduleHistoryWrite($: EngineInterface, options: PluginOptions): void {
   if (historyPending) return
   historyPending = true
@@ -254,10 +265,30 @@ function scheduleHistoryWrite($: EngineInterface, options: PluginOptions): void 
 
 async function flushHistory($: EngineInterface, options: PluginOptions): Promise<void> {
   historyPending = false
+  await saveHistory($, options, false)
+}
+
+/** Saves never overlap; `force` writes even when the record is unchanged since the last save. */
+async function saveHistory($: EngineInterface, options: PluginOptions, force: boolean): Promise<void> {
+  if (saving) {
+    dirtyAgain = true
+    return
+  }
+  saving = true
   try {
-    await writeHistory($, await read($, ledgerAtom), options)
+    const ledger = await read($, ledgerAtom)
+    const { signature } = historySignature(ledger)
+    if (force || signature !== savedSignature) {
+      if (await writeHistory($, ledger, options)) savedSignature = signature
+    }
   } catch {
     // best effort
+  } finally {
+    saving = false
+    if (dirtyAgain) {
+      dirtyAgain = false
+      scheduleHistoryWrite($, options)
+    }
   }
 }
 
@@ -307,18 +338,12 @@ async function watchTick($: EngineInterface, options: PluginOptions): Promise<vo
     if (l.generation !== seenGeneration || l.sessionId !== seenSession) {
       seed(l)
     } else {
-      let dirty = false
       for (const id of l.order) {
         const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
         if (!run) continue
-        const reviews = run.reviews.length
-        const seenCount = seenReviews.get(id)
-        seenReviews.set(id, reviews)
-        if (seenCount !== undefined && seenCount !== reviews) dirty = true
         const before = seenStatus.get(id)
         if (before === run.status) continue
         seenStatus.set(id, run.status)
-        if (run.status !== 'running') dirty = true
         if (run.status === 'done') {
           await update($, uiAtom, u => ({ ...u, stamp: { runId: id, until: now + STAMP_MS } }))
           $.clock.after(STAMP_MS, () => void clearStamp($, id))
@@ -327,8 +352,11 @@ async function watchTick($: EngineInterface, options: PluginOptions): Promise<vo
           $.ui.toast(`${g.duck} ${run.codename} ${statusWords(run.status).spy.toLowerCase()} · ${fmtCost(run.cost, run.costSource, run.costPartial)}`)
         }
       }
-      if (dirty) scheduleHistoryWrite($, options)
     }
+
+    // any change to the stored record (a status, relay usage or cost arriving late, a replaced verdict) schedules one save
+    const history = historySignature(l)
+    if (!history.empty && history.signature !== savedSignature) scheduleHistoryWrite($, options)
 
     const running = l.order.some(id => l.runs[id]?.status === 'running')
     radar.blips = blipsFor(l)
@@ -397,6 +425,7 @@ export function registerLifecycle(on: On, table: PriceTable, options: PluginOpti
       if (newSession) await update($, uiAtom, () => INITIAL_UI)
       await pruneStoredHistory($, now)
       stopTimers()
+      savedSignature = undefined // nothing is known to be stored yet: the first watch tick saves once
       agentTimer = $.clock.every(AGENT_POLL_MS, () => void pollAgents($, table))
       saveTimer = $.clock.every(SAVE_MS, () => void saveWhileActive($, options))
       relayTimer = $.clock.every(RELAY_POLL_MS, () => void pollRelays($, table, options))

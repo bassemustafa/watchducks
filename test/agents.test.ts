@@ -180,3 +180,32 @@ test('a finished agent runs again as its next request starts, before the stream 
   await stream
   expect(ledger().runs['a1']!.usage).toEqual({ uncached: 1000, output: 100, cacheRead: 0, cacheWrite: 0 })
 })
+
+test('an adopted agent is adopted again after /flock clear removed its run', async ($, on) => {
+  const ledger = watchLedger(on)
+  on('agent.list', async () => ({ value: [{ id: 'f9', description: '', type: 'skill', status: 'running' }] as never }))
+  on('session.id', async () => ({ value: 'S2' }))
+  on('session.surfaces', async () => ({ value: ['terminal'] }))
+  on('session.end', async () => ({ sessionId: 'S1' }))
+  on('store.keys', async () => ({ value: [] }))
+  // the answer names the step it answers for
+  on('turn.step', async function* ($, e) {
+    return { ...(STEP_RESULT as object), turnId: e.turnId, index: e.index } as never
+  })
+  mock.clock(on)
+  const step = async (turnId: string): Promise<void> => {
+    for await (const _ of $.turn.step({ agentId: 'f9', turnId, index: 0, model: 'claude-sonnet-5-5' } as never)) {
+      /* chunks are never read */
+    }
+  }
+  await step('t1')
+  expect(ledger().runs['f9']!.usage).toEqual({ uncached: 1000, output: 100, cacheRead: 0, cacheWrite: 0 })
+  const before = ledger().generation
+  await $.session.end({ reason: 'clear', sessionId: 'S1', resume: { id: 'S1' } })
+  expect(ledger().generation).toBe(before + 1)
+  expect(Object.keys(ledger().runs)).toEqual([])
+  await step('t2')
+  expect(ledger().runs['f9']!.agentType).toBe('skill')
+  expect(ledger().runs['f9']!.usage).toEqual({ uncached: 1000, output: 100, cacheRead: 0, cacheWrite: 0 })
+  expect(ledger().overhead.usage.uncached).toBe(0)
+})

@@ -129,7 +129,11 @@ function readFlags(words: string[], from: number, valued: ReadonlySet<string>, p
     if (!w.startsWith('-') || w.length < 2) continue
     const eq = w.startsWith('--') ? w.indexOf('=') : -1
     if (prompt.has(eq > 0 ? w.slice(0, eq) : w)) {
-      if (eq < 0) i++
+      if (eq < 0) {
+        // a bare `--` after the flag ends flag reading: what follows is never a flag
+        if (words[i + 1] === '--') break
+        i++
+      }
       continue
     }
     if (eq > 0) {

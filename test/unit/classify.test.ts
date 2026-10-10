@@ -125,6 +125,12 @@ test('gemini -p / --prompt take the prompt as their value, which is never read',
   expect(c('gemini -p "hi" -m gemini-3-pro').model).toBe('gemini-3-pro')
 })
 
+test('a gemini prompt flag followed by a bare -- ends flag reading', () => {
+  expect(c('gemini -p -- "--model=SECRET"').model).toBeUndefined()
+  expect(c('gemini --prompt -- --model=SECRET').model).toBeUndefined()
+  expect(c('gemini -m gemini-3-pro -p -- "--model=SECRET"').model).toBe('gemini-3-pro')
+})
+
 test('claude -p stays a boolean flag and opencode run still reads its model', () => {
   expect(c('claude -p --model claude-sonnet-5-5 "q"').model).toBe('claude-sonnet-5-5')
   expect(c('opencode run --model x/y "msg"').model).toBe('x/y')

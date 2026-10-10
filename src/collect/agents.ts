@@ -52,6 +52,8 @@ async function send($: EngineInterface, action: Action, table: PriceTable): Prom
 /** Loop ids `$.agent.list()` was already asked about; a hot reload empties it. */
 const LOOKED_UP_MAX = 1024
 const lookedUp = new Set<string>()
+// the ledger generation `lookedUp` belongs to: a /clear or a new session drops the runs it adopted
+let lookedUpGeneration = -1
 
 /**
  * A loop the ledger does not know (never seen at `agent.spawn`, e.g. a forked skill) is looked up once
@@ -59,9 +61,14 @@ const lookedUp = new Set<string>()
  * Only the id, type and parent are read: never the description.
  */
 async function adoptIfListed($: EngineInterface, loop: string, table: PriceTable): Promise<void> {
-  if (lookedUp.has(loop)) return
   try {
-    if (isKnownLoop(await read($, ledgerAtom), loop)) return
+    const ledger = await read($, ledgerAtom)
+    if (ledger.generation !== lookedUpGeneration) {
+      lookedUp.clear()
+      lookedUpGeneration = ledger.generation
+    }
+    if (lookedUp.has(loop)) return
+    if (isKnownLoop(ledger, loop)) return
     lookedUp.add(loop)
     if (lookedUp.size > LOOKED_UP_MAX) {
       const oldest = lookedUp.values().next()

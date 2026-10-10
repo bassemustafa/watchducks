@@ -236,11 +236,27 @@ test('clear folds the removed runs into retired: the record keeps them, the live
   expect(Object.values(later.retired).flatMap(d => Object.values(d)).reduce((n, c) => n + c.done, 0)).toBe(2)
 })
 
-test('countedSteps and turnsWithSteps are capped at 4096 keys and the newest key still dedupes', () => {
+test('clear drops retired day buckets older than 30 days before the clear and keeps the newer ones', () => {
+  const DAY = 86_400_000
+  const old = T0 - 60 * DAY
+  const done = (id: string, at: number): Action[] => [
+    { type: 'spawn', id, agentType: 'Explore', requestedModel: OPUS, at },
+    { type: 'turnComplete', loop: id, turnId: 't1', reason: 'answer', at: at + 1 },
+  ]
+  const first = apply(emptyLedger('s1', old), ...done('o1', old), { type: 'clear', at: old + 2 })
+  expect(Object.keys(first.retired)).toEqual(['2026-08-10'])
+  const second = apply(first, ...done('n1', T0 - 5 * DAY), { type: 'clear', at: T0 })
+  expect(Object.keys(second.retired)).toEqual(['2026-10-04'])
+  const edge = apply(second, ...done('e1', T0 - 30 * DAY), { type: 'clear', at: T0 })
+  expect(Object.keys(edge.retired).sort()).toEqual(['2026-09-09', '2026-10-04'])
+})
+
+test('countedSteps and turnsWithSteps are capped at 1024 keys and the newest key still dedupes', () => {
   let l = apply(emptyLedger('s1', T0), spawn('a1'))
   for (let i = 0; i < 5000; i++) l = reduce(l, step(i, OPUS, `t${i}`), PRICES)
-  expect(Object.keys(l.countedSteps).length).toBe(4096)
-  expect(Object.keys(l.turnsWithSteps).length).toBe(4096)
+  // past 1024 the maps drop to the newest 768 keys, then grow again: 5000 steps leave 888
+  expect(Object.keys(l.countedSteps).length).toBe(888)
+  expect(Object.keys(l.turnsWithSteps).length).toBe(888)
   expect(Object.hasOwn(l.countedSteps, 'a1|t4999|4999')).toBe(true)
   expect(Object.hasOwn(l.countedSteps, 'a1|t0|0')).toBe(false)
   const before = l.runs['a1']!.usage

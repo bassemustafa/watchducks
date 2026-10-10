@@ -1,6 +1,6 @@
 import type { Classification, Implementer, Ledger, RelayProjection, Review, Run, RunStatus, Spend, Usage } from '../types'
 import { fnv1a, codenameFor } from './codename'
-import { addRunsToDays } from './history'
+import { addRunsToDays, dropOldDays } from './history'
 import { ZERO_USAGE, addUsage, estimateCost, usageFromApi, type PriceTable } from './price'
 
 // Pure ledger reducer (spec §5-§7): every action returns a new ledger and the
@@ -45,8 +45,10 @@ export type Totals = {
 const SERIES_MAX = 30
 const MINUTE_MS = 60_000
 const MAX_HANDLERS = 3
-/** Per-ledger cap on the replay-dedup maps: past it the oldest keys are dropped. */
-const MAX_STEP_KEYS = 4096
+/** Per-ledger cap on the replay-dedup maps: past it the oldest keys are dropped down to STEP_KEYS_KEPT. */
+const MAX_STEP_KEYS = 1024
+/** Trimming to a quarter below the cap keeps the rebuild to once per 256 new keys. */
+const STEP_KEYS_KEPT = 768
 
 export function emptyLedger(sessionId: string, at: number): Ledger {
   return {
@@ -82,13 +84,13 @@ export function seriesWindow(ledger: Ledger, nowMs: number, minutes = SERIES_MAX
   return out
 }
 
-/** `map` plus `key`; past MAX_STEP_KEYS the oldest keys (insertion order) are dropped. */
+/** `map` plus `key`; past MAX_STEP_KEYS only the newest STEP_KEYS_KEPT keys (insertion order) are kept. */
 function withKey(map: Record<string, true>, key: string): Record<string, true> {
   const next: Record<string, true> = { ...map, [key]: true }
   const keys = Object.keys(next)
   if (keys.length <= MAX_STEP_KEYS) return next
   const trimmed: Record<string, true> = {}
-  for (const k of keys.slice(keys.length - MAX_STEP_KEYS)) trimmed[k] = true
+  for (const k of keys.slice(keys.length - STEP_KEYS_KEPT)) trimmed[k] = true
   return trimmed
 }
 
@@ -435,7 +437,7 @@ function reduceVerdict(ledger: Ledger, a: Extract<Action, { type: 'verdict' }>):
   return putRun(ledger, { ...target, reviews })
 }
 
-function reduceClear(ledger: Ledger): Ledger {
+function reduceClear(ledger: Ledger, at: number): Ledger {
   const kept: Record<string, Run> = {}
   const removed: Run[] = []
   for (const [id, run] of Object.entries(ledger.runs)) {
@@ -456,7 +458,8 @@ function reduceClear(ledger: Ledger): Ledger {
     order: ledger.order.filter(id => Object.hasOwn(kept, id)),
     findings,
     bgSeen,
-    retired: addRunsToDays(ledger.retired ?? {}, removed),
+    // days past the 30-day window can never reach the board, so they are not kept
+    retired: dropOldDays(addRunsToDays(ledger.retired ?? {}, removed), at),
   })
 }
 
@@ -529,7 +532,7 @@ export function reduce(ledger: Ledger, action: Action, prices: PriceTable): Ledg
     case 'verdict':
       return reduceVerdict(ledger, action)
     case 'clear':
-      return reduceClear(ledger)
+      return reduceClear(ledger, action.at)
   }
 }
 

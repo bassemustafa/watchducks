@@ -99,8 +99,12 @@ test('usageOps and costOps count only the runs whose usage and cost are known', 
   expect(row.costOps).toBe(1)
 })
 
-test('a history record written without usageOps and costOps reads them as ops', () => {
-  const old: HistoryRecord = { v: 1, sessionStartedAt: Date.UTC(2026, 9, 9), days: { '2026-10-09': { 'opencode|m': counters() } } }
+test('a history record written without usageOps and costOps reads them as ops when tokens and cost were recorded', () => {
+  // the legacy fixture now carries tokens and cost: an all-zero bucket no longer counts as measured (see the next test)
+  const old: HistoryRecord = {
+    v: 1, sessionStartedAt: Date.UTC(2026, 9, 9),
+    days: { '2026-10-09': { 'opencode|m': { ...counters(), uncached: 100, costReported: 0.5 } } },
+  }
   const fresh: HistoryRecord = recordFromLedger(ledgerOf([run('f1', OPENCODE), run('f2', {})]))
   const rows = aggregateHistory([old, fresh], Date.UTC(2026, 9, 9, 12))
   const oc = rows.find(r => r.model === 'm')!
@@ -110,6 +114,23 @@ test('a history record written without usageOps and costOps reads them as ops', 
   const mixed = rows.find(r => r.model === 'openai/gpt-6.1-sol')!
   expect(mixed.ops).toBe(1)
   expect(mixed.usageOps).toBe(1)
+})
+
+test('a legacy raw-CLI record with all-zero tokens and cost reads usageOps and costOps as 0', () => {
+  const legacy: HistoryRecord = { v: 1, sessionStartedAt: Date.UTC(2026, 9, 9), days: { '2026-10-09': { 'gemini|g': counters() } } }
+  const row = aggregateHistory([legacy], Date.UTC(2026, 9, 9, 12)).find(r => r.model === 'g')!
+  expect(row.ops).toBe(1)
+  expect(row.usageOps).toBe(0)
+  expect(row.costOps).toBe(0)
+})
+
+test('unknownCostOps skips relays that can never report a cost', () => {
+  const unknown = (over: Partial<Run>): number =>
+    recordFromLedger(ledgerOf([run('u1', { model: 'm', ...over })])).days['2026-10-09']![`${over.implementer}|m`]!.unknownCostOps
+  expect(unknown({ implementer: 'codex', outDir: '/tmp/out' })).toBe(0)
+  expect(unknown({ implementer: 'claude' })).toBe(0)
+  expect(unknown({ implementer: 'claude', outDir: '/tmp/out' })).toBe(1)
+  expect(unknown({ implementer: 'claude', kind: 'agent' })).toBe(1)
 })
 
 test('addRunsToDays adds to a copy: the input days are not changed', () => {

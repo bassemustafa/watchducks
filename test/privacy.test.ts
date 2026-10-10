@@ -193,3 +193,57 @@ test('privacy canary: planted sentinels never reach state, store, toasts, status
   const dump = JSON.stringify([seen.state, seen.store, seen.shown, trees])
   expect(dump).not.toContain('SENTINEL')
 })
+
+test('privacy: an agent adopted from $.agent.list() never leaks its listed description', { options: { notify: 'on' } }, async ($, on) => {
+  const seen = observe(on)
+  on('command.register', async () => ({ value: { command: 'flock' } }))
+  on('tool.register', async () => ({ value: { tool: 'mcp__watchducks__x' } }))
+  on('session.id', async () => ({ value: 'S1' }))
+  on('session.root', async () => ({ value: '/work' }))
+  on('session.surfaces', async () => ({ value: ['terminal'] }))
+  on('session.start', async ($, e) => ({ cwd: e.cwd }))
+  on('session.end', async () => ({ sessionId: 'S1' }))
+  on('ui.panes', async () => ({ value: [{ id: 'flock', title: 'The Flock', isShown: true, isFocused: false, isPlaced: false }] }))
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e) => {
+    const { Text } = $.ui.resolve(e) as unknown as { Text: (props: { children: string }) => never }
+    return Text({ children: '' })
+  })
+  // a forked skill: listed by the engine, never spawned through agent.spawn
+  on('agent.list', async () => ({
+    value: [{ id: 'f1', description: 'SENTINEL-LIST-DESCRIPTION', type: 'skill', status: 'running', parentId: 'p1' }] as never,
+  }))
+  on('turn.step', async function* () {
+    return STEP_RESULT
+  })
+  on('turn.complete', async () => ({ text: '' }))
+  mock.env(on, {})
+  const clock = mock.clock(on)
+
+  await $.session.start(START)
+  for await (const _ of $.turn.step({ agentId: 'f1', turnId: 't1', index: 0, model: 'claude-sonnet-5-5' } as never)) {
+    /* chunks are never read */
+  }
+  await $.turn.complete({ agentId: 'f1', turnId: 't1', reason: 'answer', answer: '', durationMs: 1, isAborted: false } as never)
+  await clock.advance(3000) // the watch tick sees the run done: stamp, toast and a history save
+  await $.session.end({ reason: 'exit' } as never)
+
+  // the step was adopted into a run (not left to engine overhead), and the canary's places were reached
+  expect(seen.state.some(s => s.includes('"f1"') && s.includes('"skill"'))).toBe(true)
+  expect(seen.store.length).toBeGreaterThan(0)
+  expect(seen.shown.length).toBeGreaterThan(0)
+
+  const trees: string[] = []
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await pane($, surface, 60)
+    trees.push(await drawn(ui)) // field view
+    await ui.press({ key: 'f1' })
+    trees.push(await drawn(ui)) // dossier of the adopted agent
+    await ui.press({ key: 'back' })
+    await ui.unmount()
+  }
+  trees.push(await drawn(await band($)))
+
+  const dump = JSON.stringify([seen.state, seen.store, seen.shown, trees])
+  expect(dump).not.toContain('SENTINEL-LIST-DESCRIPTION')
+  expect(dump).not.toContain('SENTINEL')
+})
