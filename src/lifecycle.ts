@@ -7,10 +7,15 @@ import { HISTORY_PREFIX, pruneHistory, recordFromLedger } from './history'
 import { emptyLedger, isKnownLoop, reduce, type Action } from './ledger'
 import type { PriceTable } from './price'
 import { MAX_RESULT_BYTES, isInsideRoots, projectRelayResult } from './relay-result'
-import { INITIAL_LEDGER, isHistoryRecord, recordsHeadless } from './state'
+import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, recordsHeadless } from './state'
 import { ROSTER_SPEC, VERDICT_SPEC } from './tools'
+import { blipsFor, radar } from './ui/animate'
+import { fmtCost } from './ui/format'
+import { radarFrame } from './ui/raster'
+import { glyphs, statusWords } from './ui/theme'
 
 const ledgerAtom = atom({ plugin: 'watchducks', key: 'ledger' } as const, INITIAL_LEDGER)
+const uiAtom = atom({ plugin: 'watchducks', key: 'ui' } as const, INITIAL_UI)
 
 // Session lifecycle (spec §10). A plugin registers `session.start` and
 // `session.end` once, and `$` cannot cross an import, so every timer and every
@@ -24,6 +29,8 @@ const SAVE_MS = 60_000
 let agentTimer: Timer | undefined
 let saveTimer: Timer | undefined
 let relayTimer: Timer | undefined
+let watchTimer: Timer | undefined
+let animTimer: Timer | undefined
 let pollingAgents = false
 let pollingRelays = false
 /** Relay runs whose result.json was already read: the 120 s grace window must not read it again. */
@@ -33,6 +40,10 @@ function stopTimers(): void {
   agentTimer?.cancel()
   saveTimer?.cancel()
   relayTimer?.cancel()
+  watchTimer?.cancel()
+  animTimer?.cancel()
+  watchTimer = undefined
+  animTimer = undefined
   agentTimer = undefined
   saveTimer = undefined
   relayTimer = undefined
@@ -195,6 +206,133 @@ async function saveWhileActive($: EngineInterface, options: PluginOptions): Prom
   }
 }
 
+// UI timers (spec §9.2, §9.4). One watch timer sees every run change in the
+// ledger (the collectors write it, this file only reads): it stamps a run that
+// turned done, toasts a run that ended, auto-opens the sidebar on the first run
+// of the session, and starts or stops the 200 ms radar timer. Module state
+// dies with a hot reload; session.start seeds it again from the ledger so no
+// old run is stamped or toasted twice.
+
+const WATCH_MS = 500
+const ANIM_MS = 200
+const STAMP_MS = 1500
+const PANE = 'flock'
+
+let watching = false
+let animating = false
+let watchCount = 0
+let seenGeneration = -1
+let seenSession = ''
+const seenStatus = new Map<string, string>()
+
+function seed(l: Ledger): void {
+  seenGeneration = l.generation
+  seenSession = l.sessionId
+  seenStatus.clear()
+  for (const id of l.order) {
+    const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
+    if (run) seenStatus.set(id, run.status)
+  }
+}
+
+async function clearStamp($: EngineInterface, runId: string): Promise<void> {
+  try {
+    await update($, uiAtom, u => {
+      if (u.stamp?.runId !== runId) return u
+      const { stamp: _stamp, ...rest } = u
+      return rest
+    })
+  } catch {
+    // a stale stamp is ignored by the render once its time has passed
+  }
+}
+
+async function flockPlaced($: EngineInterface): Promise<boolean> {
+  try {
+    return (await $.ui.panes()).some(p => p.id === PANE && p.isPlaced)
+  } catch {
+    return false
+  }
+}
+
+async function drawRadar($: EngineInterface): Promise<void> {
+  if (animating) return
+  animating = true
+  try {
+    const m = radar.mounted
+    if (!m) return
+    radar.tick = (radar.tick + 1) % 48
+    await $.ui.blit({ requestId: PANE, key: 'radar', cells: radarFrame(radar.tick, radar.blips, m.columns, m.rows).cells })
+  } catch {
+    // a missed frame is not an error
+  } finally {
+    animating = false
+  }
+}
+
+async function watchTick($: EngineInterface, options: PluginOptions): Promise<void> {
+  if (watching) return
+  watching = true
+  try {
+    const l = await read($, ledgerAtom)
+    const now = Date.now()
+    const g = glyphs(options.glyphs === 'ascii' ? 'ascii' : 'emoji')
+
+    if (l.generation !== seenGeneration || l.sessionId !== seenSession) {
+      seed(l)
+    } else {
+      for (const id of l.order) {
+        const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
+        if (!run) continue
+        const before = seenStatus.get(id)
+        if (before === run.status) continue
+        seenStatus.set(id, run.status)
+        if (run.status === 'done') {
+          await update($, uiAtom, u => ({ ...u, stamp: { runId: id, until: now + STAMP_MS } }))
+          $.clock.after(STAMP_MS, () => void clearStamp($, id))
+        }
+        if (run.status !== 'running' && (before === undefined || before === 'running') && options.notify === 'on') {
+          $.ui.toast(`${g.duck} ${run.codename} ${statusWords(run.status).spy.toLowerCase()} · ${fmtCost(run.cost, run.costSource, run.costPartial)}`)
+        }
+      }
+    }
+
+    const running = l.order.some(id => l.runs[id]?.status === 'running')
+    radar.blips = blipsFor(l)
+    const ui = await read($, uiAtom)
+
+    const wantsOpen =
+      options.autoOpen !== 'off' && !ui.autoOpened && !ui.closedByPerson && l.order.length > 0 && radar.fullscreen
+    let placed = false
+    if (wantsOpen) {
+      // the first run of the session, beside a fullscreen transcript: open once
+      await update($, uiAtom, u => ({ ...u, autoOpened: true }))
+      try {
+        placed = (await $.ui.open({ id: PANE, title: `${g.duck} The Flock`, columns: 52 })).isPlaced
+      } catch {
+        // the sidebar stays closed; /flock still opens it
+      }
+    } else if (running || animTimer) {
+      placed = await flockPlaced($)
+    }
+
+    const wantAnim = options.motion !== 'off' && running && placed && radar.mounted !== null
+    if (wantAnim && !animTimer) animTimer = $.clock.every(ANIM_MS, () => void drawRadar($))
+    if (!wantAnim && animTimer) {
+      animTimer.cancel()
+      animTimer = undefined
+    }
+
+    // elapsed times in the cards and the band move once a second
+    watchCount += 1
+    if (running && watchCount % 2 === 0) $.ui.invalidate('ui.render')
+  } catch {
+    // the next tick tries again
+  } finally {
+    watching = false
+  }
+}
+
 export function registerLifecycle(on: On, table: PriceTable, options: PluginOptions): void {
   on('session.start', async ($, e, next) => {
     try {
@@ -226,6 +364,8 @@ export function registerLifecycle(on: On, table: PriceTable, options: PluginOpti
       agentTimer = $.clock.every(AGENT_POLL_MS, () => void pollAgents($, table))
       saveTimer = $.clock.every(SAVE_MS, () => void saveWhileActive($, options))
       relayTimer = $.clock.every(RELAY_POLL_MS, () => void pollRelays($, table, options))
+      seed(await read($, ledgerAtom))
+      watchTimer = $.clock.every(WATCH_MS, () => void watchTick($, options))
     } catch {
       // the collectors still work without the timers
     }

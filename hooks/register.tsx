@@ -3,10 +3,12 @@ import type { Register } from 'claude-code'
 import { registerAgentCollectors } from '../src/collect/agents'
 import { registerReviewCollectors } from '../src/collect/review'
 import { registerShellCollector } from '../src/collect/shell'
-import { DUCKS, fnv1a } from '../src/codename'
+import { registerCommands } from '../src/commands'
 import { registerLifecycle } from '../src/lifecycle'
 import { prices } from '../src/state'
 import { registerTools } from '../src/tools'
+import { registerBand } from '../src/ui/band'
+import { registerSidebar } from '../src/ui/sidebar'
 
 export const register: Register = (on, options) => {
   const table = prices(options)
@@ -17,7 +19,7 @@ export const register: Register = (on, options) => {
   registerReviewCollectors(on, table)
   registerTools(on, table)
 
-  on('command.run', { command: 'flock' }, async () => {
-    return { text: `The flock is on watch (${DUCKS[fnv1a('hq') % 16]}).` }
-  })
+  registerCommands(on, table, options)
+  registerSidebar(on, options)
+  registerBand(on, options)
 }

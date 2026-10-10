@@ -58,5 +58,11 @@
     "pattern": "tool.call",
     "hook": "tool.call{tool=mcp__watchducks__verdict}",
     "hasCatch": true
+  },
+  {
+    "module": "./register.tsx",
+    "pattern": "ui.close",
+    "hook": "ui.close",
+    "hasCatch": true
   }
 ]
