@@ -41,6 +41,26 @@ test('withOverrides merges valid entries and ignores invalid JSON and negative r
   expect(withOverrides(PRICES, '{"x":{"input":-1,"output":1,"cacheRead":0,"cacheWrite":0}}')['x']).toBeUndefined()
 })
 
+const FREE = { output: 0, cacheRead: 0, cacheWrite: 0 }
+
+test('withOverrides: an @long key overrides the long tier only', () => {
+  const merged = withOverrides(PRICES, JSON.stringify({ 'claude-haiku-5-5@long': { input: 9, ...FREE } }))
+  near(estimateCost({ uncached: 200_000, output: 0, cacheRead: 0, cacheWrite: 0 }, 'claude-haiku-5-5', merged), 1.8)
+  near(estimateCost({ uncached: 50_000, output: 0, cacheRead: 0, cacheWrite: 0 }, 'claude-haiku-5-5', merged), 0.005)
+})
+
+test('withOverrides: a base haiku override applies to both tiers unless @long is given', () => {
+  const only = withOverrides(PRICES, JSON.stringify({ 'claude-haiku-5-5': { input: 2, ...FREE } }))
+  near(estimateCost({ uncached: 200_000, output: 0, cacheRead: 0, cacheWrite: 0 }, 'claude-haiku-5-5', only), 0.4)
+  near(estimateCost({ uncached: 50_000, output: 0, cacheRead: 0, cacheWrite: 0 }, 'claude-haiku-5-5', only), 0.1)
+  const both = withOverrides(
+    PRICES,
+    JSON.stringify({ 'claude-haiku-5-5@long': { input: 9, ...FREE }, 'claude-haiku-5-5': { input: 2, ...FREE } }),
+  )
+  near(estimateCost({ uncached: 200_000, output: 0, cacheRead: 0, cacheWrite: 0 }, 'claude-haiku-5-5', both), 1.8)
+  near(estimateCost({ uncached: 50_000, output: 0, cacheRead: 0, cacheWrite: 0 }, 'claude-haiku-5-5', both), 0.1)
+})
+
 test('usageFromApi maps the four API fields and addUsage sums fieldwise', () => {
   const u = usageFromApi({ input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 })
   expect(u).toEqual({ uncached: 1, output: 2, cacheRead: 3, cacheWrite: 4 })

@@ -108,3 +108,30 @@ test('an out-dir containing .. is dropped', () => {
 test('splitWords returns null on unbalanced quotes', () => {
   expect(splitWords('node "unterminated')).toBeNull()
 })
+
+test('nothing after a bare -- is read as a flag (codex, claude, relay)', () => {
+  expect(c('codex exec -- "--model=SECRET"').model).toBeUndefined()
+  expect(c('claude -p "q" -- --model=SECRET').model).toBeUndefined()
+  expect(c('node x/opencode-delegate/scripts/relay.mjs --lane quick -- --model=SECRET').model).toBeUndefined()
+  expect(c('node x/opencode-delegate/scripts/relay.mjs --lane quick -- --model=SECRET').lane).toBe('quick')
+})
+
+test('gemini -p / --prompt take the prompt as their value, which is never read', () => {
+  expect(c('gemini -p "--model=SECRET"').model).toBeUndefined()
+  expect(c('gemini -p --model=SECRET').model).toBeUndefined()
+  expect(c('gemini --prompt=--model=SECRET').model).toBeUndefined()
+  expect(c('gemini --prompt --model=SECRET').model).toBeUndefined()
+  expect(c('gemini -m gemini-3-pro -p "hi"').model).toBe('gemini-3-pro')
+  expect(c('gemini -p "hi" -m gemini-3-pro').model).toBe('gemini-3-pro')
+})
+
+test('claude -p stays a boolean flag and opencode run still reads its model', () => {
+  expect(c('claude -p --model claude-sonnet-5-5 "q"').model).toBe('claude-sonnet-5-5')
+  expect(c('opencode run --model x/y "msg"').model).toBe('x/y')
+})
+
+test('an oversized command is shell before it is tokenized', () => {
+  const relay = ' node x/opencode-delegate/scripts/relay.mjs --lane quick'
+  expect(classify('A=' + 'x'.repeat(100_000) + relay).kind).toBe('shell')
+  expect(classify('A=' + 'x'.repeat(4000) + relay).kind).toBe('relay')
+})

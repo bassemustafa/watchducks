@@ -17,6 +17,8 @@ const RELAY_SUFFIXES: ReadonlyArray<readonly [string, 'opencode' | 'claude' | 'c
 
 const RELAY_VALUED = new Set(['--lane', '--model', '--variant', '--effort', '--sandbox', '--agent', '--cd', '--out-dir'])
 const CLI_VALUED = new Set(['--model', '-m', '--effort', '--variant'])
+const GEMINI_PROMPT = new Set(['-p', '--prompt'])
+const NO_FLAGS: ReadonlySet<string> = new Set()
 
 type Token = { kind: 'word' | 'op'; value: string; start: number }
 type Flag = { name: string; value: string | null }
@@ -114,13 +116,22 @@ function path(value: string | null | undefined): string | undefined {
   return value
 }
 
-/** Reads `--flag value` and `--flag=value`; a value is never another flag. Positionals are skipped. */
-function readFlags(words: string[], from: number, valued: ReadonlySet<string>): Flag[] {
+/**
+ * Reads `--flag value` and `--flag=value`; a value is never another flag. Positionals are skipped.
+ * Nothing after a bare `--` is read. A `prompt` flag takes the prompt as its value: that word is
+ * consumed unread and `--flag=...` is dropped.
+ */
+function readFlags(words: string[], from: number, valued: ReadonlySet<string>, prompt: ReadonlySet<string> = NO_FLAGS): Flag[] {
   const flags: Flag[] = []
   for (let i = from; i < words.length; i++) {
     const w = words[i] ?? ''
+    if (w === '--') break
     if (!w.startsWith('-') || w.length < 2) continue
     const eq = w.startsWith('--') ? w.indexOf('=') : -1
+    if (prompt.has(eq > 0 ? w.slice(0, eq) : w)) {
+      if (eq < 0) i++
+      continue
+    }
     if (eq > 0) {
       flags.push({ name: w.slice(0, eq), value: w.slice(eq + 1) })
       continue
@@ -186,7 +197,7 @@ function classifyCli(words: string[], workdir: string | undefined): Classificati
 
   let model: string | undefined
   let effort: string | undefined
-  for (const { name, value } of readFlags(words, 1, CLI_VALUED)) {
+  for (const { name, value } of readFlags(words, 1, CLI_VALUED, implementer === 'gemini' ? GEMINI_PROMPT : NO_FLAGS)) {
     if (name === '--model' || name === '-m') model = ident(value)
     else if (name === '--effort' || name === '--variant') effort = ident(value)
   }
@@ -200,6 +211,8 @@ function classifyCli(words: string[], workdir: string | undefined): Classificati
 
 export function classify(command: string): Classification {
   const shell = (workdir?: string): Classification => (workdir === undefined ? { kind: 'shell' } : { kind: 'shell', workdir })
+
+  if (command.length > MAX_COMMAND * 2) return shell()
 
   const lexed = tokenize(command)
   if (!lexed) return shell()

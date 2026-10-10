@@ -55,3 +55,20 @@ test('the Bash result passes through unchanged', async ($, on) => {
   const answer = await $.tool.call({ tool: 'Bash', tool_use_id: 'u5', command: RELAY } as never)
   expect(answer).toEqual({ result: { stdout: 'ok', stderr: '', interrupted: false } })
 })
+
+test('a tracked Bash call whose answer rejects ends killed and the rejection propagates', async ($, on) => {
+  const ledger = watchLedger(on)
+  const boom = new Error('aborted')
+  on('tool.call', { tool: 'Bash' }, async () => {
+    throw boom
+  })
+  let caught: unknown
+  try {
+    await $.tool.call({ tool: 'Bash', tool_use_id: 'u6', command: RELAY } as never)
+  } catch (error) {
+    caught = error
+  }
+  // the engine reports the failed answer as its own error; the call still rejects
+  expect(caught instanceof Error).toBe(true)
+  expect(ledger().runs['bash:u6']!.status).toBe('killed')
+})

@@ -77,14 +77,20 @@ export function withOverrides(table: PriceTable, json: string): PriceTable {
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return table
   const merged: PriceTable = { ...table }
+  let base: Rates | undefined
+  let longGiven = false
   for (const [rawKey, entry] of Object.entries(parsed)) {
     if (typeof entry !== 'object' || entry === null) continue
     const { input, output, cacheRead, cacheWrite } = entry as Record<string, unknown>
     if (!validRate(input) || !validRate(output) || !validRate(cacheRead) || !validRate(cacheWrite)) continue
-    const key = normalizeModel(rawKey)
+    const key = rawKey === LONG_TIER_KEY ? rawKey : normalizeModel(rawKey)
     if (key === '__proto__') continue
     merged[key] = { input, output, cacheRead, cacheWrite }
+    if (key === LONG_TIER_KEY) longGiven = true
+    else if (key === LONG_TIER_MODEL) base = merged[key]
   }
+  // a base override without a valid long-tier one prices both tiers
+  if (base && !longGiven) merged[LONG_TIER_KEY] = { ...base }
   return merged
 }
 

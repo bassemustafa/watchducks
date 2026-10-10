@@ -32,7 +32,14 @@ export function registerShellCollector(on: On, table: PriceTable): void {
     const track = cls.kind !== 'shell' || e.run_in_background === true
     if (track) await send($, { type: 'bashStart', id, cls, at: Date.now() }, table)
 
-    const r = await next(e)
+    let r: Awaited<ReturnType<typeof next>>
+    try {
+      r = await next(e)
+    } catch (error) {
+      // aborted beneath us: end a tracked run as killed; the error is rethrown untouched
+      if (track) await send($, { type: 'bashResult', id, isError: true, interrupted: true, at: Date.now() }, table)
+      throw error
+    }
 
     const taskId = field(r.result, 'backgroundTaskId')
     const backgroundTaskId = typeof taskId === 'string' && taskId !== '' ? taskId : undefined
