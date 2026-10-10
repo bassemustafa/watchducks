@@ -8,7 +8,8 @@
   "scripts": {
     "typecheck": "tsc -p .",
     "validate": "claude plugin validate .",
-    "test": "claude plugin test ."
+    "test": "claude plugin test .",
+    "check:gating": "node scripts/check-gating.mjs"
   },
   "devDependencies": {
     "typescript": "5.9.3"
