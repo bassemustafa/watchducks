@@ -13,13 +13,13 @@ type Counters = Omit<StationRow, 'implementer' | 'model'>
 
 const COUNTER_KEYS: ReadonlyArray<keyof Counters> = [
   'ops', 'done', 'failed', 'killed', 'ended', 'uncached', 'output', 'cacheRead', 'cacheWrite',
-  'costReported', 'costEstimated', 'unknownCostOps', 'vetted', 'bugs',
+  'costReported', 'costEstimated', 'unknownCostOps', 'usageOps', 'costOps', 'vetted', 'bugs',
 ]
 
 function emptyCounters(): Counters {
   return {
     ops: 0, done: 0, failed: 0, killed: 0, ended: 0, uncached: 0, output: 0, cacheRead: 0, cacheWrite: 0,
-    costReported: 0, costEstimated: 0, unknownCostOps: 0, vetted: 0, bugs: 0,
+    costReported: 0, costEstimated: 0, unknownCostOps: 0, usageOps: 0, costOps: 0, vetted: 0, bugs: 0,
   }
 }
 
@@ -36,11 +36,13 @@ function addRun(c: Counters, run: Run): void {
   else if (run.status === 'killed') c.killed += 1
   else if (run.status === 'ended') c.ended += 1
   if (run.usage) {
+    c.usageOps += 1
     c.uncached += run.usage.uncached
     c.output += run.usage.output
     c.cacheRead += run.usage.cacheRead
     c.cacheWrite += run.usage.cacheWrite
   }
+  if (run.cost !== null) c.costOps += 1
   if (run.cost !== null && run.costSource === 'reported') c.costReported += run.cost
   else if (run.cost !== null && run.costSource === 'estimated') c.costEstimated += run.cost
   else if (run.cost === null && (run.kind === 'agent' || run.kind === 'relay')) c.unknownCostOps += 1
@@ -80,15 +82,26 @@ function rowsFromBuckets(buckets: ReadonlyMap<string, Counters>): StationRow[] {
   )
 }
 
-/** The session's whole record, rebuilt from the ledger (idempotent). HQ and overhead are excluded. */
-export function recordFromLedger(ledger: Ledger): HistoryRecord {
-  const days: HistoryRecord['days'] = {}
-  for (const run of orderedRuns(ledger)) {
-    const day = utcDay(run.endedAt ?? run.startedAt)
-    const bucket = (days[day] ??= {})
-    addRun((bucket[bucketKey(run)] ??= emptyCounters()), run)
+/** A copy of `days` with every run added by its UTC end day and implementer × model bucket; the input is not changed. */
+export function addRunsToDays(days: HistoryRecord['days'], runs: readonly Run[]): HistoryRecord['days'] {
+  const out: HistoryRecord['days'] = {}
+  for (const [day, byKey] of Object.entries(days)) {
+    const bucket: HistoryRecord['days'][string] = {}
+    for (const [key, counters] of Object.entries(byKey)) bucket[key] = { ...emptyCounters(), ...counters }
+    out[day] = bucket
   }
-  return { v: 1, sessionStartedAt: ledger.sessionStartedAt, days }
+  for (const run of runs) {
+    const bucket = (out[utcDay(run.endedAt ?? run.startedAt)] ??= {})
+    const key = bucketKey(run)
+    const counters = (bucket[key] ??= emptyCounters())
+    addRun(counters as Counters, run)
+  }
+  return out
+}
+
+/** The session's whole record, rebuilt from the ledger (idempotent): runs /clear retired plus the live ones. HQ and overhead are excluded. */
+export function recordFromLedger(ledger: Ledger): HistoryRecord {
+  return { v: 1, sessionStartedAt: ledger.sessionStartedAt, days: addRunsToDays(ledger.retired ?? {}, orderedRuns(ledger)) }
 }
 
 /** Station rows for the live session (all runs, no day split). */
@@ -114,7 +127,11 @@ export function aggregateHistory(records: readonly HistoryRecord[], nowMs: numbe
         if (key.indexOf('|') < 0) continue
         let c = buckets.get(key)
         if (!c) buckets.set(key, (c = emptyCounters()))
-        for (const k of COUNTER_KEYS) c[k] += num(counters[k])
+        // a record written before usageOps / costOps existed counts every op as known
+        for (const k of COUNTER_KEYS) {
+          const v = counters[k]
+          c[k] += num(v === undefined && (k === 'usageOps' || k === 'costOps') ? counters.ops : v)
+        }
       }
     }
   }

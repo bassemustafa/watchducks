@@ -159,3 +159,20 @@ test('a finished result stops the polling: the file is read once', async ($, on)
   await clock.advance(3000)
   expect(fs.reads()).toBe(1)
 })
+
+test('a result read before a reload is not applied again when a newer result.json appears', async ($, on) => {
+  const ledger = watchLedger(on)
+  const clock = world(on)
+  let text = RESULT
+  files(on, '/tmp/o1/result.json', async () => ({ value: text }))
+  await $.session.start(START)
+  await $.tool.call(RELAY_CALL as never)
+  await clock.advance(3000)
+  near(ledger().runs['bash:u1']!.cost, 0.02244)
+  expect(ledger().runs['bash:u1']!.resultRead).toBe(true)
+  // another run reused the out-dir; the reloaded poll must not take its result
+  text = RESULT.replace('0.02244', '0.99')
+  await $.session.start(START)
+  await clock.advance(3000)
+  near(ledger().runs['bash:u1']!.cost, 0.02244)
+})

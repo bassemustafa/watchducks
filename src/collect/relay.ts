@@ -36,7 +36,7 @@ export function resultPath(outDir: string): string {
 }
 
 /**
- * Ids of the relay runs whose result.json is still worth reading: a running relay
+ * Ids of the relay runs whose result.json is still worth reading (not yet applied): a running relay
  * with an out-dir for up to 3 h after it started, and one that ended (a foreground
  * relay, or a run closed by a bash result) for 120 s after it ended.
  */
@@ -44,7 +44,7 @@ export function duePolls(ledger: Ledger, now: number): string[] {
   const due: string[] = []
   for (const id of ledger.order) {
     const run = Object.hasOwn(ledger.runs, id) ? ledger.runs[id] : undefined
-    if (!run || run.kind !== 'relay' || run.outDir === undefined) continue
+    if (!run || run.kind !== 'relay' || run.outDir === undefined || run.resultRead) continue
     if (run.status === 'running') {
       if (now - run.startedAt < MAX_POLL_AGE_MS) due.push(id)
     } else if (run.status !== 'unknown' && run.endedAt !== undefined && now - run.endedAt < POLL_GRACE_MS) {

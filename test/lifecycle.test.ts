@@ -2,7 +2,9 @@ import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 import type { Ledger } from '../types'
+import { utcDay } from '../src/history'
 import { emptyLedger } from '../src/ledger'
+import { INITIAL_UI } from '../src/state'
 
 const START = { cwd: '/work', surface: null, isInteractive: true }
 const RESULT = '{"schema":"delegate-relay.result.v1","tool":"opencode","status":"completed","totalCostUsd":0.5}'
@@ -115,4 +117,53 @@ test('a headless session writes its history when recordHeadless is on', { option
   await $.session.end({ reason: 'exit' } as never)
   expect(id).toBe('S1')
   expect(store.get('history/v1/' + id)).toBeDefined()
+})
+
+test('a native /clear prunes the stored history down to 200 records', async ($, on) => {
+  const { store } = world(on, ['terminal'])
+  await $.session.start(START)
+  const day = utcDay(Date.now())
+  for (let i = 0; i < 201; i++) {
+    store.set(`history/v1/old${i}`, { v: 1, sessionStartedAt: Date.now() - 100_000 + i, days: { [day]: { 'opencode|m': { ops: 1 } } } })
+  }
+  await $.session.end({ reason: 'clear', sessionId: 'S1', resume: { id: 'S1' } })
+  expect(store.has('history/v1/old0')).toBe(false)
+  expect([...store.keys()].filter(k => k.startsWith('history/v1/')).length).toBe(200)
+})
+
+test('a run that ends is saved to history within 2.5 s, not at the next minute tick', async ($, on) => {
+  const { store, clock } = world(on, ['terminal'])
+  on('turn.complete', async () => ({ text: '' }))
+  await $.session.start(START)
+  await $.agent.spawn({ subagentType: 'Explore' } as never)
+  await clock.advance(500)
+  await $.turn.complete({ agentId: 'l1', turnId: 't1', reason: 'answer', answer: '', durationMs: 1, isAborted: false } as never)
+  expect(store.get('history/v1/S1')).toBeUndefined()
+  await clock.advance(500) // the watch tick sees the run done and schedules one write
+  await clock.advance(2100)
+  const record = store.get('history/v1/S1') as { days: Record<string, Record<string, { ops: number; done: number }>> }
+  const counted = Object.values(record.days).flatMap(d => Object.values(d)).reduce((n, c) => n + c.done, 0)
+  expect(counted).toBe(1)
+})
+
+test('a new session id resets the UI atom; a same-id reload leaves it', async ($, on) => {
+  let sessionId = 'S1'
+  const writes: unknown[] = []
+  on('state.set', { plugin: 'watchducks', key: 'ui' }, async ($, e, next) => {
+    writes.push(e.value)
+    return next(e)
+  })
+  world(on, ['terminal'], () => sessionId)
+  await $.session.start(START)
+  const first = writes.length
+  await $.session.start(START) // same id: a hot reload keeps closedByPerson / autoOpened
+  expect(writes.length).toBe(first)
+  sessionId = 'S2'
+  await $.session.start(START)
+  expect(writes.length).toBe(first + 1)
+  expect(writes[writes.length - 1]).toEqual(INITIAL_UI)
+  sessionId = 'S3'
+  await $.session.end({ reason: 'clear', sessionId: 'S2', resume: { id: 'S2' } })
+  expect(writes.length).toBe(first + 2)
+  expect(writes[writes.length - 1]).toEqual(INITIAL_UI)
 })

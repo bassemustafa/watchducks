@@ -1,12 +1,14 @@
 import { expect, test } from 'claude-code/testing'
 
-import { emptyLedger, isKnownLoop, reduce, resolveRun, totals, type Action } from '../../src/ledger'
+import { emptyLedger, isKnownLoop, reduce, resolveRun, seriesWindow, totals, type Action } from '../../src/ledger'
+import { recordFromLedger, stationRowsFromLedger } from '../../src/history'
 import { PRICES } from '../../src/price'
 import type { Ledger } from '../../types'
 
 const T0 = Date.UTC(2026, 9, 9, 12)
 const OPUS = 'claude-opus-5-5'
 const apply = (l: Ledger, ...actions: Action[]): Ledger => actions.reduce((acc, a) => reduce(acc, a, PRICES), l)
+const stepAt = (index: number, at: number, loop = 'a1'): Action => ({ type: 'step', loop, turnId: 't1', index, model: OPUS, usage: stepUsage(OPUS), at })
 const spawn = (id: string): Action => ({ type: 'spawn', id, agentType: 'Explore', requestedModel: OPUS, at: T0 })
 const stepUsage = (model: string) => ({ model, input_tokens: 1000, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })
 const step = (index: number, model = OPUS, turnId = 't1'): Action => ({ type: 'step', loop: 'a1', turnId, index, model, effort: 'high', usage: stepUsage(model), at: T0 + 1000 })
@@ -217,4 +219,101 @@ test('resolveRun, isKnownLoop and totals', () => {
   near(t.byImplementer['claude-code'], 0.006)
   expect(t.byImplementer['codex']).toBe(0)
   expect(t.costPartial).toBe(false)
+})
+
+test('clear folds the removed runs into retired: the record keeps them, the live board does not', () => {
+  const cleared = apply(emptyLedger('s1', T0), spawn('a1'), spawn('a2'),
+    { type: 'turnComplete', loop: 'a2', turnId: 't1', reason: 'answer', at: T0 + 1 },
+    { type: 'clear', at: T0 + 2 })
+  const ops = (l: Ledger) => Object.values(recordFromLedger(l).days).flatMap(d => Object.values(d)).reduce((n, c) => n + c.ops, 0)
+  expect(cleared.runs['a2']).toBeUndefined()
+  expect(ops(cleared)).toBe(2)
+  expect(stationRowsFromLedger(cleared).reduce((n, r) => n + r.ops, 0)).toBe(1)
+  const twice = apply(cleared, { type: 'clear', at: T0 + 3 })
+  expect(ops(twice)).toBe(2)
+  const later = apply(twice, { type: 'turnComplete', loop: 'a1', turnId: 't2', reason: 'answer', at: T0 + 4 }, { type: 'clear', at: T0 + 5 })
+  expect(ops(later)).toBe(2)
+  expect(Object.values(later.retired).flatMap(d => Object.values(d)).reduce((n, c) => n + c.done, 0)).toBe(2)
+})
+
+test('countedSteps and turnsWithSteps are capped at 4096 keys and the newest key still dedupes', () => {
+  let l = apply(emptyLedger('s1', T0), spawn('a1'))
+  for (let i = 0; i < 5000; i++) l = reduce(l, step(i, OPUS, `t${i}`), PRICES)
+  expect(Object.keys(l.countedSteps).length).toBe(4096)
+  expect(Object.keys(l.turnsWithSteps).length).toBe(4096)
+  expect(Object.hasOwn(l.countedSteps, 'a1|t4999|4999')).toBe(true)
+  expect(Object.hasOwn(l.countedSteps, 'a1|t0|0')).toBe(false)
+  const before = l.runs['a1']!.usage
+  l = reduce(l, step(4999, OPUS, 't4999'), PRICES)
+  expect(l.runs['a1']!.usage).toEqual(before)
+})
+
+test('adopt creates an agent run like a spawn, once, and the next step charges it', () => {
+  let l = apply(emptyLedger('s1', T0), { type: 'adopt', id: 'f1', agentType: 'skill', parentId: 'a1', at: T0 })
+  const r = l.runs['f1']!
+  expect(r.kind).toBe('agent')
+  expect(r.implementer).toBe('claude-code')
+  expect(r.agentType).toBe('skill')
+  expect(r.parentId).toBe('a1')
+  expect(r.status).toBe('running')
+  expect(l.order).toEqual(['f1'])
+  l = apply(l, { type: 'adopt', id: 'f1', agentType: 'other', at: T0 + 1 }, stepAt(0, T0 + 2, 'f1'))
+  expect(l.order).toEqual(['f1'])
+  expect(l.runs['f1']!.agentType).toBe('skill')
+  expect(l.runs['f1']!.usage?.uncached).toBe(1000)
+  expect(l.overhead.usage.uncached).toBe(0)
+})
+
+test('a complete-only charge updates the run model and models', () => {
+  const l = apply(emptyLedger('s1', T0), spawn('a1'),
+    { type: 'turnComplete', loop: 'a1', turnId: 't9', reason: 'answer', usage: stepUsage('claude-sonnet-5-5'), at: T0 + 2000 })
+  expect(l.runs['a1']!.model).toBe('claude-sonnet-5-5')
+  expect(l.runs['a1']!.models).toEqual(['claude-sonnet-5-5'])
+})
+
+test('a reviewer is suspected for its 3 newest targets only', () => {
+  const impl = (n: number): Action[] => [
+    { type: 'bashStart', id: `bash:i${n}`, cls: { kind: 'cli', implementer: 'codex', workdir: '/work/a' }, at: T0 + n * 10 },
+    { type: 'bashResult', id: `bash:i${n}`, isError: false, interrupted: false, at: T0 + n * 10 + 5 },
+  ]
+  const l = apply(emptyLedger('s1', T0), ...[1, 2, 3, 4].flatMap(impl),
+    { type: 'bashStart', id: 'bash:rev', cls: { kind: 'relay', implementer: 'opencode', lane: 'review', readOnly: true, workdir: '/work/a' }, at: T0 + 100 })
+  expect(l.runs['bash:i1']!.suspectedHandlers).toEqual([])
+  for (const n of [2, 3, 4]) expect(l.runs[`bash:i${n}`]!.suspectedHandlers).toEqual(['bash:rev'])
+})
+
+test('a target lists the reviewers that picked it, newest first', () => {
+  const l = apply(emptyLedger('s1', T0),
+    { type: 'bashStart', id: 'bash:impl', cls: { kind: 'cli', implementer: 'codex', workdir: '/work/a' }, at: T0 },
+    { type: 'bashResult', id: 'bash:impl', isError: false, interrupted: false, at: T0 + 10 },
+    { type: 'bashStart', id: 'bash:r1', cls: { kind: 'relay', implementer: 'opencode', lane: 'review', readOnly: true, workdir: '/work/a' }, at: T0 + 20 },
+    { type: 'bashStart', id: 'bash:r2', cls: { kind: 'relay', implementer: 'opencode', lane: 'review', readOnly: true, workdir: '/work/a' }, at: T0 + 30 })
+  expect(l.runs['bash:impl']!.suspectedHandlers).toEqual(['bash:r2', 'bash:r1'])
+})
+
+const relay = (usage: { uncached: number; output: number; cacheRead: number; cacheWrite: number } | null): Action =>
+  ({ type: 'relayResult', id: 'bash:r', at: T0 + 2, proj: { status: 'done', readOnly: false, costReported: null, usage, touchedFiles: null } })
+
+test('a relay result adds its tokens to the series once and marks the result as read', () => {
+  const start = apply(emptyLedger('s1', T0), { type: 'bashStart', id: 'bash:r', cls: { kind: 'relay', implementer: 'opencode', readOnly: false }, at: T0 })
+  const used = { uncached: 1000, output: 100, cacheRead: 50, cacheWrite: 10 }
+  const l = apply(start, relay(used))
+  expect(l.runs['bash:r']!.resultRead).toBe(true)
+  expect(l.tokenSeries).toEqual([1160])
+  expect(apply(l, relay(used)).tokenSeries).toEqual([1160])
+  expect(apply(start, relay(null)).tokenSeries).toEqual([])
+})
+
+test('seriesWindow aligns to the current minute, zero-fills and ages old activity out', () => {
+  const MIN = 60_000
+  let l = emptyLedger('s1', T0)
+  expect(seriesWindow(l, T0)).toEqual(new Array(30).fill(0))
+  l = apply(l, spawn('a1'), stepAt(0, T0), stepAt(1, T0 + 2 * MIN))
+  const w = seriesWindow(l, T0 + 2 * MIN)
+  expect(w.length).toBe(30)
+  expect(w.slice(-3)).toEqual([1100, 0, 1100])
+  expect(w.slice(0, 27).every(n => n === 0)).toBe(true)
+  expect(seriesWindow(l, T0 + 4 * MIN, 5)).toEqual([1100, 0, 1100, 0, 0])
+  expect(seriesWindow(l, T0 + 40 * MIN).every(n => n === 0)).toBe(true)
+  expect(seriesWindow(l, T0 + 2 * MIN, 3)).toEqual([1100, 0, 1100])
 })

@@ -1,7 +1,7 @@
-import { atom, update } from 'claude-code'
+import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On } from 'claude-code'
 
-import { reduce, type Action, type StepUsage } from '../ledger'
+import { isKnownLoop, reduce, type Action, type StepUsage } from '../ledger'
 import type { PriceTable } from '../price'
 import { INITIAL_LEDGER } from '../state'
 
@@ -49,6 +49,43 @@ async function send($: EngineInterface, action: Action, table: PriceTable): Prom
   }
 }
 
+/** Loop ids `$.agent.list()` was already asked about; a hot reload empties it. */
+const LOOKED_UP_MAX = 1024
+const lookedUp = new Set<string>()
+
+/**
+ * A loop the ledger does not know (never seen at `agent.spawn`, e.g. a forked skill) is looked up once
+ * in `$.agent.list()`; when listed it becomes an agent run before its first step is charged.
+ * Only the id, type and parent are read: never the description.
+ */
+async function adoptIfListed($: EngineInterface, loop: string, table: PriceTable): Promise<void> {
+  if (lookedUp.has(loop)) return
+  try {
+    if (isKnownLoop(await read($, ledgerAtom), loop)) return
+    lookedUp.add(loop)
+    if (lookedUp.size > LOOKED_UP_MAX) {
+      const oldest = lookedUp.values().next()
+      if (!oldest.done) lookedUp.delete(oldest.value)
+    }
+    let listed: Awaited<ReturnType<EngineInterface['agent']['list']>>
+    try {
+      listed = await $.agent.list()
+    } catch {
+      lookedUp.delete(loop)
+      return
+    }
+    const info = listed.find(a => a.id === loop)
+    if (!info) return
+    await send(
+      $,
+      { type: 'adopt', id: loop, agentType: info.type, ...(info.parentId ? { parentId: info.parentId } : {}), at: Date.now() },
+      table,
+    )
+  } catch {
+    // an unlisted or unreadable loop stays engine overhead
+  }
+}
+
 export function registerAgentCollectors(on: On, table: PriceTable): void {
   on('agent.spawn', async ($, e, next) => {
     const r = await next(e)
@@ -71,6 +108,24 @@ export function registerAgentCollectors(on: On, table: PriceTable): void {
   }).catch(($, e, next) => next(e))
 
   on('turn.step', async function* ($, e, next) {
+    if (e.agentId) {
+      await adoptIfListed($, e.agentId, table)
+      // a resumed agent runs again as its request starts, not when the stream ends (metadata only, no usage)
+      await send(
+        $,
+        {
+          type: 'step',
+          loop: e.agentId,
+          turnId: e.turnId,
+          index: e.index,
+          model: e.model,
+          ...(e.effort !== undefined ? { effort: e.effort } : {}),
+          usage: null,
+          at: Date.now(),
+        },
+        table,
+      )
+    }
     const result = yield* next(e)
     await send(
       $,

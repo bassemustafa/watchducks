@@ -33,8 +33,6 @@ let watchTimer: Timer | undefined
 let animTimer: Timer | undefined
 let pollingAgents = false
 let pollingRelays = false
-/** Relay runs whose result.json was already read: the 120 s grace window must not read it again. */
-const relaysRead = new Set<string>()
 
 function stopTimers(): void {
   agentTimer?.cancel()
@@ -172,7 +170,8 @@ async function pollRelays($: EngineInterface, table: PriceTable, options: Plugin
   pollingRelays = true
   try {
     const seen = await read($, ledgerAtom)
-    const due = duePolls(seen, Date.now()).filter(id => !relaysRead.has(id))
+    // a run whose result was applied carries `resultRead`, so duePolls skips it even after a reload
+    const due = duePolls(seen, Date.now())
     if (due.length === 0) return
     const roots = await resolvedRoots($, options)
     for (const id of due) {
@@ -181,10 +180,15 @@ async function pollRelays($: EngineInterface, table: PriceTable, options: Plugin
       try {
         const projection = await readRelayResult($, run.outDir, run.startedAt, roots)
         if (!projection) continue
-        // a /clear or a session change while the read was pending: the result belongs to the old ledger
-        if ((await read($, ledgerAtom)).generation !== seen.generation) return
-        await send($, { type: 'relayResult', id, proj: projection, at: Date.now() }, table)
-        relaysRead.add(id)
+        // a /clear or a session change while the read was pending: the result belongs to the old ledger,
+        // so the generation is checked in the same atomic update that applies it
+        const action: Action = { type: 'relayResult', id, proj: projection, at: Date.now() }
+        let applied = false
+        await update($, ledgerAtom, l => {
+          applied = l.generation === seen.generation
+          return applied ? reduce(l, action, table) : l
+        })
+        if (!applied) return
       } catch {
         // not there yet, unreadable or hostile: the run keeps its status and the next tick tries again
       }
@@ -216,6 +220,7 @@ async function saveWhileActive($: EngineInterface, options: PluginOptions): Prom
 const WATCH_MS = 500
 const ANIM_MS = 200
 const STAMP_MS = 1500
+const HISTORY_DELAY_MS = 2000
 const PANE = 'flock'
 
 let watching = false
@@ -224,14 +229,35 @@ let watchCount = 0
 let seenGeneration = -1
 let seenSession = ''
 const seenStatus = new Map<string, string>()
+const seenReviews = new Map<string, number>()
+let historyPending = false
 
 function seed(l: Ledger): void {
   seenGeneration = l.generation
   seenSession = l.sessionId
   seenStatus.clear()
+  seenReviews.clear()
   for (const id of l.order) {
     const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
-    if (run) seenStatus.set(id, run.status)
+    if (!run) continue
+    seenStatus.set(id, run.status)
+    seenReviews.set(id, run.reviews.length)
+  }
+}
+
+/** One history write at most every 2 s: a run that ended or was reviewed between the 60 s saves is kept at once. */
+function scheduleHistoryWrite($: EngineInterface, options: PluginOptions): void {
+  if (historyPending) return
+  historyPending = true
+  $.clock.after(HISTORY_DELAY_MS, () => void flushHistory($, options))
+}
+
+async function flushHistory($: EngineInterface, options: PluginOptions): Promise<void> {
+  historyPending = false
+  try {
+    await writeHistory($, await read($, ledgerAtom), options)
+  } catch {
+    // best effort
   }
 }
 
@@ -281,12 +307,18 @@ async function watchTick($: EngineInterface, options: PluginOptions): Promise<vo
     if (l.generation !== seenGeneration || l.sessionId !== seenSession) {
       seed(l)
     } else {
+      let dirty = false
       for (const id of l.order) {
         const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
         if (!run) continue
+        const reviews = run.reviews.length
+        const seenCount = seenReviews.get(id)
+        seenReviews.set(id, reviews)
+        if (seenCount !== undefined && seenCount !== reviews) dirty = true
         const before = seenStatus.get(id)
         if (before === run.status) continue
         seenStatus.set(id, run.status)
+        if (run.status !== 'running') dirty = true
         if (run.status === 'done') {
           await update($, uiAtom, u => ({ ...u, stamp: { runId: id, until: now + STAMP_MS } }))
           $.clock.after(STAMP_MS, () => void clearStamp($, id))
@@ -295,6 +327,7 @@ async function watchTick($: EngineInterface, options: PluginOptions): Promise<vo
           $.ui.toast(`${g.duck} ${run.codename} ${statusWords(run.status).spy.toLowerCase()} · ${fmtCost(run.cost, run.costSource, run.costPartial)}`)
         }
       }
+      if (dirty) scheduleHistoryWrite($, options)
     }
 
     const running = l.order.some(id => l.runs[id]?.status === 'running')
@@ -353,12 +386,15 @@ export function registerLifecycle(on: On, table: PriceTable, options: PluginOpti
     try {
       const id = await $.session.id()
       const now = Date.now()
-      // same id: a hot reload, keep the ledger; another id: a new session
+      // same id: a hot reload, keep the ledger and the UI flags; another id: a new session
+      let newSession = false
       await update($, ledgerAtom, l => {
-        if (l.sessionId === id) return l
+        newSession = l.sessionId !== id
+        if (!newSession) return l
         const fresh = emptyLedger(id, now)
         return l.sessionId === '' ? fresh : { ...fresh, generation: l.generation + 1 }
       })
+      if (newSession) await update($, uiAtom, () => INITIAL_UI)
       await pruneStoredHistory($, now)
       stopTimers()
       agentTimer = $.clock.every(AGENT_POLL_MS, () => void pollAgents($, table))
@@ -388,6 +424,9 @@ export function registerLifecycle(on: On, table: PriceTable, options: PluginOpti
         const id = await $.session.id()
         const generation = old.generation + 1
         await update($, ledgerAtom, l => ({ ...emptyLedger(id, Date.now()), generation: Math.max(generation, l.generation + 1) }))
+        await update($, uiAtom, () => INITIAL_UI)
+        // a native /clear starts a new session id without a session.start: keep the history cap here too
+        await pruneStoredHistory($, Date.now())
       } catch {
         // keep the old ledger rather than fail the end step
       }

@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { aggregateHistory, pruneHistory, recordFromLedger, utcDay } from '../../src/history'
+import { addRunsToDays, aggregateHistory, pruneHistory, recordFromLedger, stationRowsFromLedger, utcDay } from '../../src/history'
 import type { HistoryRecord, Ledger, Run } from '../../types'
 
 const ZERO = { usage: { uncached: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: null, costPartial: false }
@@ -19,7 +19,7 @@ function ledgerOf(runs: Run[]): Ledger {
     v: 1, generation: 0, sessionId: 's1', sessionStartedAt: Date.UTC(2026, 9, 9),
     runs: Object.fromEntries(runs.map(r => [r.id, r])), order: runs.map(r => r.id),
     hq: ZERO, overhead: ZERO, turnsWithSteps: {}, countedSteps: {}, findings: {}, bgSeen: {},
-    tokenSeries: [], seriesEndMinute: 0,
+    tokenSeries: [], seriesEndMinute: 0, retired: {},
   }
 }
 
@@ -84,4 +84,39 @@ test('a record whose only day is 40 days old is dropped', () => {
 
 test('utcDay uses the UTC calendar day', () => {
   expect(utcDay(Date.UTC(2026, 9, 9, 23, 59))).toBe('2026-10-09')
+})
+
+test('usageOps and costOps count only the runs whose usage and cost are known', () => {
+  const known = run('k1', OPENCODE)
+  const unknown = run('k2', { implementer: 'opencode', model: 'openai/gpt-6.1-sol' })
+  const l = ledgerOf([known, unknown])
+  const bucket = recordFromLedger(l).days['2026-10-09']!['opencode|openai/gpt-6.1-sol']!
+  expect(bucket.ops).toBe(2)
+  expect(bucket.usageOps).toBe(1)
+  expect(bucket.costOps).toBe(1)
+  const row = stationRowsFromLedger(l)[0]!
+  expect(row.usageOps).toBe(1)
+  expect(row.costOps).toBe(1)
+})
+
+test('a history record written without usageOps and costOps reads them as ops', () => {
+  const old: HistoryRecord = { v: 1, sessionStartedAt: Date.UTC(2026, 9, 9), days: { '2026-10-09': { 'opencode|m': counters() } } }
+  const fresh: HistoryRecord = recordFromLedger(ledgerOf([run('f1', OPENCODE), run('f2', {})]))
+  const rows = aggregateHistory([old, fresh], Date.UTC(2026, 9, 9, 12))
+  const oc = rows.find(r => r.model === 'm')!
+  expect(oc.ops).toBe(1)
+  expect(oc.usageOps).toBe(1)
+  expect(oc.costOps).toBe(1)
+  const mixed = rows.find(r => r.model === 'openai/gpt-6.1-sol')!
+  expect(mixed.ops).toBe(1)
+  expect(mixed.usageOps).toBe(1)
+})
+
+test('addRunsToDays adds to a copy: the input days are not changed', () => {
+  const days = addRunsToDays({}, [run('d1', OPENCODE)])
+  const frozen = JSON.stringify(days)
+  const more = addRunsToDays(days, [run('d2', OPENCODE), run('d3', { endedAt: Date.UTC(2026, 9, 10, 1), implementer: 'claude', model: 'm' })])
+  expect(JSON.stringify(days)).toBe(frozen)
+  expect(more['2026-10-09']!['opencode|openai/gpt-6.1-sol']!.ops).toBe(2)
+  expect(more['2026-10-10']!['claude|m']!.ops).toBe(1)
 })

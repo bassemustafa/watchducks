@@ -1,5 +1,6 @@
 import type { Classification, Implementer, Ledger, RelayProjection, Review, Run, RunStatus, Spend, Usage } from '../types'
 import { fnv1a, codenameFor } from './codename'
+import { addRunsToDays } from './history'
 import { ZERO_USAGE, addUsage, estimateCost, usageFromApi, type PriceTable } from './price'
 
 // Pure ledger reducer (spec §5-§7): every action returns a new ledger and the
@@ -15,6 +16,7 @@ export type StepUsage = {
 
 export type Action =
   | { type: 'spawn'; id: string; agentType: string; requestedModel?: string; parentId?: string; at: number }
+  | { type: 'adopt'; id: string; agentType: string; parentId?: string; at: number }
   | { type: 'step'; loop?: string; turnId: string; index: number; model: string; effort?: string | number; usage: StepUsage | null; at: number }
   | { type: 'turnComplete'; loop?: string; turnId: string; reason: 'answer' | 'aborted' | 'refusal' | 'error'; usage?: StepUsage; at: number }
   | { type: 'agentStatus'; id: string; status: string; at: number }
@@ -43,6 +45,8 @@ export type Totals = {
 const SERIES_MAX = 30
 const MINUTE_MS = 60_000
 const MAX_HANDLERS = 3
+/** Per-ledger cap on the replay-dedup maps: past it the oldest keys are dropped. */
+const MAX_STEP_KEYS = 4096
 
 export function emptyLedger(sessionId: string, at: number): Ledger {
   return {
@@ -60,7 +64,32 @@ export function emptyLedger(sessionId: string, at: number): Ledger {
     bgSeen: {},
     tokenSeries: [],
     seriesEndMinute: 0,
+    retired: {},
   }
+}
+
+/** The last `minutes` per-minute token totals, oldest first, ending at the minute of `nowMs` (zero where nothing was recorded). */
+export function seriesWindow(ledger: Ledger, nowMs: number, minutes = SERIES_MAX): number[] {
+  const count = Number.isFinite(minutes) ? Math.max(0, Math.floor(minutes)) : 0
+  const out = new Array<number>(count).fill(0)
+  if (!Number.isFinite(nowMs)) return out
+  const nowMinute = Math.floor(nowMs / MINUTE_MS)
+  const series = ledger.tokenSeries
+  for (let i = 0; i < count; i++) {
+    const slot = series.length - 1 - (ledger.seriesEndMinute - (nowMinute - (count - 1 - i)))
+    if (slot >= 0 && slot < series.length) out[i] = series[slot] ?? 0
+  }
+  return out
+}
+
+/** `map` plus `key`; past MAX_STEP_KEYS the oldest keys (insertion order) are dropped. */
+function withKey(map: Record<string, true>, key: string): Record<string, true> {
+  const next: Record<string, true> = { ...map, [key]: true }
+  const keys = Object.keys(next)
+  if (keys.length <= MAX_STEP_KEYS) return next
+  const trimmed: Record<string, true> = {}
+  for (const k of keys.slice(keys.length - MAX_STEP_KEYS)) trimmed[k] = true
+  return trimmed
 }
 
 function emptySpend(): Spend {
@@ -211,8 +240,8 @@ function reduceStep(ledger: Ledger, a: Extract<Action, { type: 'step' }>, prices
     next = charge(next, a.loop, a.usage, a.model, 'steps', a.at, prices)
     next = {
       ...next,
-      countedSteps: { ...next.countedSteps, [key]: true },
-      turnsWithSteps: { ...next.turnsWithSteps, [turnKey(a.loop, a.turnId)]: true },
+      countedSteps: withKey(next.countedSteps, key),
+      turnsWithSteps: withKey(next.turnsWithSteps, turnKey(a.loop, a.turnId)),
     }
   }
   const run = a.loop === undefined ? undefined : getRun(next, a.loop)
@@ -234,7 +263,13 @@ function reduceTurnComplete(ledger: Ledger, a: Extract<Action, { type: 'turnComp
   const key = stepKey(a.loop, a.turnId, -1)
   if (a.usage && !Object.hasOwn(next.turnsWithSteps, turnKey(a.loop, a.turnId)) && !Object.hasOwn(next.countedSteps, key)) {
     next = charge(next, a.loop, a.usage, a.usage.model, 'complete', a.at, prices)
-    next = { ...next, countedSteps: { ...next.countedSteps, [key]: true } }
+    next = { ...next, countedSteps: withKey(next.countedSteps, key) }
+    // the complete usage names the model that ran: the run shows it like a step would
+    const charged = a.loop === undefined ? undefined : getRun(next, a.loop)
+    if (charged && a.usage.model) {
+      const models = charged.models ?? []
+      next = putRun(next, { ...charged, model: a.usage.model, models: models.includes(a.usage.model) ? models : [...models, a.usage.model] })
+    }
   }
   const run = a.loop === undefined ? undefined : getRun(next, a.loop)
   if (!run) return next
@@ -260,6 +295,17 @@ function reduceSpawn(ledger: Ledger, a: Extract<Action, { type: 'spawn' }>): Led
     ...base,
     agentType: a.agentType,
     ...(a.requestedModel !== undefined ? { model: a.requestedModel } : {}),
+    ...(a.parentId !== undefined ? { parentId: a.parentId } : {}),
+  }
+  return withHandlers(addRun(ledger, run))
+}
+
+/** An agent the engine lists but no `agent.spawn` reported (a forked skill): a run like a spawn's, with nothing from its prompt. */
+function reduceAdopt(ledger: Ledger, a: Extract<Action, { type: 'adopt' }>): Ledger {
+  if (Object.hasOwn(ledger.runs, a.id)) return ledger
+  const run: Run = {
+    ...newRun(ledger, a.id, 'agent', 'claude-code', a.at),
+    agentType: a.agentType,
     ...(a.parentId !== undefined ? { parentId: a.parentId } : {}),
   }
   return withHandlers(addRun(ledger, run))
@@ -347,6 +393,7 @@ function reduceRelayResult(ledger: Ledger, a: Extract<Action, { type: 'relayResu
     readOnly: run.readOnly || p.readOnly,
     usage,
     usageSource: p.usage ? 'relay' : run.usageSource,
+    resultRead: true,
     cost,
     costSource,
     costPartial,
@@ -356,7 +403,10 @@ function reduceRelayResult(ledger: Ledger, a: Extract<Action, { type: 'relayResu
     ...(p.touchedFiles !== null ? { editCalls: p.touchedFiles } : {}),
   }
   const settled = p.status === 'running' ? updated : finish(updated, p.status, p.finishedAt ?? a.at)
-  return withHandlers(putRun(ledger, settled))
+  const next = withHandlers(putRun(ledger, settled))
+  // the first relay usage joins the tokens-per-minute series; a repeated result adds nothing
+  if (!p.usage || run.usageSource === 'relay') return next
+  return bumpSeries(next, a.at, p.usage.uncached + p.usage.output + p.usage.cacheRead + p.usage.cacheWrite)
 }
 
 function reduceFindings(ledger: Ledger, a: Extract<Action, { type: 'findings' }>): Ledger {
@@ -387,7 +437,11 @@ function reduceVerdict(ledger: Ledger, a: Extract<Action, { type: 'verdict' }>):
 
 function reduceClear(ledger: Ledger): Ledger {
   const kept: Record<string, Run> = {}
-  for (const [id, run] of Object.entries(ledger.runs)) if (run.status === 'running') kept[id] = run
+  const removed: Run[] = []
+  for (const [id, run] of Object.entries(ledger.runs)) {
+    if (run.status === 'running') kept[id] = run
+    else removed.push(run)
+  }
   const findings: Ledger['findings'] = {}
   for (const [toolUseId, entry] of Object.entries(ledger.findings)) {
     if (entry.runId === 'main' || Object.hasOwn(kept, entry.runId)) findings[toolUseId] = entry
@@ -402,6 +456,7 @@ function reduceClear(ledger: Ledger): Ledger {
     order: ledger.order.filter(id => Object.hasOwn(kept, id)),
     findings,
     bgSeen,
+    retired: addRunsToDays(ledger.retired ?? {}, removed),
   })
 }
 
@@ -409,26 +464,35 @@ function isReviewer(run: Run): boolean {
   return run.lane === 'review' || run.lane === 'debate' || (run.agentType !== undefined && /review/i.test(run.agentType)) || run.readOnly
 }
 
-/** Suspected handlers: reviewers on the same workdir that started after the work ended (spec §6.4). */
+/**
+ * Suspected handlers (spec §6.4): each reviewer picks the 3 newest ended non-reviewer runs on its
+ * workdir that ended before it started; a run's handlers are the reviewers that picked it, newest first.
+ */
 function withHandlers(ledger: Ledger): Ledger {
-  const candidates: { run: Run; at: number }[] = []
+  const reviewers: { run: Run; at: number }[] = []
+  const targets: { run: Run; at: number }[] = []
   ledger.order.forEach((id, at) => {
     const run = getRun(ledger, id)
-    if (run && isReviewer(run)) candidates.push({ run, at })
+    if (!run) return
+    if (isReviewer(run)) reviewers.push({ run, at })
+    else if (run.workdirKey !== undefined && run.endedAt !== undefined) targets.push({ run, at })
   })
+  const pickedBy = new Map<string, { run: Run; at: number }[]>()
+  for (const reviewer of reviewers) {
+    if (reviewer.run.workdirKey === undefined) continue
+    targets
+      .filter(t => t.run.workdirKey === reviewer.run.workdirKey && (t.run.endedAt ?? 0) <= reviewer.run.startedAt)
+      .sort((x, y) => (y.run.endedAt ?? 0) - (x.run.endedAt ?? 0) || y.at - x.at)
+      .slice(0, MAX_HANDLERS)
+      .forEach(t => pickedBy.set(t.run.id, [...(pickedBy.get(t.run.id) ?? []), reviewer]))
+  }
   const changed: Run[] = []
   for (const id of ledger.order) {
     const run = getRun(ledger, id)
     if (!run) continue
-    let handlers: string[] = []
-    if (!isReviewer(run) && run.workdirKey !== undefined && run.endedAt !== undefined) {
-      const ended = run.endedAt
-      handlers = candidates
-        .filter(c => c.run.workdirKey === run.workdirKey && c.run.startedAt >= ended)
-        .sort((x, y) => y.run.startedAt - x.run.startedAt || y.at - x.at)
-        .slice(0, MAX_HANDLERS)
-        .map(c => c.run.id)
-    }
+    const handlers = (pickedBy.get(id) ?? [])
+      .sort((x, y) => y.run.startedAt - x.run.startedAt || y.at - x.at)
+      .map(c => c.run.id)
     const same = handlers.length === run.suspectedHandlers.length && handlers.every((h, i) => h === run.suspectedHandlers[i])
     if (!same) changed.push({ ...run, suspectedHandlers: handlers })
   }
@@ -440,6 +504,8 @@ export function reduce(ledger: Ledger, action: Action, prices: PriceTable): Ledg
   switch (action.type) {
     case 'spawn':
       return reduceSpawn(ledger, action)
+    case 'adopt':
+      return reduceAdopt(ledger, action)
     case 'step':
       return reduceStep(ledger, action, prices)
     case 'turnComplete':

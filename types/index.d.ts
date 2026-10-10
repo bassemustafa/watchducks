@@ -51,6 +51,8 @@ export type Run = {
   backgroundTaskId?: string
   /** Resolved relay --out-dir; live only, used to poll result.json after a reload. */
   outDir?: string
+  /** True once a relay result.json was applied; live only, so a reload never reads a reused out-dir again. */
+  resultRead?: boolean
 }
 
 export type Ledger = {
@@ -75,6 +77,8 @@ export type Ledger = {
   /** Delegated tokens per minute, oldest first, at most 30 entries ending at `seriesEndMinute`. */
   tokenSeries: number[]
   seriesEndMinute: number
+  /** History days of runs /clear removed from the live ledger, so the session's record keeps them. */
+  retired: HistoryRecord['days']
 }
 
 export type View = 'field' | 'station' | 'dossier'
@@ -137,6 +141,10 @@ export type StationRow = {
   costReported: number
   costEstimated: number
   unknownCostOps: number
+  /** Runs whose token usage is known (`usage !== null`). */
+  usageOps: number
+  /** Runs whose cost is known (`cost !== null`). */
+  costOps: number
   vetted: number
   bugs: number
 }
@@ -146,7 +154,7 @@ export type HistoryRecord = {
   v: 1
   sessionStartedAt: number
   /** UTC day (YYYY-MM-DD) → `${implementer}|${model}` → counters. */
-  days: Record<string, Record<string, Omit<StationRow, 'implementer' | 'model'>>>
+  days: Record<string, Record<string, Omit<StationRow, 'implementer' | 'model' | 'usageOps' | 'costOps'> & Partial<Pick<StationRow, 'usageOps' | 'costOps'>>>>
 }
 
 declare module 'claude-code' {

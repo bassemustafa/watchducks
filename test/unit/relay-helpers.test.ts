@@ -86,6 +86,11 @@ describe('duePolls', () => {
     expect(duePolls(ledgerOf(run('e', { status: 'failed' })), NOW)).toEqual([])
   })
 
+  test('a relay whose result was already read is not due, running or ended', () => {
+    const ended = run('e', { status: 'done', endedAt: NOW - 1000, resultRead: true })
+    expect(duePolls(ledgerOf(run('r', { resultRead: true }), ended, run('n', {})), NOW)).toEqual(['n'])
+  })
+
   test('ids come back in creation order', () => {
     expect(duePolls(ledgerOf(run('b', {}), run('a', {})), NOW)).toEqual(['b', 'a'])
   })

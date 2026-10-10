@@ -117,3 +117,66 @@ test('session.end with reason clear writes the old history and starts an empty l
   expect(fresh.generation).toBe(old.generation + 1)
   expect(Object.keys(fresh.runs)).toEqual([])
 })
+
+test('a step from a loop listed but never spawned becomes an agent run and is charged to it', async ($, on) => {
+  const ledger = watchLedger(on)
+  on('agent.list', async () => ({ value: [{ id: 'f1', description: '', type: 'skill', status: 'running', parentId: 'p1' }] as never }))
+  on('turn.step', async function* () {
+    return STEP_RESULT
+  })
+  for await (const _ of $.turn.step({ agentId: 'f1', turnId: 't1', index: 0, model: 'claude-sonnet-5-5' } as never)) {
+    /* chunks are never read */
+  }
+  const run = ledger().runs['f1']!
+  expect(run.kind).toBe('agent')
+  expect(run.agentType).toBe('skill')
+  expect(run.parentId).toBe('p1')
+  expect(run.usage).toEqual({ uncached: 1000, output: 100, cacheRead: 0, cacheWrite: 0 })
+  expect(ledger().overhead.usage.uncached).toBe(0)
+})
+
+test('a step from a loop that is not listed still goes to engine overhead', async ($, on) => {
+  const ledger = watchLedger(on)
+  on('agent.list', async () => ({ value: [] as never }))
+  on('turn.step', async function* () {
+    return STEP_RESULT
+  })
+  for await (const _ of $.turn.step({ agentId: 'ghost', turnId: 't1', index: 0, model: 'claude-sonnet-5-5' } as never)) {
+    /* chunks are never read */
+  }
+  expect(ledger().runs['ghost']).toBeUndefined()
+  expect(ledger().overhead.usage.uncached).toBe(1000)
+})
+
+test('a finished agent runs again as its next request starts, before the stream ends', async ($, on) => {
+  const ledger = watchLedger(on)
+  let release: () => void = () => {}
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  let reached: () => void = () => {}
+  const started = new Promise<void>(resolve => {
+    reached = resolve
+  })
+  on('agent.spawn', async () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+  on('turn.complete', async () => ({ text: '' }))
+  on('turn.step', async function* () {
+    reached() // the plugin has run its part before the stream: the request has started
+    await gate
+    return STEP_RESULT
+  })
+  await $.agent.spawn({ subagentType: 'Explore' } as never)
+  await $.turn.complete({ agentId: 'a1', turnId: 't0', reason: 'answer', answer: '', durationMs: 1, isAborted: false } as never)
+  expect(ledger().runs['a1']!.status).toBe('done')
+  const stream = (async () => {
+    for await (const _ of $.turn.step({ agentId: 'a1', turnId: 't1', index: 0, model: 'claude-sonnet-5-5' } as never)) {
+      /* chunks are never read */
+    }
+  })()
+  await started
+  expect(ledger().runs['a1']!.status).toBe('running')
+  expect(ledger().runs['a1']!.usage).toBeNull()
+  release()
+  await stream
+  expect(ledger().runs['a1']!.usage).toEqual({ uncached: 1000, output: 100, cacheRead: 0, cacheWrite: 0 })
+})
