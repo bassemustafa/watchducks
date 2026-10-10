@@ -116,6 +116,8 @@ export function headerSvg(opts: {
   blips: ReadonlyArray<{ angle: number; radius: number; status: RunStatus }>
   motion: boolean
   width: number
+  /** The duck beside the title; default true. The mid width tier leaves it out. */
+  logo?: boolean
 }): string {
   const W = clampInt(opts.width, 280, 1200)
   const H = Math.max(80, Math.round(W * 0.28))
@@ -131,7 +133,8 @@ export function headerSvg(opts: {
   const running = opts.blips.filter(b => b.status === 'running').length
   const total = opts.blips.length
 
-  const textX = duckX + duckSize + pad
+  const logo = opts.logo !== false
+  const textX = logo ? duckX + duckSize + pad : pad
   const fs = Math.round(H * 0.17)
   const naturalTitle = 9 * fs * 0.8
   const room = cx - R - textX - pad * 0.6
@@ -166,8 +169,12 @@ export function headerSvg(opts: {
   s.push(`<rect width="${W}" height="${H}" rx="14" fill="url(#wd-panel)"/>`)
   s.push(`<rect x=".5" y=".5" width="${W - 1}" height="${H - 1}" rx="13.5" fill="none" stroke="url(#wd-edge)"/>`)
   // Duck, on a soft teal glow.
-  s.push(`<ellipse cx="${n(duckX + duckSize / 2)}" cy="${n(duckY + duckSize / 2)}" rx="${n(duckSize * 0.8)}" ry="${n(duckSize * 0.7)}" fill="url(#wd-glowbg)"/>`)
-  s.push(`<g shape-rendering="crispEdges">${duckRects(duckX, duckY, p)}</g>`)
+  if (logo) {
+    s.push(
+      `<g id="wd-duck"><ellipse cx="${n(duckX + duckSize / 2)}" cy="${n(duckY + duckSize / 2)}" rx="${n(duckSize * 0.8)}" ry="${n(duckSize * 0.7)}" fill="url(#wd-glowbg)"/>`,
+      `<g shape-rendering="crispEdges">${duckRects(duckX, duckY, p)}</g></g>`,
+    )
+  }
   // Title block.
   s.push(`<text class="tx" x="${n(textX)}" y="${n(titleY)}" font-family="${FONT_SANS}" font-size="${fs}" font-weight="700" letter-spacing="2" fill="${PALETTE.text}"${fit}>THE FLOCK</text>`)
   s.push(`<rect x="${n(textX)}" y="${n(barY)}" width="34" height="3" rx="1.5" fill="url(#wd-rule)"/>`)
@@ -210,7 +217,7 @@ export function barSvg(segments: ReadonlyArray<{ label: string; value: number; c
     const gap = i === 0 ? 0 : 0.75
     const tail = i === used.length - 1 ? 0 : 0.75
     const share = Math.round((seg.value / total) * 100)
-    const tip = `${esc(seg.label)}: ${fmtValue(seg.value)} (${share < 1 ? '<1' : share}%)`
+    const tip = `${esc(seg.label)}: ${fmtValue(seg.value)} (${share < 1 ? '&lt;1' : share}%)`
     defs.push(`<linearGradient id="wd-seg${i}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${toHex(mix(hex(color), 0xffffff, 0.3))}"/><stop offset="1" stop-color="${color}"/></linearGradient>`)
     bars.push(`<g><title>${tip}</title><rect x="${n(x + gap)}" y="0" width="${n(Math.max(0.5, w - gap - tail))}" height="${H}" fill="url(#wd-seg${i})"/></g>`)
     x += w

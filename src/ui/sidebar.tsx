@@ -3,7 +3,7 @@ import type { Elements, On, PluginOptions } from 'claude-code'
 
 import type { HistoryRecord, Implementer, Ledger, Run, StationRow, UiState } from '../../types'
 import { HISTORY_PREFIX, aggregateHistory, stationRowsFromLedger } from '../history'
-import { totals, type Totals } from '../ledger'
+import { seriesWindow, totals, type Totals } from '../ledger'
 import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord } from '../state'
 import { RADAR_FULL, RADAR_SMALL, blipsFor, radar, svgBlipsFor } from './animate'
 import { codenameOf, dossierView, fit, runCost, runElapsed, runTokens, totalTokens, type Glyphs, type Press, type Table } from './dossier'
@@ -112,13 +112,49 @@ function spendParts(tot: Totals): Array<[Implementer, number]> {
     .sort((a, b) => b[1] - a[1])
 }
 
+function tagline(ledger: Ledger, tot: Totals): string {
+  return ledger.order.length === 0 ? 'standing by' : `${tot.running} in field · ${ledger.order.length} tracked`
+}
+
+/** The text-only header of the compact tier, on both surfaces: no Raster, no Svg. */
+function textHeader(t: Table, ledger: Ledger, tot: Totals): El {
+  const { Box, Text } = t
+  return (
+    <Box flexDirection="column">
+      <Text bold color={PALETTE.accent}>
+        THE FLOCK
+      </Text>
+      <Text dimColor>{tagline(ledger, tot)}</Text>
+      <Text> </Text>
+      {counters(t, tot)}
+    </Box>
+  )
+}
+
+function cacheText(t: Table, tot: Totals): El {
+  const { Text } = t
+  return (
+    <Text dimColor wrap="truncate">
+      {`cache ${cachePct(tot.usage)}`}
+    </Text>
+  )
+}
+
+function spendText(t: Table, parts: ReadonlyArray<[Implementer, number]>, inner: number): El | null {
+  if (parts.length === 0) return null
+  const { Text } = t
+  return (
+    <Text dimColor wrap="truncate">
+      {fit(`spend ${parts.map(([imp, v]) => `${imp} ${fmtCost(v, null, false)}`).join(' · ')}`, inner)}
+    </Text>
+  )
+}
+
 // ---------------------------------------------------------------- terminal
 
 function terminalArt(t: Elements['terminal'], ledger: Ledger, tot: Totals, lay: Layout): Art {
   const { Box, Text, Raster } = t
-  const tagline = (
-    <Text dimColor>{ledger.order.length === 0 ? 'standing by' : `${tot.running} in field · ${ledger.order.length} tracked`}</Text>
-  )
+  const tag = <Text dimColor>{tagline(ledger, tot)}</Text>
   const title = (
     <Text bold color={PALETTE.accent}>
       THE FLOCK
@@ -130,14 +166,7 @@ function terminalArt(t: Elements['terminal'], ledger: Ledger, tot: Totals, lay: 
 
   let header: El
   if (lay.tier === 'compact') {
-    header = (
-      <Box flexDirection="column">
-        {title}
-        {tagline}
-        {blank}
-        {counters(t, tot)}
-      </Box>
-    )
+    header = textHeader(t, ledger, tot)
   } else {
     const size = lay.tier === 'full' ? RADAR_FULL : RADAR_SMALL
     radar.mounted = { columns: size.columns, rows: size.rows }
@@ -157,7 +186,7 @@ function terminalArt(t: Elements['terminal'], ledger: Ledger, tot: Totals, lay: 
             <Raster {...raster(duckLogo())} />
             <Box flexDirection="column" marginLeft={2}>
               {title}
-              {tagline}
+              {tag}
             </Box>
           </Box>
           {blank}
@@ -168,7 +197,7 @@ function terminalArt(t: Elements['terminal'], ledger: Ledger, tot: Totals, lay: 
       header = (
         <Box flexDirection="column">
           {title}
-          {tagline}
+          {tag}
           {blank}
           {radarRow}
         </Box>
@@ -176,8 +205,9 @@ function terminalArt(t: Elements['terminal'], ledger: Ledger, tot: Totals, lay: 
     }
   }
 
-  const cacheBar = <Raster {...raster(gradientBar(cacheFraction, lay.inner, hex(PALETTE.accent), hex(PALETTE.done), 'cache'))} />
   const parts = spendParts(tot)
+  if (lay.tier === 'compact') return { header, cacheBar: cacheText(t, tot), spendBar: spendText(t, parts, lay.inner) }
+  const cacheBar = <Raster {...raster(gradientBar(cacheFraction, lay.inner, hex(PALETTE.accent), hex(PALETTE.done), 'cache'))} />
   const spendBar =
     parts.length === 0
       ? null
@@ -197,13 +227,14 @@ function desktopArt(t: Elements['desktop'], ledger: Ledger, tot: Totals, lay: La
   const barPx = Math.max(120, lay.inner * 8)
   const input = tot.usage.uncached + tot.usage.cacheRead + tot.usage.cacheWrite
   const parts = spendParts(tot)
+  if (lay.tier === 'compact') return { header: textHeader(t, ledger, tot), cacheBar: cacheText(t, tot), spendBar: spendText(t, parts, lay.inner) }
   const header = (
     <Box flexDirection="column">
       <Svg
         isInteractive
         alt="The flock radar"
         width={px}
-        source={headerSvg({ blips: svgBlipsFor(ledger), motion, width: px })}
+        source={headerSvg({ blips: svgBlipsFor(ledger), motion, width: px, logo: lay.tier === 'full' })}
       />
       <Text> </Text>
       {counters(t, tot)}
@@ -240,6 +271,23 @@ function desktopArt(t: Elements['desktop'], ledger: Ledger, tot: Totals, lay: La
 
 // -------------------------------------------------------------- field view
 
+/** Greedy-wraps `parts` joined by " · " into lines of at most `width` cells; a part is never split. */
+function packFigures(parts: readonly string[], width: number): string[] {
+  const lines: string[] = []
+  let current = ''
+  for (const part of parts) {
+    const joined = current === '' ? part : `${current} · ${part}`
+    if (current !== '' && Array.from(joined).length > width) {
+      lines.push(current)
+      current = part
+    } else {
+      current = joined
+    }
+  }
+  if (current !== '') lines.push(current)
+  return lines.map(line => fit(line, width))
+}
+
 function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g: Glyphs, stamped: boolean, press: Press): El {
   const { Text, Button } = t
   const color = statusColor(run.status)
@@ -264,14 +312,12 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
     const id = run.suspectedHandlers[0] ?? ''
     line2 = <Text color={PALETTE.handler}>{fit(`suspected handler? ${codenameOf(ledger, id)}`, inner)}</Text>
   } else {
-    line2 = (
-      <Text dimColor>
-        {fit(
-          `${words.spy} · ${words.plain}   ${fmtDuration(runElapsed(run, now))}   ${runTokens(run)} tok   ${runCost(run)}`,
-          inner,
-        )}
-      </Text>
-    )
+    const status = `${words.spy} · ${words.plain}`
+    const figures = [fmtDuration(runElapsed(run, now)), `${runTokens(run)} tok`, runCost(run)]
+    const whole = `${status}   ${figures.join('   ')}`
+    // too long for one line: the status keeps its own line, the figures wrap whole so tokens and cost never get cut
+    const lines = Array.from(whole).length <= inner ? [whole] : [fit(status, inner), ...packFigures(figures, inner)]
+    line2 = <Text dimColor>{lines.join('\n')}</Text>
   }
   return (
     <Button key={run.id} plain onPress={() => press({ view: 'dossier', dossierId: run.id })}>
@@ -299,14 +345,14 @@ function fieldView(
   const tot = totals(ledger)
   const runs = orderedRuns(ledger)
   const delegated = totalTokens(tot.usage) ?? 0
-  const series = sparkline(ledger.tokenSeries, Math.min(15, Math.max(4, inner - LABEL - 2)))
+  const series = sparkline(seriesWindow(ledger, now, 30), Math.min(15, Math.max(4, inner - LABEL - 2)))
   const stampId = ui.stamp && ui.stamp.until > now ? ui.stamp.runId : undefined
   const parts = spendParts(tot)
 
   const kv = (label: string, value: string, color?: string) => (
     <Text wrap="truncate">
       <Text dimColor>{label.padEnd(LABEL)}</Text>
-      <Text bold color={color ?? PALETTE.text}>
+      <Text bold color={color}>
         {value}
       </Text>
     </Text>

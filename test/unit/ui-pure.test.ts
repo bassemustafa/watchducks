@@ -2,6 +2,9 @@ import { expect, test } from 'claude-code/testing'
 
 import { cachePct, fmtCost, fmtDuration, fmtTokens, sparkline } from '../../src/ui/format'
 import { DEFAULT_COLOR, dimTwin, duckLogo, encodeCells, gradientBar, hex, radarFrame, type RasterSpec } from '../../src/ui/raster'
+import type { Run } from '../../types'
+import { emptyLedger } from '../../src/ledger'
+import { codenameOf, runCost, runTokens } from '../../src/ui/dossier'
 import { barSvg, headerSvg } from '../../src/ui/svg'
 import { glyphs, statusColor, statusWords } from '../../src/ui/theme'
 
@@ -265,4 +268,61 @@ test('barSvg draws a segment per positive value with exact tooltips and safe col
   const empty = barSvg([], 200)
   expect(empty).not.toContain('<title>')
   expect(empty).toContain('width="200"')
+})
+
+test('F24: a share under 1% is written with an escaped angle bracket', () => {
+  const svg = barSvg(
+    [
+      { label: 'tiny', value: 0.001, color: '#2dd4bf' },
+      { label: 'rest', value: 1, color: '#f87171' },
+    ],
+    200,
+  )
+  expect(svg).not.toContain('(<')
+  expect(svg).toContain('&lt;1%')
+})
+
+test('F16: headerSvg without the logo has no duck group and keeps the title', () => {
+  const opts = { blips: [], motion: false, width: 400 }
+  expect(headerSvg(opts)).toContain('id="wd-duck"')
+  expect(headerSvg({ ...opts, logo: true })).toContain('id="wd-duck"')
+  const bare = headerSvg({ ...opts, logo: false })
+  expect(bare).not.toContain('wd-duck')
+  expect(bare).toContain('THE FLOCK')
+})
+
+test('F21: the HQ reviewer id is named HQ, an unknown id stays "?"', () => {
+  const ledger = emptyLedger('', 0)
+  expect(codenameOf(ledger, 'hq')).toBe('HQ')
+  expect(codenameOf(ledger, 'nobody')).toBe('?')
+})
+
+// A relay run as the ledger holds it before any result was read.
+function relay(implementer: Run['implementer'], outDir?: string): Run {
+  return {
+    id: 'bash:u1',
+    kind: 'relay',
+    codename: 'ALPHA-01',
+    implementer,
+    readOnly: false,
+    status: 'running',
+    startedAt: 0,
+    usage: null,
+    usageSource: null,
+    cost: null,
+    costSource: null,
+    costPartial: false,
+    editCalls: 0,
+    bugsReported: 0,
+    reviews: [],
+    suspectedHandlers: [],
+    ...(outDir !== undefined ? { outDir } : {}),
+  }
+}
+
+test('F25: a claude relay without an out dir shows dashes for tokens and cost, with one it stays unknown', () => {
+  expect(runTokens(relay('claude'))).toBe('—')
+  expect(runCost(relay('claude'))).toBe('—')
+  expect(runTokens(relay('claude', '/tmp/o1'))).toBe('?')
+  expect(runCost(relay('claude', '/tmp/o1'))).toBe('?')
 })

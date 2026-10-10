@@ -32,7 +32,7 @@ export function registerBand(on: On, options: PluginOptions): void {
 
     let placed = false
     try {
-      placed = (await $.ui.panes()).some(p => p.id === 'flock' && p.isPlaced)
+      placed = (await $.ui.panes()).some(p => p.id === 'flock' && p.isPlaced && p.isShown)
     } catch {
       // unknown placement: show the band
     }

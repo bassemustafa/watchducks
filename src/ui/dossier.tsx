@@ -29,14 +29,15 @@ export function runTokens(run: Run): string {
   const total = totalTokens(run.usage)
   if (total !== null) return fmtTokens(total)
   if (run.kind === 'cli' || run.kind === 'shell') return '—'
-  if (run.kind === 'relay' && run.implementer !== 'claude') return '—'
+  if (run.kind === 'relay' && (run.implementer !== 'claude' || run.outDir === undefined)) return '—'
   return '?'
 }
 
 export function runCost(run: Run): string {
   if (run.cost === null && run.costSource === null) {
     if (run.kind === 'cli' || run.kind === 'shell') return '—'
-    if (run.kind === 'relay' && run.implementer === 'codex') return '—'
+    // a relay without an out dir has no result file to read, so its cost can never arrive
+    if (run.kind === 'relay' && (run.implementer === 'codex' || run.outDir === undefined)) return '—'
   }
   return fmtCost(run.cost, run.costSource, run.costPartial)
 }
@@ -48,7 +49,8 @@ export function runElapsed(run: Run, now: number): number {
 
 export function codenameOf(ledger: Ledger, id: string): string {
   const run = Object.hasOwn(ledger.runs, id) ? ledger.runs[id] : undefined
-  return run ? run.codename : '?'
+  if (run) return run.codename
+  return id === 'hq' ? 'HQ' : '?'
 }
 
 function clock(ms: number | undefined): string {
@@ -88,7 +90,7 @@ export function dossierView(
   const row = (label: string, value: string, valueColor?: string) => (
     <Text wrap="truncate">
       <Text dimColor>{label.padEnd(LABEL)}</Text>
-      <Text color={valueColor ?? PALETTE.text}>{fit(value, inner - LABEL)}</Text>
+      <Text color={valueColor}>{fit(value, inner - LABEL)}</Text>
     </Text>
   )
 
