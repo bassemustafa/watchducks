@@ -1,0 +1,6 @@
+{
+  "name": "watchducks",
+  "description": "watchducks: a flock of spy ducks watching every subagent, relay and background run your Claude Code session starts.",
+  "owner": { "name": "bassemustafa" },
+  "plugins": [{ "name": "watchducks", "source": "./" }]
+}
