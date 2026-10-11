@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import { isInsideRoots, projectRelayResult } from '../../src/relay-result'
+import { workdirKey } from '../../src/ledger'
+import { isInsideRoots, projectRelayResult, relayIdentity } from '../../src/relay-result'
 
 const SAMPLE = '{"schema":"delegate-relay.result.v1","lane":"debate","tool":"opencode","agent":"plan","model":"openai/gpt-6.1-sol","variant":"high","status":"completed","exitCode":0,"startedAt":"2026-10-09T12:05:33.841Z","finishedAt":"2026-10-09T12:12:00.928Z","finalMessage":"SENTINEL-FINAL","briefPath":"/tmp/SENTINEL-PATH","touchedFiles":["?? .gitignore"],"cost":0}'
 
@@ -63,4 +64,48 @@ test('a status naming an Object prototype key is ended, not a prototype value', 
 test('an empty root allows nothing', () => {
   expect(isInsideRoots('/home/u/.ssh/id', [''])).toBe(false)
   expect(isInsideRoots('/tmp/o/result.json', ['', '/tmp'])).toBe(true)
+})
+
+test('any versioned relay result schema projects; other schemas do not', () => {
+  expect(projectRelayResult('{"schema":"delegate-relay.result.v2","status":"completed","tool":"gemini"}')?.implementer).toBe('gemini')
+  expect(projectRelayResult('{"schema":"delegate-relay.result.v12","status":"completed"}')?.status).toBe('done')
+  expect(projectRelayResult('{"schema":"delegate-relay.result.v","status":"completed"}')).toBeNull()
+  expect(projectRelayResult('{"schema":"delegate-relay.result.v1234","status":"completed"}')).toBeNull()
+  expect(projectRelayResult('{"schema":"xdelegate-relay.result.v1","status":"completed"}')).toBeNull()
+})
+
+const IDENTITY = '{"schema":"delegate-relay.result.v1","tool":"claude","startedAt":"2026-10-09T12:05:33.841Z","workdir":"/home/u/SENTINEL-WORKDIR","finalMessage":"SENTINEL-FINAL"}'
+
+test('relayIdentity reads the start, the tool and a hash of the working directory', () => {
+  const id = relayIdentity(IDENTITY)
+  expect(id?.startedAt).toBe(Date.parse('2026-10-09T12:05:33.841Z'))
+  expect(id?.tool).toBe('claude')
+  expect(id?.workdirKey).toBe(workdirKey('/home/u/SENTINEL-WORKDIR'))
+})
+
+test('relayIdentity never returns the working directory or any other field', () => {
+  const json = JSON.stringify(relayIdentity(IDENTITY))
+  expect(json).not.toContain('SENTINEL-WORKDIR')
+  expect(json).not.toContain('SENTINEL-FINAL')
+  expect(Object.keys(relayIdentity(IDENTITY) ?? {}).sort()).toEqual(['startedAt', 'tool', 'workdirKey'])
+})
+
+test('relayIdentity accepts v1 and v2 and rejects other schemas', () => {
+  expect(relayIdentity(IDENTITY.replace('result.v1', 'result.v2'))?.tool).toBe('claude')
+  expect(relayIdentity(IDENTITY.replace('delegate-relay.result.v1', 'other'))).toBeNull()
+  expect(relayIdentity(IDENTITY.replace('"schema"', '"schemas"'))).toBeNull()
+})
+
+test('relayIdentity needs a start time; tool and workdir are optional and type-checked', () => {
+  expect(relayIdentity('{"schema":"delegate-relay.result.v1","tool":"claude"}')).toBeNull()
+  expect(relayIdentity('{"schema":"delegate-relay.result.v1","startedAt":"not a date"}')).toBeNull()
+  const bare = relayIdentity('{"schema":"delegate-relay.result.v1","startedAt":"2026-10-09T12:05:33.841Z","tool":"vim","workdir":5}')
+  expect(bare).toEqual({ startedAt: Date.parse('2026-10-09T12:05:33.841Z') })
+})
+
+test('relayIdentity returns null for oversize, invalid and non-object JSON', () => {
+  expect(relayIdentity('{"schema":"delegate-relay.result.v1","startedAt":"2026-10-09T12:05:33.841Z","finalMessage":"' + 'x'.repeat(2 * 1024 * 1024) + '"}')).toBeNull()
+  expect(relayIdentity('{"schema":')).toBeNull()
+  expect(relayIdentity('[1,2]')).toBeNull()
+  expect(relayIdentity('null')).toBeNull()
 })

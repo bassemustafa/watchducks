@@ -24,7 +24,7 @@ function watchLedger(on: On): () => Ledger {
 }
 
 // The world beneath the plugin for a session that polls: a background relay Bash call, a store and a clock.
-function world(on: On, sessionId: () => string = () => 'S1'): MockClock {
+function world(on: On, sessionId: () => string = () => 'S1', env: Record<string, string> = {}): MockClock {
   on('command.register', async () => ({ value: { command: 'flock' } }))
   on('tool.register', async () => ({ value: { tool: 'mcp__watchducks__x' } }))
   on('session.id', async () => ({ value: sessionId() }))
@@ -35,7 +35,7 @@ function world(on: On, sessionId: () => string = () => 'S1'): MockClock {
   on('store.keys', async () => ({ value: [] }))
   on('store.set', async () => ({ value: undefined }))
   on('tool.call', { tool: 'Bash' }, async () => ({ result: { backgroundTaskId: 't1' } }) as never)
-  mock.env(on, {})
+  mock.env(on, env)
   return mock.clock(on)
 }
 
@@ -175,4 +175,209 @@ test('a result read before a reload is not applied again when a newer result.jso
   await $.session.start(START)
   await clock.advance(3000)
   near(ledger().runs['bash:u1']!.cost, 0.02244)
+})
+
+// Discovery (a relay with no --out-dir): an in-memory tree where every path lands on itself and a missing one is not a file.
+type Node = { kind: 'dir' | 'file'; mtimeMs: number; text?: string }
+
+function nodesOf(dirs: string[], files: Record<string, string> = {}, mtimeMs: number = Date.now()): Record<string, Node> {
+  const out: Record<string, Node> = {}
+  for (const dir of ['/work', '/tmp', ...dirs]) out[dir] = { kind: 'dir', mtimeMs }
+  for (const [path, text] of Object.entries(files)) out[path] = { kind: 'file', mtimeMs, text }
+  return out
+}
+
+function memfs(on: On, nodes: Record<string, Node>): { reads: () => string[]; lists: () => number } {
+  const reads: string[] = []
+  let lists = 0
+  const at = (path: string): Node | undefined => (Object.hasOwn(nodes, path) ? nodes[path] : undefined)
+  on('fs.stat', async ($, e) => {
+    const node = at(e.path)
+    if (!node) return { value: { kind: 'other' as const, size: 0, mtimeMs: 0, isLink: false } }
+    return { value: { kind: node.kind, size: node.text?.length ?? 0, mtimeMs: node.mtimeMs, isLink: false, realPath: e.path } }
+  })
+  on('fs.list', async ($, e) => {
+    lists += 1
+    const entries = Object.entries(nodes)
+      .filter(([path]) => path.slice(0, path.lastIndexOf('/')) === e.path)
+      .map(([path, node]) => ({
+        name: path.slice(path.lastIndexOf('/') + 1),
+        kind: node.kind,
+        size: node.text?.length ?? 0,
+        mtimeMs: node.kind === 'file' ? node.mtimeMs : 0,
+        isLink: false,
+      }))
+    return { value: entries }
+  })
+  on('fs.read', async ($, e) => {
+    reads.push(e.path)
+    return { value: at(e.path)?.text ?? '' }
+  })
+  return { reads: () => reads, lists: () => lists }
+}
+
+const USAGE = { input_tokens: 20, output_tokens: 100, cache_read_input_tokens: 300, cache_creation_input_tokens: 0 }
+
+function resultText(patch: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    schema: 'delegate-relay.result.v1',
+    tool: 'claude',
+    status: 'completed',
+    workdir: '/repo',
+    startedAt: new Date(Date.now()).toISOString(),
+    usage: USAGE,
+    totalCostUsd: 0.5,
+    ...patch,
+  })
+}
+
+// a background relay that names no out-dir, started in /repo
+const BARE_CALL = { tool: 'Bash', tool_use_id: 'u1', run_in_background: true, command: 'node /x/claude-delegate/scripts/relay.mjs --lane quick --brief b --cd /repo' }
+
+async function polls(clock: MockClock, count: number): Promise<void> {
+  for (let i = 0; i < count; i++) await clock.advance(3000)
+}
+
+test('a relay with no out-dir gets the cost and usage of the result.json it finds under the temp dir', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-found'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const dir = `${tmp}/delegate-relay/repo-20261012T101500`
+  memfs(on, nodesOf([tmp, `${tmp}/delegate-relay`, dir], { [`${dir}/result.json`]: resultText() }))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 6)
+  const run = ledger().runs['bash:u1']!
+  expect(run.outDir).toBe(dir)
+  near(run.cost, 0.5)
+  expect(run.costSource).toBe('reported')
+  expect(run.usage).toEqual({ uncached: 20, output: 100, cacheRead: 300, cacheWrite: 0 })
+  expect(run.status).toBe('done')
+  expect(run.resultRead).toBe(true)
+})
+
+test('discovery runs on every third poll, not before', async ($, on) => {
+  const clock = world(on, () => 'S1', { TMPDIR: '/tmp/wd-disc-cadence' })
+  const fs = memfs(on, nodesOf(['/tmp/wd-disc-cadence']))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 2)
+  expect(fs.lists()).toBe(0)
+  await polls(clock, 1)
+  expect(fs.lists()).toBeGreaterThan(0)
+})
+
+test('a result.json of another working directory is not taken, even when it started closer', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-workdir'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const mine = `${tmp}/delegate-relay/repo-b`
+  const other = `${tmp}/delegate-relay/other-a`
+  memfs(
+    on,
+    nodesOf([tmp, `${tmp}/delegate-relay`, mine, other], {
+      [`${mine}/result.json`]: resultText({ startedAt: new Date(Date.now() + 1000).toISOString() }),
+      [`${other}/result.json`]: resultText({ workdir: '/other', totalCostUsd: 9.9 }),
+    }),
+  )
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 6)
+  const run = ledger().runs['bash:u1']!
+  expect(run.outDir).toBe(mine)
+  near(run.cost, 0.5)
+})
+
+test('with only another working directory result.json the run stays without an out-dir and nothing of it is stored', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-alone'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const other = `${tmp}/delegate-relay/other-a`
+  memfs(on, nodesOf([tmp, `${tmp}/delegate-relay`, other], { [`${other}/result.json`]: resultText({ workdir: '/SENTINEL-OTHER', totalCostUsd: 9.9 }) }))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 9)
+  const run = ledger().runs['bash:u1']!
+  expect(run.outDir).toBeUndefined()
+  expect(run.cost).toBeNull()
+  const stored = JSON.stringify(ledger())
+  expect(stored).not.toContain('SENTINEL-OTHER')
+  expect(stored).not.toContain('other-a')
+})
+
+test('a result.json from long before the run is read once and then left alone', async ($, on) => {
+  const tmp = '/tmp/wd-disc-old'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const old = `${tmp}/delegate-relay/repo-old`
+  const fs = memfs(on, nodesOf([tmp, `${tmp}/delegate-relay`, old], { [`${old}/result.json`]: resultText({ startedAt: new Date(Date.now() - 600_000).toISOString() }) }))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 12)
+  expect(fs.reads().length).toBe(1)
+})
+
+test('under the session root only the direct child directories are searched', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-session'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  memfs(on, nodesOf([tmp, '/work/deep', '/work/deep/inner'], { '/work/deep/inner/result.json': resultText() }))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 9)
+  expect(ledger().runs['bash:u1']!.outDir).toBeUndefined()
+})
+
+test('a result.json directly under a session root child directory is found', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-sessionchild'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  memfs(on, nodesOf([tmp, '/work/out-1'], { '/work/out-1/result.json': resultText() }))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 6)
+  const run = ledger().runs['bash:u1']!
+  expect(run.outDir).toBe('/work/out-1')
+  near(run.cost, 0.5)
+})
+
+test('more than 32 fresh result.json files of other runs do not starve the matching one, and an unchanged one is read once', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-many'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const base = `${tmp}/delegate-relay`
+  const dirs = [tmp, base]
+  const files: Record<string, string> = {}
+  for (let i = 0; i < 40; i++) {
+    const dir = `${base}/other-${String(i).padStart(2, '0')}`
+    dirs.push(dir)
+    files[`${dir}/result.json`] = resultText({ workdir: '/other' })
+  }
+  // listed last, so a pass that spends its reads in order never gets to it
+  const mine = `${base}/repo-z`
+  dirs.push(mine)
+  files[`${mine}/result.json`] = resultText()
+  const fs = memfs(on, nodesOf(dirs, files))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 12)
+  const run = ledger().runs['bash:u1']!
+  expect(run.outDir).toBe(mine)
+  near(run.cost, 0.5)
+  const readsOf = (path: string): number => fs.reads().filter(p => p === path).length
+  expect(readsOf(`${base}/other-00/result.json`)).toBe(1)
+  expect(readsOf(`${base}/other-39/result.json`)).toBe(1)
+})
+
+test('one directory is given to one run only', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-once'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const dir = `${tmp}/delegate-relay/repo-x`
+  memfs(on, nodesOf([tmp, `${tmp}/delegate-relay`, dir], { [`${dir}/result.json`]: resultText() }))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await $.tool.call({ ...BARE_CALL, tool_use_id: 'u2' } as never)
+  await polls(clock, 8)
+  const dirs = ['bash:u1', 'bash:u2'].map(id => ledger().runs[id]!.outDir).filter(d => d !== undefined)
+  expect(dirs).toEqual([dir])
 })

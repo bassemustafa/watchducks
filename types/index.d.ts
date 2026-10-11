@@ -98,7 +98,7 @@ export type UiState = {
 export type Classification =
   | {
       kind: 'relay'
-      implementer: 'opencode' | 'claude' | 'codex'
+      implementer: 'opencode' | 'claude' | 'codex' | 'gemini' | 'unknown'
       lane?: string
       model?: string
       effort?: string
@@ -114,7 +114,7 @@ export type RelayProjection = {
   status: RunStatus
   exitCode?: number
   lane?: string
-  implementer?: 'opencode' | 'claude' | 'codex'
+  implementer?: 'opencode' | 'claude' | 'codex' | 'gemini'
   model?: string
   effort?: string
   readOnly: boolean

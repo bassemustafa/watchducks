@@ -1,12 +1,28 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
+import type { EngineInterface, FsStat, On, PluginOptions, Timer } from 'claude-code'
 
-import type { HistoryRecord, Ledger, RelayProjection } from '../types'
-import { RELAY_POLL_MS, allowedRoots, duePolls, relayRoots, resultPath } from './collect/relay'
+import type { HistoryRecord, Ledger, RelayProjection, Run } from '../types'
+import {
+  DISCOVERY_EVERY,
+  MATCH_AHEAD_MS,
+  MAX_DISCOVERY_READS,
+  MAX_DISCOVERY_STATS,
+  MAX_IDENTITIES,
+  MAX_LISTED_ENTRIES,
+  MAX_SKIPPED,
+  RELAY_POLL_MS,
+  allowedRoots,
+  duePolls,
+  matchDiscovered,
+  pendingDiscovery,
+  relayRoots,
+  resultPath,
+  type FoundResult,
+} from './collect/relay'
 import { HISTORY_PREFIX, pruneHistory, recordFromLedger } from './history'
 import { emptyLedger, isKnownLoop, reduce, type Action } from './ledger'
 import type { PriceTable } from './price'
-import { MAX_RESULT_BYTES, isInsideRoots, projectRelayResult } from './relay-result'
+import { MAX_RESULT_BYTES, isInsideRoots, projectRelayResult, relayIdentity, type RelayIdentity } from './relay-result'
 import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, recordsHeadless } from './state'
 import { ROSTER_SPEC, VERDICT_SPEC } from './tools'
 import { blipsFor, radar } from './ui/animate'
@@ -35,6 +51,9 @@ let pollingAgents = false
 let pollingRelays = false
 
 function stopTimers(): void {
+  discoveryPolls = 0
+  discoveryGeneration = -1 // the next pass starts with no claimed or skipped directory
+  identityCache.clear()
   agentTimer?.cancel()
   saveTimer?.cancel()
   relayTimer?.cancel()
@@ -122,8 +141,8 @@ async function pollAgents($: EngineInterface, table: PriceTable): Promise<void> 
   }
 }
 
-/** The relay roots, each resolved to where it really lands; a root that cannot be resolved is skipped. */
-async function resolvedRoots($: EngineInterface, options: PluginOptions): Promise<string[]> {
+/** The relay roots, each resolved to where it really lands (a root that cannot be resolved is skipped), and where the session root landed. */
+async function resolvedRoots($: EngineInterface, options: PluginOptions): Promise<{ roots: string[]; session: string }> {
   let tmpDir = '/tmp'
   try {
     const dir = await $.env.get('TMPDIR')
@@ -138,20 +157,35 @@ async function resolvedRoots($: EngineInterface, options: PluginOptions): Promis
     // no session root: only the temp roots and the option apply
   }
   const resolved: string[] = []
+  let session = ''
   for (const root of relayRoots(options, tmpDir, sessionRoot)) {
     try {
       const stat = await $.fs.stat(root, { resolve: true })
-      if (stat.realPath !== undefined) resolved.push(stat.realPath)
+      if (stat.realPath === undefined) continue
+      resolved.push(stat.realPath)
+      if (sessionRoot !== '' && root === sessionRoot) session = stat.realPath
     } catch {
       // a root that is not there allows nothing
     }
   }
-  return allowedRoots(resolved)
+  return { roots: allowedRoots(resolved), session }
 }
 
-/** Null unless result.json is a regular file within the size cap whose real path sits under a root. */
 // A result.json older than the run (a reused --out-dir) belongs to an earlier run.
 const STALE_SLACK_MS = 5000
+
+/**
+ * The real path of a result.json that may be read: a regular file within the size cap, not older than
+ * `notBefore`, whose real path sits under a root. Discovery also refuses a link; an explicit out-dir may be one.
+ */
+function readablePath(stat: FsStat, notBefore: number, roots: readonly string[], allowLink: boolean): string | null {
+  if (stat.kind !== 'file' || stat.size > MAX_RESULT_BYTES) return null
+  if (stat.isLink && !allowLink) return null
+  if (stat.mtimeMs < notBefore) return null
+  const realPath = stat.realPath
+  if (realPath === undefined || !isInsideRoots(realPath, roots)) return null
+  return realPath
+}
 
 async function readRelayResult(
   $: EngineInterface,
@@ -159,13 +193,166 @@ async function readRelayResult(
   startedAt: number,
   roots: readonly string[],
 ): Promise<RelayProjection | null> {
-  const stat = await $.fs.stat(resultPath(outDir), { resolve: true })
-  if (stat.kind !== 'file' || stat.size > MAX_RESULT_BYTES) return null
-  if (stat.mtimeMs < startedAt - STALE_SLACK_MS) return null
-  const realPath = stat.realPath
-  if (realPath === undefined || !isInsideRoots(realPath, roots)) return null
+  const realPath = readablePath(await $.fs.stat(resultPath(outDir), { resolve: true }), startedAt - STALE_SLACK_MS, roots, true)
+  if (realPath === null) return null
   // the text lives only for this projection: nothing but the allow-listed fields leaves it
   return projectRelayResult(await $.fs.read(realPath))
+}
+
+// Discovery state (a relay run with no --out-dir): the polls since a run became pending, the directories
+// already given to a run, and result files known to be older than every pending run. The sets are dropped
+// when the ledger generation changes, and all of it with a hot reload.
+let discoveryPolls = 0
+let discoveryGeneration = -1
+let claimedDirs = new Set<string>()
+const skippedResults = new Set<string>()
+// What a result.json identified as when it was last read, keyed by file and valid while its mtime and size
+// stay the same: a fresh file that matches no pending run is then read once, not on every pass. Never any text.
+const identityCache = new Map<string, { mtimeMs: number; size: number; identity: RelayIdentity | null }>()
+
+function rememberIdentity(file: string, entry: { mtimeMs: number; size: number; identity: RelayIdentity | null }): void {
+  identityCache.delete(file)
+  if (identityCache.size >= MAX_IDENTITIES) {
+    const oldest = identityCache.keys().next()
+    if (!oldest.done) identityCache.delete(oldest.value)
+  }
+  identityCache.set(file, entry)
+}
+
+function rememberSkipped(file: string): void {
+  if (skippedResults.size >= MAX_SKIPPED) {
+    const oldest = skippedResults.values().next()
+    if (!oldest.done) skippedResults.delete(oldest.value)
+  }
+  skippedResults.add(file)
+}
+
+function trimSlash(dir: string): string {
+  return dir.length > 1 && dir.endsWith('/') ? dir.slice(0, -1) : dir
+}
+
+/**
+ * One pass over the allowed roots for the result.json of relay runs that have no out-dir. Directory names
+ * are read only to walk; a candidate is identified by what its result.json says (start, tool, a hash of the
+ * working directory), never by its name. Only the matched directory is stored, as the run's out-dir.
+ */
+async function discoverRelays(
+  $: EngineInterface,
+  seen: Ledger,
+  pending: readonly Run[],
+  roots: readonly string[],
+  session: string,
+  table: PriceTable,
+): Promise<void> {
+  if (seen.generation !== discoveryGeneration) {
+    discoveryGeneration = seen.generation
+    claimedDirs = new Set()
+    skippedResults.clear()
+    identityCache.clear()
+  }
+  const t0 = Math.min(...pending.map(r => r.startedAt)) - STALE_SLACK_MS
+  let stats = 0
+  let reads = 0
+  const exhausted = (): boolean => stats >= MAX_DISCOVERY_STATS
+
+  const statOf = async (target: string, resolve: boolean): Promise<FsStat | null> => {
+    if (exhausted()) return null
+    stats += 1
+    try {
+      return await $.fs.stat(target, resolve ? { resolve: true } : undefined)
+    } catch {
+      return null
+    }
+  }
+
+  const childDirs = async (dir: string): Promise<string[]> => {
+    try {
+      const names: string[] = []
+      for (const entry of (await $.fs.list(dir)).slice(0, MAX_LISTED_ENTRIES)) {
+        if (entry.kind !== 'dir' || entry.isLink) continue
+        if (entry.name === '' || entry.name === '.' || entry.name === '..' || entry.name.includes('/')) continue
+        names.push(entry.name)
+      }
+      return names
+    } catch {
+      return []
+    }
+  }
+
+  const found: FoundResult[] = []
+  const considerResult = async (dir: string): Promise<void> => {
+    const file = dir + '/result.json'
+    if (skippedResults.has(file)) return
+    const stat = await statOf(file, true)
+    const realPath = stat === null ? null : readablePath(stat, t0, roots, false)
+    if (stat === null || realPath === null) return
+    try {
+      // an unchanged file keeps its identity: it is not read again and does not use up the pass's reads
+      const cached = identityCache.get(file)
+      let identity: RelayIdentity | null
+      if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+        identity = cached.identity
+      } else {
+        if (reads >= MAX_DISCOVERY_READS) return
+        reads += 1
+        // the text lives only for this identification: a start, a tool and a hash leave it
+        identity = relayIdentity(await $.fs.read(realPath))
+        rememberIdentity(file, { mtimeMs: stat.mtimeMs, size: stat.size, identity })
+      }
+      if (!identity) return
+      if (identity.startedAt < t0 - MATCH_AHEAD_MS) {
+        rememberSkipped(file)
+        return
+      }
+      found.push({
+        dir,
+        startedAt: identity.startedAt,
+        ...(identity.tool !== undefined ? { tool: identity.tool } : {}),
+        ...(identity.workdirKey !== undefined ? { workdirKey: identity.workdirKey } : {}),
+      })
+    } catch {
+      // unreadable: the next pass tries again
+    }
+  }
+
+  const visited = new Map<string, boolean>()
+  /** True when the directory is a real directory touched since the oldest pending run started; its result.json is then considered. */
+  const visit = async (dir: string): Promise<boolean> => {
+    const known = visited.get(dir)
+    if (known !== undefined) return known
+    const stat = await statOf(dir, false)
+    const fresh = stat !== null && stat.kind === 'dir' && !stat.isLink && stat.mtimeMs >= t0
+    visited.set(dir, fresh)
+    if (fresh) await considerResult(dir)
+    return fresh
+  }
+
+  for (const root of new Set(roots)) {
+    const shallow = root === session
+    for (const name of await childDirs(root)) {
+      if (exhausted()) break
+      const dir = trimSlash(root) + '/' + name
+      const fresh = await visit(dir)
+      if (!fresh || shallow) continue
+      for (const inner of await childDirs(dir)) {
+        if (exhausted()) break
+        await visit(dir + '/' + inner)
+      }
+    }
+  }
+
+  const taken = new Set(claimedDirs)
+  for (const run of Object.values(seen.runs)) if (run.outDir !== undefined) taken.add(trimSlash(run.outDir))
+  for (const { id, outDir } of matchDiscovered(pending, found, taken)) {
+    // a /clear or a session change while the pass was running: the match belongs to the old ledger
+    let applied = false
+    await update($, ledgerAtom, l => {
+      applied = l.generation === seen.generation
+      return applied ? reduce(l, { type: 'relayFound', id, outDir, at: Date.now() }, table) : l
+    })
+    if (!applied) return
+    claimedDirs.add(outDir)
+  }
 }
 
 async function pollRelays($: EngineInterface, table: PriceTable, options: PluginOptions): Promise<void> {
@@ -173,10 +360,21 @@ async function pollRelays($: EngineInterface, table: PriceTable, options: Plugin
   pollingRelays = true
   try {
     const seen = await read($, ledgerAtom)
+    const now = Date.now()
     // a run whose result was applied carries `resultRead`, so duePolls skips it even after a reload
-    const due = duePolls(seen, Date.now())
-    if (due.length === 0) return
-    const roots = await resolvedRoots($, options)
+    const due = duePolls(seen, now)
+    const pending = pendingDiscovery(seen, now)
+    discoveryPolls = pending.length === 0 ? 0 : discoveryPolls + 1
+    if (due.length === 0 && pending.length === 0) return
+    const { roots, session } = await resolvedRoots($, options)
+    // the pass only sets an out-dir; the loop below reads the result on the next tick, the one way a result is applied
+    if (pending.length > 0 && discoveryPolls % DISCOVERY_EVERY === 0) {
+      try {
+        await discoverRelays($, seen, pending, roots, session, table)
+      } catch {
+        // the next pass tries again
+      }
+    }
     for (const id of due) {
       const run = Object.hasOwn(seen.runs, id) ? seen.runs[id] : undefined
       if (run?.outDir === undefined) continue

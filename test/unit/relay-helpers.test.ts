@@ -1,7 +1,16 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { Ledger, Run } from '../../types'
-import { MAX_POLL_AGE_MS, POLL_GRACE_MS, allowedRoots, duePolls, relayRoots, resultPath } from '../../src/collect/relay'
+import {
+  MAX_POLL_AGE_MS,
+  POLL_GRACE_MS,
+  allowedRoots,
+  duePolls,
+  matchDiscovered,
+  pendingDiscovery,
+  relayRoots,
+  resultPath,
+} from '../../src/collect/relay'
 import { emptyLedger } from '../../src/ledger'
 
 const NOW = 1_000_000_000_000
@@ -93,5 +102,93 @@ describe('duePolls', () => {
 
   test('ids come back in creation order', () => {
     expect(duePolls(ledgerOf(run('b', {}), run('a', {})), NOW)).toEqual(['b', 'a'])
+  })
+})
+
+function bare(id: string, patch: Partial<Run>): Run {
+  const { outDir: _gone, ...rest } = run(id, patch)
+  return rest as Run
+}
+
+describe('pendingDiscovery', () => {
+  test('a running relay with no out-dir and no result is pending; one with an out-dir or another kind is not', () => {
+    const l = ledgerOf(bare('r', {}), run('o', {}), bare('c', { kind: 'cli' }), bare('s', { kind: 'shell' }))
+    expect(pendingDiscovery(l, NOW).map(r => r.id)).toEqual(['r'])
+  })
+
+  test('a relay running for 3 h or more is dropped', () => {
+    const l = ledgerOf(bare('old', { startedAt: NOW - MAX_POLL_AGE_MS }), bare('new', { startedAt: NOW - MAX_POLL_AGE_MS + 1 }))
+    expect(pendingDiscovery(l, NOW).map(r => r.id)).toEqual(['new'])
+  })
+
+  test('an ended relay stays pending for 120 s after it ended; one with no end time or an unknown status does not', () => {
+    const l = ledgerOf(
+      bare('f', { status: 'ended', endedAt: NOW - POLL_GRACE_MS + 1 }),
+      bare('s', { status: 'done', endedAt: NOW - POLL_GRACE_MS }),
+      bare('n', { status: 'failed' }),
+      bare('u', { status: 'unknown', endedAt: NOW - 1 }),
+    )
+    expect(pendingDiscovery(l, NOW).map(r => r.id)).toEqual(['f'])
+  })
+
+  test('a relay whose result was read is not pending', () => {
+    expect(pendingDiscovery(ledgerOf(bare('r', { resultRead: true })), NOW)).toEqual([])
+  })
+})
+
+describe('matchDiscovered', () => {
+  const S = NOW - 1000
+  const none: ReadonlySet<string> = new Set()
+  const pending = (id: string, patch: Partial<Run> = {}): Run => bare(id, { startedAt: S, ...patch })
+
+  test('the start must be within [run - 5 s, run + 60 s]', () => {
+    const at = (startedAt: number) => matchDiscovered([pending('r')], [{ dir: '/d', startedAt }], none)
+    expect(at(S - 5000)).toEqual([{ id: 'r', outDir: '/d' }])
+    expect(at(S - 5001)).toEqual([])
+    expect(at(S + 60000)).toEqual([{ id: 'r', outDir: '/d' }])
+    expect(at(S + 60001)).toEqual([])
+  })
+
+  test('a tool that disagrees blocks the pair; an unknown implementer or an unnamed tool does not', () => {
+    const f = (tool?: string) => [{ dir: '/d', startedAt: S, ...(tool !== undefined ? { tool } : {}) }]
+    expect(matchDiscovered([pending('r', { implementer: 'claude' })], f('codex'), none)).toEqual([])
+    expect(matchDiscovered([pending('r', { implementer: 'claude' })], f('claude'), none)).toHaveLength(1)
+    expect(matchDiscovered([pending('r', { implementer: 'claude' })], f(), none)).toHaveLength(1)
+    expect(matchDiscovered([pending('r', { implementer: 'unknown' })], f('gemini'), none)).toHaveLength(1)
+  })
+
+  test('a working directory that disagrees blocks the pair; one side unknown does not', () => {
+    const f = (workdirKey?: string) => [{ dir: '/d', startedAt: S, ...(workdirKey !== undefined ? { workdirKey } : {}) }]
+    expect(matchDiscovered([pending('r', { workdirKey: 'aa' })], f('bb'), none)).toEqual([])
+    expect(matchDiscovered([pending('r', { workdirKey: 'aa' })], f('aa'), none)).toHaveLength(1)
+    expect(matchDiscovered([pending('r', { workdirKey: 'aa' })], f(), none)).toHaveLength(1)
+    expect(matchDiscovered([pending('r')], f('bb'), none)).toHaveLength(1)
+  })
+
+  test('a claimed directory is skipped', () => {
+    const found = [{ dir: '/taken', startedAt: S }, { dir: '/free', startedAt: S + 5000 }]
+    expect(matchDiscovered([pending('r')], found, new Set(['/taken']))).toEqual([{ id: 'r', outDir: '/free' }])
+    expect(matchDiscovered([pending('r')], [found[0]!], new Set(['/taken']))).toEqual([])
+  })
+
+  test('two runs and two directories are paired by closeness, each used once', () => {
+    const runs = [pending('a', { startedAt: S }), pending('b', { startedAt: S + 10_000 })]
+    const found = [{ dir: '/near-b', startedAt: S + 11_000 }, { dir: '/near-a', startedAt: S + 1000 }]
+    expect(matchDiscovered(runs, found, none)).toEqual([
+      { id: 'a', outDir: '/near-a' },
+      { id: 'b', outDir: '/near-b' },
+    ])
+  })
+
+  test('one directory is never given to two runs, and one run takes only one directory', () => {
+    const runs = [pending('a', { startedAt: S }), pending('b', { startedAt: S + 2000 })]
+    expect(matchDiscovered(runs, [{ dir: '/only', startedAt: S + 1500 }], none)).toEqual([{ id: 'b', outDir: '/only' }])
+    expect(matchDiscovered([runs[0]!], [{ dir: '/x', startedAt: S }, { dir: '/y', startedAt: S + 1 }], none)).toEqual([{ id: 'a', outDir: '/x' }])
+  })
+
+  test('the closest pair wins even when it leaves a run unmatched', () => {
+    const runs = [pending('a', { startedAt: S }), pending('b', { startedAt: S + 50_000 })]
+    const found = [{ dir: '/d', startedAt: S + 49_000 }]
+    expect(matchDiscovered(runs, found, none)).toEqual([{ id: 'b', outDir: '/d' }])
   })
 })

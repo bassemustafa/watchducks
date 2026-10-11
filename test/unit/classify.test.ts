@@ -80,11 +80,9 @@ test('gemini --prompt is a raw CLI', () => {
   expect(c('gemini --prompt hi').kind).toBe('cli')
 })
 
-test('plain, chained, piped, substituted, multi-line, long and unbalanced commands are shell', () => {
+test('plain, substituted, multi-line, long and unbalanced commands are shell', () => {
   const shell = [
     'npm test',
-    'ls; node x/claude-delegate/scripts/relay.mjs',
-    'node x/claude-delegate/scripts/relay.mjs | tee log',
     'echo $(cat f)',
     'node "unterminated',
     'node x/claude-delegate/scripts/relay.mjs\n--lane review',
@@ -140,4 +138,106 @@ test('an oversized command is shell before it is tokenized', () => {
   const relay = ' node x/opencode-delegate/scripts/relay.mjs --lane quick'
   expect(classify('A=' + 'x'.repeat(100_000) + relay).kind).toBe('shell')
   expect(classify('A=' + 'x'.repeat(4000) + relay).kind).toBe('relay')
+})
+
+const RELAY = 'node /x/claude-delegate/scripts/relay.mjs --lane quick --brief b --cd /repo'
+
+test('a relay piped into another command is still the relay', () => {
+  const r = c(RELAY + ' 2>&1 | tail -5')
+  expect(r.kind).toBe('relay')
+  expect(r.implementer).toBe('claude')
+  expect(r.lane).toBe('quick')
+  expect(r.workdir).toBe('/repo')
+})
+
+test('commands before or after the relay segment do not change the class', () => {
+  expect(c('mkdir -p /tmp/o && ' + RELAY).kind).toBe('relay')
+  expect(c('ls; ' + RELAY + ' && echo done').kind).toBe('relay')
+  expect(c('node x/claude-delegate/scripts/relay.mjs | tee log').kind).toBe('relay')
+  expect(c('echo hi | ' + RELAY).implementer).toBe('claude')
+  expect(c('cd /p/w && mkdir -p /tmp/o && node x/codex-delegate/scripts/relay.mjs | tee log').workdir).toBe('/p/w')
+})
+
+test('a cd segment inside the chain sets the workdir for the segments after it; the relay own flag wins', () => {
+  expect(c('mkdir -p /tmp/o && cd /repo && node /x/claude-delegate/scripts/relay.mjs --lane quick --brief b').workdir).toBe('/repo')
+  expect(c('cd /a && node /x/claude-delegate/scripts/relay.mjs --cd /b').workdir).toBe('/b')
+  expect(c('mkdir -p /tmp/o; cd /repo; nohup node /x/claude-delegate/scripts/relay.mjs --lane quick &').workdir).toBe('/repo')
+  expect(c('cd /a && cd /b && node /x/claude-delegate/scripts/relay.mjs').workdir).toBe('/b')
+  expect(c('node /x/claude-delegate/scripts/relay.mjs --lane quick && cd /late').workdir).toBeUndefined()
+  expect(c('ls && cd /repo && codex exec "x"').workdir).toBe('/repo')
+  expect(c('cd /repo -P && node /x/claude-delegate/scripts/relay.mjs').workdir).toBeUndefined()
+})
+
+test('a script that is not a relay stays shell, piped or not', () => {
+  expect(c('node build.mjs | tail').kind).toBe('shell')
+  expect(c('node build.mjs && npm test').kind).toBe('shell')
+  expect(c('node -e "x/delegate/relay.js"').kind).toBe('shell')
+  expect(c('echo $(cat f) | ' + RELAY).kind).toBe('shell')
+})
+
+test('wrappers before the interpreter are skipped and a trailing & is ignored', () => {
+  for (const command of [
+    'nohup ' + RELAY + ' &',
+    'timeout 30m ' + RELAY,
+    'timeout -s KILL -k 10 30m ' + RELAY,
+    'timeout --signal=KILL 30m ' + RELAY,
+    'env FOO=1 ' + RELAY,
+    'FOO=1 nice -n 5 ' + RELAY,
+    'time setsid ' + RELAY,
+    'stdbuf -oL -e0 ' + RELAY,
+    'exec ' + RELAY,
+    'command ' + RELAY,
+    'nohup timeout 1h env A=1 B=2 ' + RELAY + ' 2>&1 &',
+  ]) {
+    const r = c(command)
+    expect(r.kind).toBe('relay')
+    expect(r.implementer).toBe('claude')
+    expect(r.lane).toBe('quick')
+  }
+})
+
+test('a relay* script, or any script under a directory named delegate, is a relay whatever the tool', () => {
+  const g = c('python3 /opt/agents/gemini-delegate/run_relay.py --out /tmp/x')
+  expect(g.kind).toBe('relay')
+  expect(g.implementer).toBe('gemini')
+  expect(g.outDir).toBe('/tmp/x')
+  expect(c('node /srv/delegate/relay.mjs').kind).toBe('relay')
+  expect(c('node /srv/delegate/relay.mjs').implementer).toBe('unknown')
+  expect(c('bun /srv/tools/relay-v2.js').implementer).toBe('unknown')
+  expect(c('deno run -A /srv/tools/relay.ts').kind).toBe('relay')
+  expect(c('/opt/tools/relay.py --lane quick').kind).toBe('relay')
+  expect(c('bash ./relay.sh').kind).toBe('relay')
+})
+
+test('the implementer is the directory nearest the script, then a --tool flag, then unknown', () => {
+  expect(c('node /home/u/.claude/skills/opencode-delegate/scripts/relay.mjs').implementer).toBe('opencode')
+  expect(c('node /home/u/.codex/skills/x/relay.mjs').implementer).toBe('codex')
+  expect(c('node /srv/delegate/relay.mjs --tool gemini').implementer).toBe('gemini')
+  expect(c('node /srv/delegate/relay.mjs --implementer=codex').implementer).toBe('codex')
+  expect(c('node /srv/delegate/relay.mjs --tool nonsense').implementer).toBe('unknown')
+  expect(c('node /home/u/.claude/skills/opencode-delegate/scripts/relay.mjs --tool gemini').implementer).toBe('opencode')
+})
+
+test('workdir and out-dir flag aliases', () => {
+  const r = c('node /srv/delegate/relay.mjs --cwd /repo --output-dir=/tmp/o3')
+  expect(r.workdir).toBe('/repo')
+  expect(r.outDir).toBe('/tmp/o3')
+  const w = c('node /srv/delegate/relay.mjs --workdir=/w --artifacts-dir /tmp/a')
+  expect(w.workdir).toBe('/w')
+  expect(w.outDir).toBe('/tmp/a')
+  const d = c('node /srv/delegate/relay.mjs --dir /d --artifacts /tmp/b')
+  expect(d.workdir).toBe('/d')
+  expect(d.outDir).toBe('/tmp/b')
+  const k = c('node /srv/delegate/relay.mjs -C /c --outdir /tmp/c')
+  expect(k.workdir).toBe('/c')
+  expect(k.outDir).toBe('/tmp/c')
+  const bad = c('node /srv/delegate/relay.mjs --out-dir /tmp/../etc --cwd rel')
+  expect(bad.outDir).toBeUndefined()
+  expect(bad.workdir).toBeUndefined()
+})
+
+test('a substitution, a newline or an oversized tail makes the command shell even with a relay segment', () => {
+  expect(c(RELAY + ' | tail $(echo 5)').kind).toBe('shell')
+  expect(c(RELAY + ' | tail\n5').kind).toBe('shell')
+  expect(c('ls && ' + RELAY + ' ' + 'a'.repeat(5000)).kind).toBe('shell')
 })

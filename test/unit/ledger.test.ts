@@ -320,6 +320,30 @@ test('a relay result adds its tokens to the series once and marks the result as 
   expect(apply(start, relay(null)).tokenSeries).toEqual([])
 })
 
+test('a relay result names the tool of a run the classifier could not attribute', () => {
+  const start = apply(emptyLedger('s1', T0), { type: 'bashStart', id: 'bash:r', cls: { kind: 'relay', implementer: 'unknown', readOnly: false }, at: T0 })
+  const proj = { status: 'done', readOnly: false, implementer: 'gemini', costReported: null, usage: null, touchedFiles: null } as const
+  expect(apply(start, { type: 'relayResult', id: 'bash:r', at: T0 + 2, proj }).runs['bash:r']!.implementer).toBe('gemini')
+  expect(apply(start, relay(null)).runs['bash:r']!.implementer).toBe('unknown')
+  const known = apply(emptyLedger('s1', T0), { type: 'bashStart', id: 'bash:r', cls: { kind: 'relay', implementer: 'codex', readOnly: false }, at: T0 },
+    { type: 'relayResult', id: 'bash:r', at: T0 + 2, proj })
+  expect(known.runs['bash:r']!.implementer).toBe('codex')
+})
+
+test('relayFound sets the out-dir of a relay that has none and nothing else', () => {
+  const start = apply(emptyLedger('s1', T0),
+    { type: 'bashStart', id: 'bash:r', cls: { kind: 'relay', implementer: 'unknown', readOnly: false }, at: T0 },
+    { type: 'bashStart', id: 'bash:c', cls: { kind: 'cli', implementer: 'codex' }, at: T0 },
+    { type: 'bashStart', id: 'bash:o', cls: { kind: 'relay', implementer: 'codex', readOnly: false, outDir: '/tmp/mine' }, at: T0 })
+  const found = (id: string): Action => ({ type: 'relayFound', id, outDir: '/tmp/d1', at: T0 + 1 })
+  expect(apply(start, found('bash:r')).runs['bash:r']!.outDir).toBe('/tmp/d1')
+  expect(apply(start, found('bash:c')).runs['bash:c']!.outDir).toBeUndefined()
+  expect(apply(start, found('bash:o')).runs['bash:o']!.outDir).toBe('/tmp/mine')
+  expect(apply(start, found('bash:gone')).order).toEqual(start.order)
+  const read = apply(start, { type: 'relayResult', id: 'bash:r', at: T0 + 2, proj: { status: 'running', readOnly: false, costReported: null, usage: null, touchedFiles: null } }, found('bash:r'))
+  expect(read.runs['bash:r']!.outDir).toBeUndefined()
+})
+
 test('seriesWindow aligns to the current minute, zero-fills and ages old activity out', () => {
   const MIN = 60_000
   let l = emptyLedger('s1', T0)

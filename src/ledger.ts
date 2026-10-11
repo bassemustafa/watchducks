@@ -24,6 +24,7 @@ export type Action =
   | { type: 'bashResult'; id: string; isError: boolean; interrupted: boolean; backgroundTaskId?: string; at: number }
   | { type: 'bgSnapshot'; taskIds: readonly string[]; at: number }
   | { type: 'relayResult'; id: string; proj: RelayProjection; at: number }
+  | { type: 'relayFound'; id: string; outDir: string; at: number }
   | { type: 'editCall'; loop?: string; at: number }
   | { type: 'findings'; loop?: string; toolUseId: string; count: number; at: number }
   | { type: 'verdict'; targetId: string; reviewerId?: string; bugs?: number; edits?: number; at: number }
@@ -369,10 +370,19 @@ function reduceBgSnapshot(ledger: Ledger, a: Extract<Action, { type: 'bgSnapshot
   return withHandlers({ ...ledger, runs: { ...ledger.runs, ...Object.fromEntries(changed.map(r => [r.id, r])) } })
 }
 
+/** A relay started without `--out-dir` whose result.json was found: only a run that has neither an out-dir nor a result yet takes it. */
+function reduceRelayFound(ledger: Ledger, a: Extract<Action, { type: 'relayFound' }>): Ledger {
+  const run = getRun(ledger, a.id)
+  if (!run || run.kind !== 'relay' || run.outDir !== undefined || run.resultRead) return ledger
+  return putRun(ledger, { ...run, outDir: a.outDir })
+}
+
 function reduceRelayResult(ledger: Ledger, a: Extract<Action, { type: 'relayResult' }>, prices: PriceTable): Ledger {
   const run = getRun(ledger, a.id)
   if (!run) return ledger
   const p = a.proj
+  // a relay the classifier could not attribute takes the tool its result names
+  const implementer = run.implementer === 'unknown' && p.implementer !== undefined ? p.implementer : run.implementer
   const model = p.model ?? run.model
   const usage = p.usage ?? run.usage
   let cost: number | null = null
@@ -381,7 +391,7 @@ function reduceRelayResult(ledger: Ledger, a: Extract<Action, { type: 'relayResu
   if (p.costReported !== null) {
     cost = p.costReported
     costSource = 'reported'
-  } else if (usage && run.implementer === 'claude') {
+  } else if (usage && implementer === 'claude') {
     const estimate = model !== undefined ? estimateCost(usage, model, prices) : null
     if (estimate === null) costPartial = true
     else {
@@ -391,6 +401,7 @@ function reduceRelayResult(ledger: Ledger, a: Extract<Action, { type: 'relayResu
   }
   const updated: Run = {
     ...run,
+    implementer,
     status: p.status,
     readOnly: run.readOnly || p.readOnly,
     usage,
@@ -523,6 +534,8 @@ export function reduce(ledger: Ledger, action: Action, prices: PriceTable): Ledg
       return reduceBgSnapshot(ledger, action)
     case 'relayResult':
       return reduceRelayResult(ledger, action, prices)
+    case 'relayFound':
+      return reduceRelayFound(ledger, action)
     case 'editCall': {
       const run = action.loop === undefined ? undefined : getRun(ledger, action.loop)
       return run ? putRun(ledger, { ...run, editCalls: run.editCalls + 1 }) : ledger
