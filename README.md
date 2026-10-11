@@ -43,9 +43,9 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
   claude × sonnet-5-5   ████████   4 ops  …
 ```
 
-**The dossier** is the detail view of one operative: codename, kind, agent type, lane, implementer, model or models, effort and where it came from, read-only flag, status, start, end and duration, the token split, cache %, cost with its source, handler reviews, patches and leaks. It has a Back button. The Agent call's description is not shown.
+**The dossier** is the detail view of one operative: codename, kind, agent type, lane, implementer, model or models, effort and where it came from, read-only flag, status, start, end and duration, tokens, cache %, cost with its source, handler reviews, patches and leaks. Tokens show `input` (uncached + cache read + cache write) with those three parts under it, then `output` and `total`. It has a Back button. The Agent call's description is not shown.
 
-**The station board** has one row per implementer × model, with a proportional bar (by cost, or by tokens when cost is unknown). Columns: ops, done, failed, tokens, cache %, cost, vetted/ops, and leaks per vetted op. Use the **Session | 30 days** toggle to switch between this session and the last 30 days.
+**The station board** has one row per implementer × model, with a proportional bar (by cost, or by tokens when cost is unknown). Columns: ops, done, failed, tokens, cache %, cost, vetted/ops, and leaks per vetted op. Each row also shows `in` and `out` totals and, when tokens were measured, the `uncached · read · write` split. This works for both the Session and the 30 days span. Use the **Session | 30 days** toggle to switch between this session and the last 30 days.
 
 **The band** is one line above the prompt. It shows when the sidebar is not shown and a run is in field or one ended in the last 5 minutes:
 
@@ -113,14 +113,15 @@ The docked sidebar needs the fullscreen layout. Elsewhere the sidebar opens inli
 | Source | Identity | Status | Tokens & cache | Cost |
 |---|---|---|---|---|
 | Agent-tool subagent | agent type; model and effort seen per request | from the spawn result, turn end and agent list | yes, per request | estimated from the price table (Claude models) |
-| `claude` relay | from result.json (`lane`, `model`, `effort`) | from result.json | yes, from result.json `usage` | reported (`totalCostUsd`) |
-| `opencode` relay | from result.json (`tool`, `model`, `variant`) | from result.json | — | reported only; `$0 reported` under subscription plans |
-| `codex` relay | from result.json, when present | from result.json | — | — |
+| `claude` relay | from the command and result.json (`lane`, `model`, `effort`) | from result.json | yes, from result.json `usage` | reported (`totalCostUsd`) |
+| `opencode` relay | from the command and result.json (`tool`, `model`, `variant`) | from result.json | — | reported only; `$0 reported` under subscription plans |
+| `codex` relay | from the command and result.json, when present | from result.json | — | — |
+| Other relay scripts (a `relay*` script, or one under a `*delegate*` folder) | from the path, `--tool`, or result.json `tool` (`unknown` until then) | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise from the Bash result only | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — |
 | Raw CLIs: `codex exec`, `opencode run`, `claude -p`, `gemini -p` | implementer, plus `--model`/`-m` if given literally | tool result (foreground) or background snapshots | — | — |
 | Other background shell | implementer `shell` | background snapshots | — | — |
 | HQ (main loop) | session model | — | yes, per request | estimated; shown separately, never in delegated totals |
 
-> **Pass `--out-dir` to delegate relays.** Without it, the relay's `result.json` cannot be found and its usage shows "—". The out-dir must be under the system temp dir, the session root, or a `relayRoots` entry.
+> **`--out-dir` is optional.** With it, watchducks reads `<out-dir>/result.json`. Without it, watchducks finds the result itself (discovery). While a relay without an out-dir runs (up to 3 h) and for less than 2 minutes after it ends, it scans the allowed folders about every 9 s and pairs a `result.json` with the run by start time, tool and working directory. The out-dir, or the folder discovery finds, must be under the system temp dir, `/tmp`, the session root or a `relayRoots` entry.
 
 Runs the session did not start are not tracked.
 
@@ -172,11 +173,11 @@ watchducks keeps only numbers, identifiers and enums. It never inspects, copies,
 - file contents and Edit/Write inputs
 - findings text
 
-**Bash commands.** Only a bounded classifier looks at the command line. It recognizes relays and CLIs and picks out flags such as `--lane`, `--model`, `--variant`, `--effort`, `--read-only`, `--sandbox`, `--agent`, `--cd` and `--out-dir`. The command text itself is never stored or shown.
+**Bash commands.** Only a bounded classifier looks at the command line. It recognizes relays and CLIs and picks out these flags: `--lane`, `--model`, `--variant`, `--effort`, `--read-only`, `--sandbox`, `--agent`, `--tool` and `--implementer`. The working directory comes from `--cd`, `--cwd`, `--workdir`, `--dir` or `-C`. The out-dir comes from `--out-dir`, `--outdir`, `--output-dir`, `--out`, `--artifacts-dir` or `--artifacts`. The classifier splits the line at `&&`, `||`, `;` and `|` and uses the first part that runs a relay or a known CLI; what follows does not change that. A `cd <dir>` part before it sets the working directory. Leading wrappers (`nohup`, `time`, `setsid`, `exec`, `command`, `env`, `timeout`, `nice`, `stdbuf`, `NAME=value` words, a trailing `&`) are skipped. Commands with `$(…)`, backticks, newlines or over the length cap are still treated as plain shell. The command text itself is never stored or shown.
 
 **result.json (read this).** For relay runs, watchducks reads `<out-dir>/result.json`. Reading loads the whole file into the mod's memory for one parse, including the relay's `finalMessage`. Only allow-listed fields are kept:
 
-- `schema` (must be `delegate-relay.result.v1`, otherwise the file is ignored)
+- `schema` (must be `delegate-relay.result.v<N>` for any version number, otherwise the file is ignored; `tool` may also be `gemini`)
 - `status`, `exitCode`
 - `lane`, `tool`, `model`, `variant`, `effort`
 - `agent`, `readOnly`, `sandbox` (used only to set the read-only flag)
@@ -186,6 +187,8 @@ watchducks keeps only numbers, identifiers and enums. It never inspects, copies,
 - the length of `touchedFiles` (not the file names)
 
 `finalMessage` and everything else is dropped without being inspected, kept or shown. The file is read only if its real path is inside an allowed root, it is a regular file of at most 1 MiB, and it was not written before the run started (a 5-second slack is allowed).
+
+**Discovery.** When a relay run has no `--out-dir`, watchducks lists folders under the allowed roots: the temp dir, `/tmp` and `relayRoots` entries (two levels deep each) and the session root (one level deep). Links are never followed. Folder names are read only to walk the tree and are never stored. From a candidate's `result.json` it reads only `schema`, `startedAt`, `tool` and `workdir`. The working directory is turned into a short hash at once, and the path is not kept. Only the matched folder's path is stored, as that run's out-dir. Each pass is capped at 512 `stat` calls, 32 file reads and 2048 entries per listed folder. A file that has not changed since it was last identified is not read again; only its start, tool and workdir hash are remembered, for at most 1024 files.
 
 **Other plugins can read this one's state.** Any installed plugin can read any plugin's state, so watchducks' state holds only allow-listed values.
 
