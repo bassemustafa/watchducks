@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pixel-art duck and radar animation in the terminal, and SVG views in the desktop app. `motion` and `glyphs` settings.
 - Delegate relay `result.json` projection, keeping allow-listed fields only, with path, size and freshness checks.
 - Price table dated 2026-10-06, with `priceOverrides`.
-- CI: validate, gating-hook allow-list check and tests on Claude Code 2.1.295.
+- CI: validate and tests on Claude Code 2.1.289 (the desktop app's engine) and 2.1.295, plus the gating-hook allow-list check on 2.1.295.
 
 [Unreleased]: https://github.com/bassemustafa/watchducks/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/bassemustafa/watchducks/releases/tag/v0.1.0

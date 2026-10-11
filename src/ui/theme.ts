@@ -70,8 +70,8 @@ export function statusColor(s: RunStatus): string {
   return COLORS[s]
 }
 
-export function glyphs(mode: 'emoji' | 'ascii'): { duck: string; dot: Record<RunStatus, string> } {
+export function glyphs(mode: 'emoji' | 'ascii'): { duck: string; dot: Record<RunStatus, string>; on: string; off: string } {
   return mode === 'ascii'
-    ? { duck: '>o)', dot: { ...ASCII_DOTS } }
-    : { duck: '🦆', dot: { ...EMOJI_DOTS } }
+    ? { duck: '>o)', dot: { ...ASCII_DOTS }, on: '*', off: '-' }
+    : { duck: '🦆', dot: { ...EMOJI_DOTS }, on: '●', off: '○' }
 }

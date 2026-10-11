@@ -90,7 +90,7 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
 
 ## Install
 
-Requires Claude Code 2.1.295 or newer.
+Requires Claude Code 2.1.289 or newer (2.1.289 is the version the Claude desktop app bundles).
 
 In a shell:
 

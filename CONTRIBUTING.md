@@ -11,7 +11,7 @@ Thanks for helping. Keep changes small and focused.
 
 ## Development setup
 
-Requirements: Node 20 for development, and Claude Code 2.1.295 or newer.
+Requirements: Node 20 for development, and Claude Code 2.1.289 or newer. CI runs the tests on 2.1.289 and 2.1.295; a Button takes only a plain string `label`, because 2.1.289 refuses any other content.
 
 From the repo root:
 

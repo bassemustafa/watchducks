@@ -42,16 +42,15 @@ export function stationView(
   const w = weights(rows)
   const top = Math.max(...w, 0)
 
+  const mark = (which: 'session' | '30d') => (span === which ? g.on : g.off)
   const toggle = (
-    <Button key="span" hotkey="h" plain onPress={() => press({ span: span === 'session' ? '30d' : 'session' })}>
-      <Text bold={span === 'session'} color={span === 'session' ? PALETTE.accent : undefined} dimColor={span !== 'session'}>
-        Session
-      </Text>
-      <Text dimColor>{'  |  '}</Text>
-      <Text bold={span === '30d'} color={span === '30d' ? PALETTE.accent : undefined} dimColor={span !== '30d'}>
-        30 days
-      </Text>
-    </Button>
+    <Button
+      key="span"
+      hotkey="h"
+      plain
+      label={`${mark('session')} Session   ${mark('30d')} 30 days`}
+      onPress={() => press({ span: span === 'session' ? '30d' : 'session' })}
+    />
   )
 
   return (

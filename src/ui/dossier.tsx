@@ -71,9 +71,7 @@ export function dossierView(
 ): ReturnType<Table['Box']> {
   const { Box, Text, Button } = t
   const back = (
-    <Button key="back" hotkey="b" plain onPress={() => press({ view: 'field', dossierId: undefined })}>
-      <Text color={PALETTE.accent}>← Back</Text>
-    </Button>
+    <Button key="back" hotkey="b" plain label="← Back" onPress={() => press({ view: 'field', dossierId: undefined })} />
   )
   if (!run) {
     return (

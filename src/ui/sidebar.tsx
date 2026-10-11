@@ -289,10 +289,11 @@ function packFigures(parts: readonly string[], width: number): string[] {
 }
 
 function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g: Glyphs, stamped: boolean, press: Press): El {
-  const { Text, Button } = t
+  const { Box, Text, Button } = t
   const color = statusColor(run.status)
   const words = statusWords(run.status)
-  const line1 = fit(`${g.dot[run.status]} ${run.codename}  ${run.implementer} · ${run.model ?? '—'} · ${run.effort ?? '—'}`, inner)
+  const dot = g.dot[run.status]
+  const rest = fit(`${run.codename}  ${run.implementer} · ${run.model ?? '—'} · ${run.effort ?? '—'}`, Math.max(1, inner - (Array.from(dot).length + 1)))
 
   const review = run.reviews.length > 0 ? run.reviews[run.reviews.length - 1] : undefined
   let line2: El
@@ -320,13 +321,13 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
     line2 = <Text dimColor>{lines.join('\n')}</Text>
   }
   return (
-    <Button key={run.id} plain onPress={() => press({ view: 'dossier', dossierId: run.id })}>
-      <Text color={color} bold={run.status === 'running'}>
-        {line1}
-      </Text>
-      {'\n'}
+    <Box key={`card-${run.id}`} flexDirection="column">
+      <Box>
+        <Text color={color} bold={run.status === 'running'}>{`${dot} `}</Text>
+        <Button key={run.id} plain label={rest} onPress={() => press({ view: 'dossier', dossierId: run.id })} />
+      </Box>
       {line2}
-    </Button>
+    </Box>
   )
 }
 
@@ -450,17 +451,22 @@ export function registerSidebar(on: On, options: PluginOptions): void {
     const { Box, Text, Button } = t
     const blank = <Text> </Text>
     const tab = (key: string, hotkey: string, label: string, view: UiState['view']) => (
-      <Button key={key} hotkey={hotkey} plain onPress={() => press({ view, dossierId: undefined })}>
-        <Text bold={ui.view === view} color={ui.view === view ? PALETTE.accent : undefined} dimColor={ui.view !== view}>
-          {label}
-        </Text>
-      </Button>
+      <Box key={`tab-${key}`}>
+        {ui.view === view ? (
+          <Text bold color={PALETTE.accent}>
+            {'▸ '}
+          </Text>
+        ) : (
+          <Text>{'  '}</Text>
+        )}
+        <Button key={key} hotkey={hotkey} plain label={label} onPress={() => press({ view, dossierId: undefined })} />
+      </Box>
     )
     const nav = (
       <Box>
-        {tab('field', 'f', 'f Field', 'field')}
+        {tab('field', 'f', 'Field', 'field')}
         <Text>{'    '}</Text>
-        {tab('station', 's', 's Station', 'station')}
+        {tab('station', 's', 'Station', 'station')}
       </Box>
     )
 
