@@ -7,10 +7,10 @@ import { seriesWindow, totals, type Totals } from '../ledger'
 import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord } from '../state'
 import { RADAR_FULL, RADAR_SMALL, blipsFor, radar, svgBlipsFor } from './animate'
 import { codenameOf, dossierView, fit, runCost, runElapsed, runTokens, totalTokens, type Glyphs, type Press, type Table } from './dossier'
-import { cachePct, fmtCost, fmtDuration, fmtTokens, sparkline } from './format'
+import { cachePct, fmtCost, fmtDuration, fmtElapsedCoarse, fmtTokens, sparkline } from './format'
 import { duckLogo, gradientBar, hex, radarFrame, type RasterSpec } from './raster'
 import { stationView } from './station'
-import { barSvg, headerSvg } from './svg'
+import { BAR_HEIGHT, barSvg, barWidth, headerHeight, headerSvg, headerWidth } from './svg'
 import { PALETTE, glyphs, statusColor, statusWords } from './theme'
 
 const ledgerAtom = atom({ plugin: 'watchducks', key: 'ledger' } as const, INITIAL_LEDGER)
@@ -54,7 +54,7 @@ function raster(spec: RasterSpec): { key: string; columns: number; rows: number;
   return { key: spec.key, columns: spec.columns, rows: spec.rows, cells: spec.cells }
 }
 
-type Layout = { columns: number; inner: number; tier: 'full' | 'mid' | 'compact'; g: Glyphs; showOverhead: boolean }
+type Layout = { columns: number; inner: number; tier: 'full' | 'mid' | 'compact'; g: Glyphs; showOverhead: boolean; coarse: boolean }
 
 /** What the surface-specific part of the field view contributes. */
 type Art = { header: El; cacheBar: El; spendBar: El | null }
@@ -233,7 +233,8 @@ function desktopArt(t: Elements['desktop'], ledger: Ledger, tot: Totals, lay: La
       <Svg
         isInteractive
         alt="The flock radar"
-        width={px}
+        width={headerWidth(px)}
+        height={headerHeight(px)}
         source={headerSvg({ blips: svgBlipsFor(ledger), motion, width: px, logo: lay.tier === 'full' })}
       />
       <Text> </Text>
@@ -242,9 +243,9 @@ function desktopArt(t: Elements['desktop'], ledger: Ledger, tot: Totals, lay: La
   )
   const cacheBar = (
     <Svg
-      isInteractive
       alt="Cache hit share of input"
-      width={barPx}
+      width={barWidth(barPx)}
+      height={BAR_HEIGHT}
       source={barSvg(
         [
           { label: 'cache read', value: tot.usage.cacheRead, color: PALETTE.accent },
@@ -257,9 +258,9 @@ function desktopArt(t: Elements['desktop'], ledger: Ledger, tot: Totals, lay: La
   const spendBar =
     parts.length === 0 ? null : (
       <Svg
-        isInteractive
         alt="Spend by implementer"
-        width={barPx}
+        width={barWidth(barPx)}
+        height={BAR_HEIGHT}
         source={barSvg(
           parts.map(([imp, v]) => ({ label: imp, value: v, color: IMPLEMENTER_COLORS[imp] ?? PALETTE.ended })),
           barPx,
@@ -288,7 +289,7 @@ function packFigures(parts: readonly string[], width: number): string[] {
   return lines.map(line => fit(line, width))
 }
 
-function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g: Glyphs, stamped: boolean, press: Press): El {
+function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g: Glyphs, stamped: boolean, press: Press, coarse: boolean): El {
   const { Box, Text, Button } = t
   const color = statusColor(run.status)
   const words = statusWords(run.status)
@@ -314,7 +315,7 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
     line2 = <Text color={PALETTE.handler}>{fit(`suspected handler? ${codenameOf(ledger, id)}`, inner)}</Text>
   } else {
     const status = `${words.spy} · ${words.plain}`
-    const figures = [fmtDuration(runElapsed(run, now)), `${runTokens(run)} tok`, runCost(run)]
+    const figures = [(coarse ? fmtElapsedCoarse : fmtDuration)(runElapsed(run, now)), `${runTokens(run)} tok`, runCost(run)]
     const whole = `${status}   ${figures.join('   ')}`
     // too long for one line: the status keeps its own line, the figures wrap whole so tokens and cost never get cut
     const lines = Array.from(whole).length <= inner ? [whole] : [fit(status, inner), ...packFigures(figures, inner)]
@@ -407,7 +408,7 @@ function fieldView(
       {runs.length === 0 && <Text dimColor>No operatives yet — the flock is watching.</Text>}
       {runs.map((run, i) => (
         <Box flexDirection="column" key={'card:' + run.id} marginBottom={i === runs.length - 1 ? 0 : 1}>
-          {card(t, ledger, run, now, inner, g, run.id === stampId, press)}
+          {card(t, ledger, run, now, inner, g, run.id === stampId, press, lay.coarse)}
         </Box>
       ))}
     </Box>
@@ -443,7 +444,7 @@ export function registerSidebar(on: On, options: PluginOptions): void {
     const now = Date.now()
     const columns = e.props.bodyColumns > 0 ? e.props.bodyColumns : e.viewport?.columns && e.viewport.columns > 0 ? e.viewport.columns : DEFAULT_COLUMNS
     const tier = columns >= 48 ? 'full' : columns >= 36 ? 'mid' : 'compact'
-    const lay: Layout = { columns, inner: Math.max(16, columns - PAD * 2), tier, g, showOverhead }
+    const lay: Layout = { columns, inner: Math.max(16, columns - PAD * 2), tier, g, showOverhead, coarse: e.surface === 'desktop' }
     const press: Press = patch => void update($, uiAtom, u => ({ ...u, ...patch })).catch(() => undefined)
     radar.mounted = null
 

@@ -1,11 +1,11 @@
 import { expect, test } from 'claude-code/testing'
 
-import { cachePct, fmtCost, fmtDuration, fmtTokens, sparkline } from '../../src/ui/format'
+import { cachePct, fmtCost, fmtDuration, fmtElapsedCoarse, fmtTokens, sparkline } from '../../src/ui/format'
 import { DEFAULT_COLOR, dimTwin, duckLogo, encodeCells, gradientBar, hex, radarFrame, type RasterSpec } from '../../src/ui/raster'
 import type { Run } from '../../types'
 import { emptyLedger } from '../../src/ledger'
 import { codenameOf, runCost, runTokens } from '../../src/ui/dossier'
-import { barSvg, headerSvg } from '../../src/ui/svg'
+import { BAR_HEIGHT, barSvg, headerHeight, headerSvg } from '../../src/ui/svg'
 import { glyphs, statusColor, statusWords } from '../../src/ui/theme'
 
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -325,4 +325,25 @@ test('F25: a claude relay without an out dir shows dashes for tokens and cost, w
   expect(runCost(relay('claude'))).toBe('—')
   expect(runTokens(relay('claude', '/tmp/o1'))).toBe('?')
   expect(runCost(relay('claude', '/tmp/o1'))).toBe('?')
+})
+
+test('fmtElapsedCoarse holds "<1m" for the first minute and then matches fmtDuration', () => {
+  expect(fmtElapsedCoarse(-1)).toBe('—')
+  expect(fmtElapsedCoarse(NaN)).toBe('—')
+  expect(fmtElapsedCoarse(0)).toBe('<1m')
+  expect(fmtElapsedCoarse(59_999)).toBe('<1m')
+  expect(fmtElapsedCoarse(60_000)).toBe('1m')
+  expect(fmtElapsedCoarse(3_600_000)).toBe('1h')
+})
+
+test('headerHeight agrees with the height headerSvg writes', () => {
+  for (const width of [100, 280, 416, 2000]) {
+    const svg = headerSvg({ blips: [], motion: false, width })
+    expect(svg).toContain(`<svg xmlns="http://www.w3.org/2000/svg" width="${Math.min(1200, Math.max(280, width))}" height="${headerHeight(width)}"`)
+  }
+})
+
+test('barSvg writes BAR_HEIGHT as its height', () => {
+  expect(BAR_HEIGHT).toBe(14)
+  expect(barSvg([{ label: 'a', value: 1, color: '#fff' }], 200)).toContain(`height="${BAR_HEIGHT}"`)
 })

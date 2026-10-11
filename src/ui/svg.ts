@@ -112,6 +112,23 @@ function blipShapes(
   return `<g filter="url(#wd-glow)" opacity=".55">${halos}</g>${cores}`
 }
 
+export const BAR_HEIGHT = 14
+
+/** The width headerSvg draws at for a requested width. */
+export function headerWidth(width: number): number {
+  return clampInt(width, 280, 1200)
+}
+
+/** The height headerSvg draws at for a requested width. */
+export function headerHeight(width: number): number {
+  return Math.max(80, Math.round(headerWidth(width) * 0.28))
+}
+
+/** The width barSvg draws at for a requested width. */
+export function barWidth(width: number): number {
+  return clampInt(width, 40, 1200)
+}
+
 export function headerSvg(opts: {
   blips: ReadonlyArray<{ angle: number; radius: number; status: RunStatus }>
   motion: boolean
@@ -119,8 +136,8 @@ export function headerSvg(opts: {
   /** The duck beside the title; default true. The mid width tier leaves it out. */
   logo?: boolean
 }): string {
-  const W = clampInt(opts.width, 280, 1200)
-  const H = Math.max(80, Math.round(W * 0.28))
+  const W = headerWidth(opts.width)
+  const H = headerHeight(opts.width)
   const pad = Math.round(H * 0.12)
   const p = Math.max(2, Math.floor((H - 2 * pad) / 12))
   const duckSize = p * 12
@@ -203,8 +220,8 @@ function fmtValue(v: number): string {
 
 /** A stacked, pill-shaped bar; each segment has a <title> tooltip with its exact number and share. */
 export function barSvg(segments: ReadonlyArray<{ label: string; value: number; color: string }>, width: number): string {
-  const W = clampInt(width, 40, 1200)
-  const H = 14
+  const W = barWidth(width)
+  const H = BAR_HEIGHT
   const used = segments.filter(seg => Number.isFinite(seg.value) && seg.value > 0).slice(0, MAX_SEGMENTS)
   const total = used.reduce((sum, seg) => sum + seg.value, 0)
 

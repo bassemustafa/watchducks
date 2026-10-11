@@ -42,6 +42,13 @@ export function fmtDuration(ms: number): string {
   return rest === 0 ? h + 'h' : h + 'h ' + rest + 'm'
 }
 
+/** Elapsed time that holds still for the first minute, so a redraw every second changes nothing. */
+export function fmtElapsedCoarse(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—'
+  if (ms < 60_000) return '<1m'
+  return fmtDuration(ms)
+}
+
 export function cachePct(u: Usage | null): string {
   if (!u) return '—'
   const input = u.uncached + u.cacheRead + u.cacheWrite

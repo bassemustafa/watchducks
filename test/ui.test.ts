@@ -234,6 +234,42 @@ test('F16: the compact tier writes the cache share and the spend as text', async
   }
 })
 
+// Every object in the drawn tree that carries an <svg> source: the props of one Svg element.
+function svgProps(text: string): Array<Record<string, unknown>> {
+  const found: Array<Record<string, unknown>> = []
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) return v.forEach(walk)
+    if (v === null || typeof v !== 'object') return
+    const o = v as Record<string, unknown>
+    if (typeof o.source === 'string' && o.source.startsWith('<svg')) found.push(o)
+    Object.values(o).forEach(walk)
+  }
+  walk(JSON.parse(text))
+  return found
+}
+
+test('every desktop Svg has a height matching its markup and only the header is interactive', async ($, on) => {
+  runningAgent(on)
+  await stepAgent($)
+  const svgs = svgProps(await view($, 'desktop', 52))
+  expect(svgs.length).toBe(3)
+  for (const p of svgs) {
+    expect(typeof p.height).toBe('number')
+    expect(p.source).toContain(`width="${p.width}" height="${p.height}"`)
+  }
+  expect(svgs.filter(p => p.isInteractive).length).toBe(1)
+  expect(String(svgs.find(p => p.isInteractive)?.source)).toContain('THE FLOCK')
+})
+
+test('a running card reads <1m on the desktop and 0:SS on the terminal', async ($, on) => {
+  runningAgent(on)
+  await stepAgent($)
+  const desktop = await view($, 'desktop', 52)
+  expect(desktop).toContain('<1m')
+  expect(desktop).not.toMatch(/0:\d\d/)
+  expect(await view($, 'terminal', 52)).toMatch(/0:\d\d/)
+})
+
 test('F16: at 40 columns the terminal keeps the cache bar and the desktop header loses the duck', async ($) => {
   expect(await view($, 'terminal', 40)).toContain('"key":"cache"')
   const mid = await view($, 'desktop', 40)
