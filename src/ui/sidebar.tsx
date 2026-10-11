@@ -230,8 +230,8 @@ function desktopArt(t: Elements['desktop'], ledger: Ledger, tot: Totals, lay: La
   if (lay.tier === 'compact') return { header: textHeader(t, ledger, tot), cacheBar: cacheText(t, tot), spendBar: spendText(t, parts, lay.inner) }
   const header = (
     <Box flexDirection="column">
+      {/* an image, not an interactive frame: the desktop reloads a frame on every redraw, which flashes */}
       <Svg
-        isInteractive
         alt="The flock radar"
         width={headerWidth(px)}
         height={headerHeight(px)}

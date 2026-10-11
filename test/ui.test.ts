@@ -248,7 +248,7 @@ function svgProps(text: string): Array<Record<string, unknown>> {
   return found
 }
 
-test('every desktop Svg has a height matching its markup and only the header is interactive', async ($, on) => {
+test('every desktop Svg has a height matching its markup and none is interactive', async ($, on) => {
   runningAgent(on)
   await stepAgent($)
   const svgs = svgProps(await view($, 'desktop', 52))
@@ -257,8 +257,9 @@ test('every desktop Svg has a height matching its markup and only the header is 
     expect(typeof p.height).toBe('number')
     expect(p.source).toContain(`width="${p.width}" height="${p.height}"`)
   }
-  expect(svgs.filter(p => p.isInteractive).length).toBe(1)
-  expect(String(svgs.find(p => p.isInteractive)?.source)).toContain('THE FLOCK')
+  // every desktop Svg is an image: an interactive frame flashes on each redraw
+  expect(svgs.filter(p => p.isInteractive).length).toBe(0)
+  expect(svgs.some(p => String(p.source).includes('THE FLOCK'))).toBe(true)
 })
 
 test('a running card reads <1m on the desktop and 0:SS on the terminal', async ($, on) => {
