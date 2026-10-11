@@ -20,7 +20,7 @@ export type Action =
   | { type: 'step'; loop?: string; turnId: string; index: number; model: string; effort?: string | number; usage: StepUsage | null; at: number }
   | { type: 'turnComplete'; loop?: string; turnId: string; reason: 'answer' | 'aborted' | 'refusal' | 'error'; usage?: StepUsage; at: number }
   | { type: 'agentStatus'; id: string; status: string; at: number }
-  | { type: 'bashStart'; id: string; cls: Classification; at: number }
+  | { type: 'bashStart'; id: string; cls: Classification; at: number; home?: string }
   | { type: 'bashResult'; id: string; isError: boolean; interrupted: boolean; backgroundTaskId?: string; at: number }
   | { type: 'bgSnapshot'; taskIds: readonly string[]; at: number }
   | { type: 'relayResult'; id: string; proj: RelayProjection; at: number }
@@ -97,6 +97,23 @@ function withKey(map: Record<string, true>, key: string): Record<string, true> {
 
 function emptySpend(): Spend {
   return { usage: { ...ZERO_USAGE }, cost: null, costPartial: false }
+}
+
+/**
+ * A directory the classifier extracted, made comparable: a leading `~` expands against `home` (undefined when
+ * there is no absolute home or the form is `~user`), trailing slashes drop, `/` stays.
+ */
+export function normalizeDir(path: string, home: string | undefined): string | undefined {
+  let dir = path
+  if (dir === '~' || dir.startsWith('~/')) {
+    if (home === undefined || !home.startsWith('/')) return undefined
+    dir = home + dir.slice(1)
+  } else if (dir.startsWith('~')) {
+    return undefined
+  }
+  let end = dir.length
+  while (end > 1 && dir[end - 1] === '/') end -= 1
+  return dir.slice(0, end)
 }
 
 export function workdirKey(path: string): string {
@@ -317,6 +334,8 @@ function reduceAdopt(ledger: Ledger, a: Extract<Action, { type: 'adopt' }>): Led
 function reduceBashStart(ledger: Ledger, a: Extract<Action, { type: 'bashStart' }>): Ledger {
   if (Object.hasOwn(ledger.runs, a.id)) return ledger
   const cls = a.cls
+  const workdir = cls.workdir !== undefined ? normalizeDir(cls.workdir, a.home) : undefined
+  const outDir = cls.kind === 'relay' && cls.outDir !== undefined ? normalizeDir(cls.outDir, a.home) : undefined
   let run: Run
   if (cls.kind === 'relay') {
     run = {
@@ -325,15 +344,15 @@ function reduceBashStart(ledger: Ledger, a: Extract<Action, { type: 'bashStart' 
       ...(cls.lane !== undefined ? { lane: cls.lane } : {}),
       ...(cls.model !== undefined ? { model: cls.model } : {}),
       ...(cls.effort !== undefined ? { effort: cls.effort, effortSource: 'flag' as const } : {}),
-      ...(cls.workdir !== undefined ? { workdirKey: workdirKey(cls.workdir) } : {}),
-      ...(cls.outDir !== undefined ? { outDir: cls.outDir } : {}),
+      ...(workdir !== undefined ? { workdirKey: workdirKey(workdir) } : {}),
+      ...(outDir !== undefined ? { outDir } : {}),
     }
   } else if (cls.kind === 'cli') {
     run = {
       ...newRun(ledger, a.id, 'cli', cls.implementer, a.at),
       ...(cls.model !== undefined ? { model: cls.model } : {}),
       ...(cls.effort !== undefined ? { effort: cls.effort, effortSource: 'flag' as const } : {}),
-      ...(cls.workdir !== undefined ? { workdirKey: workdirKey(cls.workdir) } : {}),
+      ...(workdir !== undefined ? { workdirKey: workdirKey(workdir) } : {}),
     }
   } else {
     run = newRun(ledger, a.id, 'shell', 'shell', a.at)

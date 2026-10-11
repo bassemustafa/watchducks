@@ -25,12 +25,25 @@ function field(result: unknown, key: string): unknown {
   return typeof result === 'object' && result !== null ? (result as Record<string, unknown>)[key] : undefined
 }
 
+/** HOME, read only when the classified command names a `~` directory; a failed read is no home. */
+async function homeFor($: EngineInterface, cls: ReturnType<typeof classify>): Promise<string | undefined> {
+  const outDir = cls.kind === 'relay' ? cls.outDir : undefined
+  if (!cls.workdir?.startsWith('~') && !outDir?.startsWith('~')) return undefined
+  try {
+    const home = await $.env.get('HOME')
+    return home !== undefined && home !== '' ? home : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function registerShellCollector(on: On, table: PriceTable): void {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const cls = classify(typeof e.command === 'string' ? e.command : '')
     const id = 'bash:' + e.tool_use_id
+    const home = await homeFor($, cls)
     const track = cls.kind !== 'shell' || e.run_in_background === true
-    if (track) await send($, { type: 'bashStart', id, cls, at: Date.now() }, table)
+    if (track) await send($, { type: 'bashStart', id, cls, at: Date.now(), ...(home !== undefined ? { home } : {}) }, table)
 
     let r: Awaited<ReturnType<typeof next>>
     try {
@@ -44,7 +57,7 @@ export function registerShellCollector(on: On, table: PriceTable): void {
     const taskId = field(r.result, 'backgroundTaskId')
     const backgroundTaskId = typeof taskId === 'string' && taskId !== '' ? taskId : undefined
     if (track || backgroundTaskId) {
-      if (!track) await send($, { type: 'bashStart', id, cls, at: Date.now() }, table)
+      if (!track) await send($, { type: 'bashStart', id, cls, at: Date.now(), ...(home !== undefined ? { home } : {}) }, table)
       await send(
         $,
         {

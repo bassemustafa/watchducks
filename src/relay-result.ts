@@ -1,5 +1,5 @@
 import type { RelayProjection, RunStatus, Usage } from '../types'
-import { workdirKey } from './ledger'
+import { normalizeDir, workdirKey } from './ledger'
 
 // Pure allow-list projection of a relay result.json (spec §6.3). Keys are read
 // by name only: the object is never iterated and `finalMessage` is never touched.
@@ -84,7 +84,10 @@ export function relayIdentity(text: string): RelayIdentity | null {
   const tool = toolOf(raw['tool'])
   if (tool !== undefined) identity.tool = tool
   const workdir = raw['workdir']
-  if (typeof workdir === 'string' && workdir.length > 0 && workdir.length <= MAX_PATH) identity.workdirKey = workdirKey(workdir)
+  if (typeof workdir === 'string' && workdir.length > 0 && workdir.length <= MAX_PATH) {
+    const dir = normalizeDir(workdir, undefined)
+    if (dir !== undefined) identity.workdirKey = workdirKey(dir)
+  }
   return identity
 }
 

@@ -24,11 +24,11 @@ function watchLedger(on: On): () => Ledger {
 }
 
 // The world beneath the plugin for a session that polls: a background relay Bash call, a store and a clock.
-function world(on: On, sessionId: () => string = () => 'S1', env: Record<string, string> = {}): MockClock {
+function world(on: On, sessionId: () => string = () => 'S1', env: Record<string, string> = {}, sessionRoot = '/work'): MockClock {
   on('command.register', async () => ({ value: { command: 'flock' } }))
   on('tool.register', async () => ({ value: { tool: 'mcp__watchducks__x' } }))
   on('session.id', async () => ({ value: sessionId() }))
-  on('session.root', async () => ({ value: '/work' }))
+  on('session.root', async () => ({ value: sessionRoot }))
   on('session.surfaces', async () => ({ value: ['terminal'] }))
   on('session.start', async ($, e) => ({ cwd: e.cwd }))
   on('session.end', async () => ({ sessionId: 'S1' }))
@@ -380,4 +380,31 @@ test('one directory is given to one run only', async ($, on) => {
   await polls(clock, 8)
   const dirs = ['bash:u1', 'bash:u2'].map(id => ledger().runs[id]!.outDir).filter(d => d !== undefined)
   expect(dirs).toEqual([dir])
+})
+
+test('a relay started with --cd ~/repo and no out-dir is paired with the result.json of /home/u/repo', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-home'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp, HOME: '/home/u' })
+  const dir = `${tmp}/delegate-relay/repo-20261012T101500`
+  memfs(on, nodesOf([tmp, `${tmp}/delegate-relay`, dir], { [`${dir}/result.json`]: resultText({ workdir: '/home/u/repo' }) }))
+  await $.session.start(START)
+  await $.tool.call({ ...BARE_CALL, command: 'node /x/claude-delegate/scripts/relay.mjs --lane quick --brief b --cd ~/repo 2>&1 | tail -3' } as never)
+  await polls(clock, 6)
+  const run = ledger().runs['bash:u1']!
+  expect(run.outDir).toBe(dir)
+  near(run.cost, 0.5)
+})
+
+test('--out-dir ~/o is read at /home/u/o/result.json', async ($, on) => {
+  const ledger = watchLedger(on)
+  const clock = world(on, () => 'S1', { TMPDIR: '/tmp/wd-disc-out', HOME: '/home/u' }, '/home/u')
+  const nodes = nodesOf(['/home/u', '/home/u/o'], { '/home/u/o/result.json': resultText() })
+  memfs(on, nodes)
+  await $.session.start(START)
+  await $.tool.call({ ...BARE_CALL, command: 'node /x/claude-delegate/scripts/relay.mjs --lane quick --brief b --out-dir ~/o' } as never)
+  await polls(clock, 2)
+  const run = ledger().runs['bash:u1']!
+  expect(run.outDir).toBe('/home/u/o')
+  near(run.cost, 0.5)
 })

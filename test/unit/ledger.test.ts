@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { emptyLedger, isKnownLoop, reduce, resolveRun, seriesWindow, totals, type Action } from '../../src/ledger'
+import { emptyLedger, isKnownLoop, normalizeDir, reduce, resolveRun, seriesWindow, totals, type Action } from '../../src/ledger'
 import { recordFromLedger, stationRowsFromLedger } from '../../src/history'
 import { PRICES } from '../../src/price'
 import type { Ledger } from '../../types'
@@ -356,4 +356,15 @@ test('seriesWindow aligns to the current minute, zero-fills and ages old activit
   expect(seriesWindow(l, T0 + 4 * MIN, 5)).toEqual([1100, 0, 1100, 0, 0])
   expect(seriesWindow(l, T0 + 40 * MIN).every(n => n === 0)).toBe(true)
   expect(seriesWindow(l, T0 + 2 * MIN, 3)).toEqual([1100, 0, 1100])
+})
+
+test('normalizeDir expands ~, drops trailing slashes and refuses what it cannot resolve', () => {
+  expect(normalizeDir('~', '/home/u')).toBe('/home/u')
+  expect(normalizeDir('~/a', '/home/u')).toBe('/home/u/a')
+  expect(normalizeDir('~/a/', '/home/u')).toBe('/home/u/a')
+  expect(normalizeDir('/a/b/', undefined)).toBe('/a/b')
+  expect(normalizeDir('/', undefined)).toBe('/')
+  expect(normalizeDir('~x/a', '/home/u')).toBeUndefined()
+  expect(normalizeDir('~/a', undefined)).toBeUndefined()
+  expect(normalizeDir('~/a', 'rel')).toBeUndefined()
 })
