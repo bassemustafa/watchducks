@@ -315,7 +315,7 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
     line2 = <Text color={PALETTE.handler}>{fit(`suspected handler? ${codenameOf(ledger, id)}`, inner)}</Text>
   } else {
     const status = `${words.spy} · ${words.plain}`
-    const figures = [(coarse ? fmtElapsedCoarse : fmtDuration)(runElapsed(run, now)), `${runTokens(run)} tok`, runCost(run)]
+    const figures = [(coarse && run.status === 'running' ? fmtElapsedCoarse : fmtDuration)(runElapsed(run, now)), `${runTokens(run)} tok`, runCost(run)]
     const whole = `${status}   ${figures.join('   ')}`
     // too long for one line: the status keeps its own line, the figures wrap whole so tokens and cost never get cut
     const lines = Array.from(whole).length <= inner ? [whole] : [fit(status, inner), ...packFigures(figures, inner)]
@@ -488,7 +488,7 @@ export function registerSidebar(on: On, options: PluginOptions): void {
         <Box flexDirection="column">
           {nav}
           {blank}
-          {stationView(t, rows, ui.span, lay.inner, g, press)}
+          {stationView(t, rows, ui.span, lay.inner, g, press, e.surface === 'terminal' ? null : $.ui.resolve(e))}
         </Box>
       )
     } else {

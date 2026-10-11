@@ -1,6 +1,9 @@
+import type { Elements } from 'claude-code'
+
 import type { StationRow, Usage } from '../../types'
 import { fit, type Glyphs, type Press, type Table } from './dossier'
 import { cachePct, fmtCost, fmtTokens } from './format'
+import { BAR_HEIGHT, barSvg, barWidth } from './svg'
 import { PALETTE } from './theme'
 
 // The station board (spec §9.2 item 5): one entry per implementer × model with
@@ -37,8 +40,12 @@ export function stationView(
   inner: number,
   g: Glyphs,
   press: Press,
+  /** The desktop element table, or null on the terminal; the desktop draws the bar as an image because its font widens block characters. */
+  desktop: Elements['desktop'] | null,
 ): ReturnType<Table['Box']> {
   const { Box, Text, Button } = t
+  const Svg = desktop ? desktop.Svg : null
+  const barPx = Math.max(120, inner * 8)
   const w = weights(rows)
   const top = Math.max(...w, 0)
 
@@ -63,7 +70,8 @@ export function stationView(
       <Text> </Text>
       {rows.length === 0 && <Text dimColor>Nothing on the board yet.</Text>}
       {rows.map((r, i) => {
-        const b = bar(top > 0 ? (w[i] ?? 0) / top : 0, Math.max(8, inner))
+        const fraction = top > 0 ? (w[i] ?? 0) / top : 0
+        const b = bar(fraction, Math.max(8, inner))
         const cost = rowCost(r)
         // no cost at all: "?" when some op should have one (an unpriced model), "—" when none could
         const costText = cost === null ? (r.unknownCostOps > 0 ? '?' : '—') : fmtCost(cost, null, r.unknownCostOps > 0)
@@ -74,10 +82,25 @@ export function stationView(
             <Text bold wrap="truncate">
               {fit(`${r.implementer} · ${r.model}`, inner)}
             </Text>
-            <Text wrap="truncate">
-              <Text color={PALETTE.accent}>{b.filled}</Text>
-              <Text color={PALETTE.ended}>{b.empty}</Text>
-            </Text>
+            {Svg ? (
+              <Svg
+                alt="Share of the board"
+                width={barWidth(barPx)}
+                height={BAR_HEIGHT}
+                source={barSvg(
+                  [
+                    { label: 'share', value: fraction, color: PALETTE.accent },
+                    { label: 'rest', value: 1 - fraction, color: PALETTE.ended },
+                  ],
+                  barPx,
+                )}
+              />
+            ) : (
+              <Text wrap="truncate">
+                <Text color={PALETTE.accent}>{b.filled}</Text>
+                <Text color={PALETTE.ended}>{b.empty}</Text>
+              </Text>
+            )}
             <Text wrap="truncate">
               <Text dimColor>ops </Text>
               <Text>{String(r.ops).padStart(3)}</Text>
@@ -86,6 +109,22 @@ export function stationView(
               <Text>{`   ${(measured ? fmtTokens(rowTokens(r)) : '—').padStart(5)}`}</Text>
               <Text dimColor> tok</Text>
             </Text>
+            <Text wrap="truncate">
+              <Text dimColor>{'in  '}</Text>
+              <Text>{measured ? fmtTokens(r.uncached + r.cacheRead + r.cacheWrite) : '—'}</Text>
+              <Text dimColor>{'   out '}</Text>
+              <Text>{measured ? fmtTokens(r.output) : '—'}</Text>
+            </Text>
+            {measured && (
+              <Text wrap="truncate">
+                <Text dimColor>{'  uncached '}</Text>
+                <Text>{fmtTokens(r.uncached)}</Text>
+                <Text dimColor>{' · read '}</Text>
+                <Text>{fmtTokens(r.cacheRead)}</Text>
+                <Text dimColor>{' · write '}</Text>
+                <Text>{fmtTokens(r.cacheWrite)}</Text>
+              </Text>
+            )}
             <Text wrap="truncate">
               <Text dimColor>cache </Text>
               <Text>{(measured ? cachePct(rowUsage(r)) : '—').padStart(4)}</Text>

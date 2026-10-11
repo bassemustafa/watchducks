@@ -329,3 +329,79 @@ test('F14: an unpriced model row shows ? for its cost, not a dash', async ($, on
   expect(text).toContain('mystery-model-1')
   expect(text).toContain('"?"')
 })
+
+// ---- token breakdown, desktop station bar, finished desktop card
+
+test('the dossier lists input as the sum of its parts, then output and the total', async ($, on) => {
+  mock.store(on)
+  on('agent.spawn', async () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+  on('turn.step', async function* () {
+    const usage = { ...BIG_USAGE, input_tokens: 100000, cache_read_input_tokens: 60000, cache_creation_input_tokens: 40000 }
+    return { turnId: 't1', index: 0, answer: '', toolUses: [], stopReason: 'end_turn', usage } as never
+  })
+  await stepAgent($)
+  const ui = await pane($, 'terminal', 52)
+  await ui.press({ key: 'a1' })
+  const text = await drawn(ui)
+  // 100k + 60k + 40k input, 20k output
+  expect(text).toMatch(/"input\s+"[^]*"200k"/)
+  expect(text).toMatch(/"  cache write\s*"/)
+  expect(text).toMatch(/"total\s+"[^]*"220k"/)
+})
+
+test('the station board splits a measured row into input and output, and dashes an unmeasured one', async ($, on) => {
+  on('tool.call', { tool: 'Bash' }, async () => ({ result: {} }) as never)
+  mock.store(on)
+  runningAgent(on)
+  await stepAgent($)
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'c1', command: 'codex exec -m gpt-6.1-sol "x"' } as never)
+  const ui = await pane($, 'terminal', 52)
+  await ui.press({ key: 'station' })
+  const text = await drawn(ui)
+  expect(text).toContain('"in  "')
+  expect(text).toContain('"   out "')
+  expect(text).toContain('"  uncached "')
+  expect(text).toContain('" · read "')
+  expect(text).toContain('" · write "')
+  // the codex CLI row has no measured usage: its in/out line is dashes and it has no breakdown line
+  expect(text.match(/"  uncached "/g)?.length).toBe(1)
+  expect(text.match(/"in  "/g)?.length).toBe(2)
+})
+
+test('the desktop station board draws the row bar as a plain Svg, the terminal keeps the text bar', async ($, on) => {
+  mock.store(on)
+  runningAgent(on)
+  await stepAgent($)
+  const desktop = await pane($, 'desktop', 52)
+  await desktop.press({ key: 'station' })
+  const dText = await drawn(desktop)
+  await desktop.unmount()
+  const bars = svgProps(dText)
+  expect(bars.length).toBe(1)
+  expect(typeof bars[0]?.height).toBe('number')
+  expect(bars[0]?.isInteractive).toBeUndefined()
+  expect(dText).not.toContain('█')
+  const terminal = await pane($, 'terminal', 52)
+  await terminal.press({ key: 'station' })
+  const tText = await drawn(terminal)
+  expect(tText).toContain('█')
+  expect(svgProps(tText).length).toBe(0)
+})
+
+test('a finished card on the desktop shows its exact M:SS duration', async ($, on) => {
+  on('command.register', async () => ({ value: { command: 'flock' } }))
+  on('session.id', async () => ({ value: 'S1' }))
+  on('session.start', async ($, e) => ({ cwd: e.cwd }))
+  on('agent.spawn', async () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+  on('turn.complete', async () => ({ text: '' }))
+  on('ui.panes', async () => ({ value: [] }))
+  mock.store(on)
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/work', surface: null, isInteractive: true })
+  await $.agent.spawn({ subagentType: 'Explore' } as never)
+  await $.turn.complete({ agentId: 'a1', turnId: 't1', reason: 'answer', answer: '', durationMs: 49000, isAborted: false } as never)
+  await clock.advance(2000)
+  const desktop = await view($, 'desktop', 52)
+  expect(desktop).toMatch(/0:\d\d/)
+  expect(desktop).not.toContain('<1m')
+})

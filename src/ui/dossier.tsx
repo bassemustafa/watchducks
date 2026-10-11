@@ -58,7 +58,7 @@ function clock(ms: number | undefined): string {
   return new Date(ms).toISOString().slice(11, 19) + ' UTC'
 }
 
-const LABEL = 12
+const LABEL = 14
 
 export function dossierView(
   t: Table,
@@ -126,10 +126,12 @@ export function dossierView(
       {row('ended', run.status === 'running' ? '—' : clock(run.endedAt))}
       {row('duration', fmtDuration(runElapsed(run, now)))}
       <Text> </Text>
-      {row('uncached', u ? fmtTokens(u.uncached) : runTokens(run))}
-      {row('cache read', u ? fmtTokens(u.cacheRead) : runTokens(run))}
-      {row('cache write', u ? fmtTokens(u.cacheWrite) : runTokens(run))}
+      {row('input', u ? fmtTokens(u.uncached + u.cacheRead + u.cacheWrite) : runTokens(run))}
+      {row('  uncached', u ? fmtTokens(u.uncached) : runTokens(run))}
+      {row('  cache read', u ? fmtTokens(u.cacheRead) : runTokens(run))}
+      {row('  cache write', u ? fmtTokens(u.cacheWrite) : runTokens(run))}
       {row('output', u ? fmtTokens(u.output) : runTokens(run))}
+      {row('total', runTokens(run))}
       {row('cache hit', cachePct(u))}
       {row('cost', runCost(run), PALETTE.accent)}
       {run.costPartial && <Text dimColor>{'  some requests had no price'}</Text>}
