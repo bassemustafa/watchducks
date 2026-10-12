@@ -23,13 +23,14 @@ import {
 import { HISTORY_PREFIX, pruneHistory, recordFromLedger } from './history'
 import { emptyLedger, isKnownLoop, normalizeDir, reduce, type Action } from './ledger'
 import type { PriceTable } from './price'
+import { fnv1a } from './codename'
 import { MAX_RESULT_BYTES, isInsideRoots, projectRelayResult, relayIdentity } from './relay-result'
 import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, recordsHeadless } from './state'
 import { ROSTER_SPEC, VERDICT_SPEC } from './tools'
 import { blipsFor, radar } from './ui/animate'
 import { fmtCost } from './ui/format'
-import { STAMP_MS } from './ui/motion'
-import { radarFrame } from './ui/raster'
+import { STAMP_MS, dotFrame, dotRaster, duckPoseAt, motion, stampFrame, stampRaster } from './ui/motion'
+import { duckLogo, radarFrame } from './ui/raster'
 import { glyphs, statusWords } from './ui/theme'
 
 const ledgerAtom = atom({ plugin: 'watchducks', key: 'ledger' } as const, INITIAL_LEDGER)
@@ -494,7 +495,7 @@ async function saveWhileActive($: EngineInterface, options: PluginOptions): Prom
 // UI timers (spec §9.2, §9.4). One watch timer sees every run change in the
 // ledger (the collectors write it, this file only reads): it stamps a run that
 // turned done, toasts a run that ended, auto-opens the sidebar on the first run
-// of the session, and starts or stops the 200 ms radar timer. Module state
+// of the session, and starts or stops the 200 ms animation timer. Module state
 // dies with a hot reload; session.start seeds it again from the ledger so no
 // old run is stamped or toasted twice.
 
@@ -519,6 +520,7 @@ let savedSignature: string | undefined
 function seed(l: Ledger): void {
   seenGeneration = l.generation
   seenSession = l.sessionId
+  motion.seed = fnv1a(l.sessionId)
   seenStatus.clear()
   for (const id of l.order) {
     const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
@@ -593,16 +595,32 @@ async function flockPlaced($: EngineInterface): Promise<boolean> {
   }
 }
 
-async function drawRadar($: EngineInterface): Promise<void> {
+async function blit1($: EngineInterface, key: string, cells: string): Promise<void> {
+  try {
+    await $.ui.blit({ requestId: PANE, key, cells })
+  } catch {
+    // a missed frame is not an error
+  }
+}
+
+async function drawMotion($: EngineInterface, options: PluginOptions): Promise<void> {
   if (animating) return
   animating = true
   try {
+    const now = Date.now()
     const m = radar.mounted
-    if (!m) return
-    radar.tick = (radar.tick + 1) % 48
-    await $.ui.blit({ requestId: PANE, key: 'radar', cells: radarFrame(radar.tick, radar.blips, m.columns, m.rows).cells })
-  } catch {
-    // a missed frame is not an error
+    if (m) {
+      radar.tick = (radar.tick + 1) % 48
+      await blit1($, 'radar', radarFrame(radar.tick, radar.blips, m.columns, m.rows).cells)
+    }
+    const dot = dotFrame(now).color
+    for (const id of motion.dots) await blit1($, `dot:${id}`, dotRaster(id, glyphs(options.glyphs === 'ascii' ? 'ascii' : 'emoji').on, dot).cells)
+    for (const [id, s] of Object.entries(motion.stamps)) {
+      const elapsed = now - s.startedAt
+      if (elapsed >= STAMP_MS) continue
+      await blit1($, `stamp:${id}`, stampRaster(id, s.kind, elapsed / STAMP_MS).cells)
+    }
+    if (motion.duckMounted) await blit1($, 'duck', duckLogo(duckPoseAt(now, motion.seed, ANIM_MS)).cells)
   } finally {
     animating = false
   }
@@ -663,8 +681,10 @@ async function watchTick($: EngineInterface, options: PluginOptions): Promise<vo
       placed = await flockPlaced($)
     }
 
-    const wantAnim = options.motion !== 'off' && running && placed && radar.mounted !== null
-    if (wantAnim && !animTimer) animTimer = $.clock.every(ANIM_MS, () => void drawRadar($))
+    const stamped = Object.values(ui.stamps ?? {}).some(s => s.until > now)
+    const onScreen = radar.mounted !== null || motion.dots.length > 0 || motion.duckMounted || Object.keys(motion.stamps).length > 0
+    const wantAnim = options.motion !== 'off' && (running || stamped) && placed && onScreen
+    if (wantAnim && !animTimer) animTimer = $.clock.every(ANIM_MS, () => void drawMotion($, options))
     if (!wantAnim && animTimer) {
       animTimer.cancel()
       animTimer = undefined

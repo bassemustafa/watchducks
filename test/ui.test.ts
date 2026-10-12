@@ -457,3 +457,18 @@ test('a finished card on the desktop shows its exact M:SS duration', async ($, o
   expect(desktop).toMatch(/0:\d\d/)
   expect(desktop).not.toContain('<1m')
 })
+
+test('a running card draws its dot as a Raster on the terminal and as Text on the desktop', async ($, on) => {
+  on('ui.panes', async () => ({ value: [] }))
+  backgroundRelay(on)
+  await $.tool.call(RELAY_CALL as never)
+  expect(await view($, 'terminal', 52)).toMatch(/"key":"dot:[^"]+"/)
+  expect(await view($, 'desktop', 52)).not.toContain('"key":"dot:')
+})
+
+test('motion off keeps the running dot as Text', { options: { motion: 'off' } }, async ($, on) => {
+  on('ui.panes', async () => ({ value: [] }))
+  backgroundRelay(on)
+  await $.tool.call(RELAY_CALL as never)
+  expect(await view($, 'terminal', 52)).not.toContain('"key":"dot:')
+})

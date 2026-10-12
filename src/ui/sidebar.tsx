@@ -8,8 +8,8 @@ import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord } from '../state'
 import { RADAR_FULL, RADAR_SMALL, blipsFor, radar, svgBlipsFor } from './animate'
 import { codenameOf, dossierView, fit, runCost, runElapsed, runTokens, totalTokens, type Glyphs, type Press, type Table } from './dossier'
 import { cachePct, fmtCost, fmtDuration, fmtElapsedCoarse, fmtTokens, sparkline } from './format'
-import { STAMP_MS, STAMP_TEXT, stampFrame, type StampKind } from './motion'
-import { DEFAULT_COLOR, duckLogo, encodeCells, gradientBar, hex, radarFrame, type RasterSpec } from './raster'
+import { STAMP_MS, STAMP_TEXT, dotFrame, dotRaster, motion as motionState, stampRaster, type StampKind } from './motion'
+import { duckLogo, gradientBar, hex, radarFrame, type RasterSpec } from './raster'
 import { stationView } from './station'
 import { BAR_HEIGHT, barSvg, barWidth, headerHeight, headerSvg, headerWidth } from './svg'
 import { PALETTE, glyphs, statusColor, statusWords } from './theme'
@@ -53,14 +53,6 @@ function orderedRuns(ledger: Ledger): Run[] {
 
 function raster(spec: RasterSpec): { key: string; columns: number; rows: number; cells: string } {
   return { key: spec.key, columns: spec.columns, rows: spec.rows, cells: spec.cells }
-}
-
-/** The stamp text as one row of cells; characters past `visible` are blank. Drawn at progress 0 until the animation timer blits the reveal. */
-function stampRaster(runId: string, kind: StampKind, progress: number): RasterSpec {
-  const { visible, color } = stampFrame(progress, kind)
-  const chars = Array.from(STAMP_TEXT[kind])
-  const cells = chars.map((ch, i): [number, number, number] => (i < visible ? [ch.codePointAt(0) ?? 0x20, color, DEFAULT_COLOR] : [0x20, DEFAULT_COLOR, DEFAULT_COLOR]))
-  return { key: `stamp:${runId}`, columns: chars.length, rows: 1, cells: encodeCells(cells) }
 }
 
 type Layout = {
@@ -198,6 +190,7 @@ function terminalArt(t: Elements['terminal'], ledger: Ledger, tot: Totals, lay: 
       </Box>
     )
     if (lay.tier === 'full') {
+      if (lay.stampTable) motionState.duckMounted = true
       header = (
         <Box flexDirection="column">
           <Box>
@@ -322,6 +315,7 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
   const color = statusColor(run.status)
   const words = statusWords(run.status)
   const dot = g.dot[run.status]
+  if (stampTable && run.status === 'running') motionState.dots.push(run.id)
   const rest = fit(`${run.codename}  ${run.implementer} · ${run.model ?? '—'} · ${run.effort ?? '—'}`, Math.max(1, inner - (Array.from(dot).length + 1)))
 
   const review = run.reviews.length > 0 ? run.reviews[run.reviews.length - 1] : undefined
@@ -329,6 +323,7 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
   if (stamp) {
     if (stampTable) {
       const Raster = stampTable.Raster
+      motionState.stamps[run.id] = { kind: stamp.kind, startedAt: now - stamp.progress * STAMP_MS }
       line2 = <Raster {...raster(stampRaster(run.id, stamp.kind, stamp.progress))} />
     } else {
       line2 = (
@@ -357,7 +352,14 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
   return (
     <Box key={`card-${run.id}`} flexDirection="column">
       <Box>
-        <Text color={color} bold={run.status === 'running'}>{`${dot} `}</Text>
+        {stampTable && run.status === 'running' ? (
+          <Box>
+            <stampTable.Raster {...raster(dotRaster(run.id, g.on, dotFrame(now).color))} />
+            <Text>{' '}</Text>
+          </Box>
+        ) : (
+          <Text color={color} bold={run.status === 'running'}>{`${dot} `}</Text>
+        )}
         <Button key={run.id} plain label={rest} onPress={() => press({ view: 'dossier', dossierId: run.id })} />
       </Box>
       {line2}
@@ -479,6 +481,9 @@ export function registerSidebar(on: On, options: PluginOptions): void {
     const lay: Layout = { columns, inner: Math.max(16, columns - PAD * 2), tier, g, showOverhead, coarse: e.surface === 'desktop', stampTable: e.surface === 'terminal' && motion ? $.ui.resolve(e) : null }
     const press: Press = patch => void update($, uiAtom, u => ({ ...u, ...patch })).catch(() => undefined)
     radar.mounted = null
+    motionState.dots = []
+    motionState.stamps = {}
+    motionState.duckMounted = false
 
     const t: Table = $.ui.resolve(e)
     const { Box, Text, Button } = t

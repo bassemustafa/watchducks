@@ -116,8 +116,26 @@ function halfBlock(top: number | null, bottom: number | null): Cell {
   return [0x2580, top, bottom]
 }
 
-export function duckLogo(): RasterSpec {
+const LENS = DUCK_COLORS.G!
+const GLINT = DUCK_COLORS.W!
+const BRIM = DUCK_COLORS.B!
+
+/** The duck in a pose: blink paints the lens pixels in the brim color, a glance moves each glint one pixel into the lens. */
+export function duckPose(pose: 'open' | 'blink' | 'glanceLeft' | 'glanceRight'): Array<Array<number | null>> {
   const px = duckPixels()
+  if (pose === 'open') return px
+  const step = pose === 'glanceLeft' ? -1 : 1
+  return px.map(row =>
+    row.map((c, i) => {
+      if (pose === 'blink') return c === LENS || c === GLINT ? BRIM : c
+      if (c === GLINT) return LENS
+      return row[i - step] === GLINT && c === LENS ? GLINT : c
+    }),
+  )
+}
+
+export function duckLogo(pose: 'open' | 'blink' | 'glanceLeft' | 'glanceRight' = 'open'): RasterSpec {
+  const px = duckPose(pose)
   const cells: Cell[] = []
   for (let r = 0; r < 6; r++) {
     for (let c = 0; c < 12; c++) {

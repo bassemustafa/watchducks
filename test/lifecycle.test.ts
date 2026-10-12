@@ -1,5 +1,5 @@
 import type { On } from 'claude-code'
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock, test, type Engine } from 'claude-code/testing'
 
 import type { Ledger, UiState } from '../types'
 import { utcDay } from '../src/history'
@@ -274,4 +274,71 @@ test('runs ending in one tick each get a stamp entry and each entry clears on it
   expect(latest.stamps?.['m2']?.kind).toBe('killed')
   await clock.advance(1600)
   expect(latest.stamps).toBeUndefined()
+})
+
+// A pane drawn as the engine draws it on a surface; the timer blits only what the last render mounted.
+function mountPane($: Engine, surface: 'terminal' | 'desktop') {
+  return $.ui.mount({
+    plugin: 'watchducks',
+    surface,
+    component: 'Pane',
+    requestId: 'flock',
+    props: { title: 'The Flock', isFocused: false, bodyColumns: 52, placement: 'dock' } as never,
+    viewport: { columns: 56, rows: 40, isFullscreen: true },
+  })
+}
+
+// One running agent, the flock pane placed and drawn, and a recorder of the blit keys.
+async function motionWorld($: Engine, on: On, surface: 'terminal' | 'desktop') {
+  const { clock } = world(on, [surface])
+  const keys: string[] = []
+  on('ui.blit', async (_$, e) => {
+    keys.push((e as unknown as { key: string }).key)
+    return { value: {} }
+  })
+  on('ui.panes', async () => ({ value: [{ id: 'flock', title: 'The Flock', isShown: true, isFocused: false, isPlaced: true }] }))
+  // the first watch tick auto-opens the sidebar beside a fullscreen transcript
+  on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
+  on('turn.complete', async () => ({ text: '' }))
+  await $.session.start(START)
+  await $.agent.spawn({ subagentType: 'Explore' } as never)
+  await clock.advance(100)
+  const m = await mountPane($, surface)
+  await m.drawn()
+  return { clock, keys, m }
+}
+
+test('a running card on the terminal gets radar, dot and duck blits from the animation timer', async ($, on) => {
+  const { clock, keys } = await motionWorld($, on, 'terminal')
+  await clock.advance(1000)
+  expect(keys).toContain('radar')
+  expect(keys).toContain('dot:l1')
+  expect(keys).toContain('duck')
+})
+
+test('the desktop surface gets no blit at all', async ($, on) => {
+  const { clock, keys } = await motionWorld($, on, 'desktop')
+  await clock.advance(1000)
+  expect(keys).toEqual([])
+})
+
+test('motion off blits nothing', { options: { motion: 'off' } }, async ($, on) => {
+  const { clock, keys } = await motionWorld($, on, 'terminal')
+  await clock.advance(1000)
+  expect(keys).toEqual([])
+})
+
+test('a stamp is blitted while it reveals and stops after STAMP_MS', async ($, on) => {
+  const { clock, keys, m } = await motionWorld($, on, 'terminal')
+  await $.turn.complete({ agentId: 'l1', turnId: 't1', reason: 'answer', answer: '', durationMs: 1, isAborted: false } as never)
+  await clock.advance(600) // the watch tick stamps the run
+  await m.drawn()
+  keys.length = 0
+  await clock.advance(600)
+  expect(keys).toContain('stamp:l1')
+  await clock.advance(1200) // past STAMP_MS; the stamp entry has cleared
+  await m.drawn()
+  keys.length = 0
+  await clock.advance(1000)
+  expect(keys.some(k => k.startsWith('stamp:'))).toBe(false)
 })

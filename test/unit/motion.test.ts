@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import { dotFrame, duckFrame, stampFrame, tween } from '../../src/ui/motion'
+import { dotFrame, duckFrame, duckPoseAt, stampFrame, stampRaster, tween } from '../../src/ui/motion'
+import { duckLogo, duckPixels, duckPose } from '../../src/ui/raster'
 
 const SHADES = [0xfbbf24, 0xf59e0b, 0xd97706, 0xb45309]
 
@@ -102,3 +103,46 @@ test('tween eases out and clamps', () => {
   expect(tween(0, 100, -2)).toBe(0)
   expect(tween(0, 100, 3)).toBe(100)
 })
+
+test('duckPose: blink paints the lenses and glints in the brim color, glances move each glint one pixel', () => {
+  const open = duckPixels()
+  const blink = duckPose('blink')
+  expect(blink[6]![1]).toBe(0x94a3b8)
+  expect(blink[6]![3]).toBe(0x94a3b8)
+  expect(blink[0]).toEqual(open[0])
+  const left = duckPose('glanceLeft')
+  expect(open[6]![3]).toBe(0x7dd3fc)
+  expect(left[6]![2]).toBe(0x7dd3fc)
+  expect(left[6]![3]).toBe(0x020617)
+  expect(duckPose('glanceRight')[6]![4]).toBe(0x7dd3fc)
+  expect(duckLogo('blink').cells).not.toBe(duckLogo().cells)
+  expect(duckLogo('blink').key).toBe('duck')
+})
+
+test('stampRaster reveals more cells as progress grows and keeps its key', () => {
+  expect(stampRaster('a1', 'done', 0).key).toBe('stamp:a1')
+  expect(stampRaster('a1', 'done', 0).cells).not.toBe(stampRaster('a1', 'done', 1).cells)
+})
+
+test('duckPoseAt on a 200 ms tick never misses a blink', () => {
+  const t0 = 1_791_800_000_000
+  // every blink start in the first minute must be seen by at least one tick of a 200 ms timer, at any phase
+  for (const phase of [0, 50, 100, 150]) {
+    let seen = 0
+    let blinks = 0
+    let wasOpen = true
+    for (let t = t0; t < t0 + 60_000; t += 10) {
+      const open = duckFrame(t, 7) === 'open'
+      if (wasOpen && !open) blinks += 1
+      wasOpen = open
+    }
+    let lastSeen = false
+    for (let t = t0 + phase; t < t0 + 60_000; t += 200) {
+      const blinking = duckPoseAt(t, 7, 200) !== 'open'
+      if (blinking && !lastSeen) seen += 1
+      lastSeen = blinking
+    }
+    expect(seen).toBe(blinks)
+  }
+})
+
