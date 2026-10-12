@@ -375,7 +375,7 @@ function reduceBashStart(ledger: Ledger, a: Extract<Action, { type: 'bashStart' 
       ...(cls.lane !== undefined ? { lane: cls.lane } : {}),
       ...(cls.model !== undefined ? { model: cls.model } : {}),
       ...(cls.effort !== undefined ? { effort: cls.effort, effortSource: 'flag' as const } : {}),
-      ...(workdir !== undefined ? { workdirKey: workdirKey(workdir) } : {}),
+      ...(workdir !== undefined ? { workdirKey: workdirKey(workdir), workdir } : {}),
       ...(outDir !== undefined ? { outDir } : {}),
     }
   } else if (cls.kind === 'cli') {
@@ -383,7 +383,7 @@ function reduceBashStart(ledger: Ledger, a: Extract<Action, { type: 'bashStart' 
       ...newRun(ledger, a.id, 'cli', cls.implementer, a.at),
       ...(cls.model !== undefined ? { model: cls.model } : {}),
       ...(cls.effort !== undefined ? { effort: cls.effort, effortSource: 'flag' as const } : {}),
-      ...(workdir !== undefined ? { workdirKey: workdirKey(workdir) } : {}),
+      ...(workdir !== undefined ? { workdirKey: workdirKey(workdir), workdir } : {}),
     }
   } else {
     run = newRun(ledger, a.id, 'shell', 'shell', a.at)

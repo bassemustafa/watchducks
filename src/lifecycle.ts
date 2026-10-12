@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, FsStat, On, PluginOptions, Timer } from 'claude-code'
 
 import type { HistoryRecord, Ledger, RelayProjection, Run } from '../types'
+import { STATS_ARGV, STATS_EVERY_MS, STATS_TIMEOUT_MS, attribute, projectStats, type StatsSnapshot } from './adapters/opencode-stats'
 import {
   DISCOVERY_BUDGET_MS,
   DISCOVERY_EVERY,
@@ -11,9 +12,11 @@ import {
   MAX_DISCOVERY_ROOTS,
   MAX_DISCOVERY_STATS,
   MAX_LISTED_ENTRIES,
+  POLL_GRACE_MS,
   RELAY_POLL_MS,
   allowedRoots,
   duePolls,
+  fingerprint,
   matchDiscovered,
   pendingDiscovery,
   relayRoots,
@@ -58,6 +61,10 @@ function stopTimers(): void {
   discoveryPolls = 0
   discoveryGeneration = -1 // the next pass starts with nothing remembered
   resetDiscovery()
+  statsTimer?.cancel()
+  statsTimer = undefined
+  statsBusy = false
+  resetStats()
   agentTimer?.cancel()
   saveTimer?.cancel()
   relayTimer?.cancel()
@@ -486,6 +493,210 @@ async function pollRelays($: EngineInterface, table: PriceTable, options: Plugin
   }
 }
 
+// opencode stats (spec §3). While `opencodeStats` is on and an opencode run is running (or ended less than the relay
+// grace ago), one timer takes `opencode stats` snapshots per working directory and gives each run its share. The
+// process runs one at a time for the session, at most once per STATS_EVERY_MS per directory; its stdout is projected to
+// numbers by `projectStats` and its stderr is never read. What is kept here is numbers and run ids: the working
+// directory is read from the run for the call and not kept.
+
+const STATS_SLACK_MS = 50 // a timer tick may land a hair before the interval is over
+const STATS_MAX_FAILURES = 3
+
+let statsTimer: Timer | undefined
+let statsBusy = false
+let statsFailures = 0
+let statsGeneration = -1
+// the snapshot each run was first seen at
+const statsBase = new Map<string, StatsSnapshot>()
+// runs whose final snapshot has been applied
+const statsFinal = new Set<string>()
+// when the process last started for a working directory key
+const statsAttempt = new Map<string, number>()
+// the figures last sent for a run, so an unchanged run writes nothing
+const statsSent = new Map<string, string>()
+
+function resetStats(): void {
+  statsFailures = 0
+  statsGeneration = -1
+  statsBase.clear()
+  statsFinal.clear()
+  statsAttempt.clear()
+  statsSent.clear()
+}
+
+function syncStatsGeneration(l: Ledger): void {
+  if (l.generation === statsGeneration) return
+  resetStats()
+  statsGeneration = l.generation
+}
+
+const dirOf = (run: Run): string => run.workdirKey ?? 'session'
+const shortModel = (model: string | undefined): string => (model === undefined ? '' : model.slice(model.lastIndexOf('/') + 1))
+
+function isStatsRun(run: Run): boolean {
+  if (run.implementer !== 'opencode' || (run.kind !== 'cli' && run.kind !== 'relay')) return false
+  // an exact relay result wins over stats: no process is needed for it
+  return !(run.usageSource === 'relay' && run.costSource === 'reported')
+}
+
+/** Opencode runs that need a snapshot: running, or ended less than the grace ago and not yet given their final one. */
+function statsLive(l: Ledger, now: number): Run[] {
+  const live: Run[] = []
+  for (const id of l.order) {
+    const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
+    if (!run || !isStatsRun(run)) continue
+    if (run.status === 'running') live.push(run)
+    else if (run.endedAt !== undefined && now - run.endedAt < POLL_GRACE_MS && !statsFinal.has(run.id)) live.push(run)
+  }
+  return live
+}
+
+/** Runs of one model whose running intervals overlap (chained) form one group; a lone run is a group of one. */
+function statsGroups(members: readonly Run[], now: number): Run[][] {
+  const byModel = new Map<string, Run[]>()
+  for (const run of members) {
+    const key = shortModel(run.model)
+    byModel.set(key, [...(byModel.get(key) ?? []), run])
+  }
+  const groups: Run[][] = []
+  for (const runs of byModel.values()) {
+    let current: Run[] = []
+    let reach = 0
+    for (const run of [...runs].sort((a, b) => a.startedAt - b.startedAt)) {
+      if (current.length > 0 && run.startedAt <= reach) {
+        current.push(run)
+        reach = Math.max(reach, run.endedAt ?? now)
+      } else {
+        if (current.length > 0) groups.push(current)
+        current = [run]
+        reach = run.endedAt ?? now
+      }
+    }
+    if (current.length > 0) groups.push(current)
+  }
+  return groups
+}
+
+async function takeStats($: EngineInterface, cwd: string | undefined): Promise<StatsSnapshot | null> {
+  try {
+    const r = await $.process.run(STATS_ARGV, { ...(cwd !== undefined ? { cwd } : {}), timeoutMs: STATS_TIMEOUT_MS })
+    if (r.exitCode !== 0 || r.isStdoutTruncated) return null
+    return projectStats(r.stdout, Date.now())
+  } catch {
+    return null
+  }
+}
+
+/** Gives every run of one working directory its share of the snapshot, in one atomic ledger update. */
+async function applyStats($: EngineInterface, table: PriceTable, seen: Ledger, dir: string, live: readonly Run[], snap: StatsSnapshot): Promise<void> {
+  const now = Date.now()
+  for (const run of live) if (!statsBase.has(run.id)) statsBase.set(run.id, snap)
+  const liveIds = new Set(live.map(r => r.id))
+  // every run of the directory this adapter has followed, so a group keeps its members after one of them leaves
+  const tracked: Run[] = []
+  for (const id of seen.order) {
+    const run = Object.hasOwn(seen.runs, id) ? seen.runs[id] : undefined
+    if (run && isStatsRun(run) && dirOf(run) === dir && statsBase.has(id)) tracked.push(run)
+  }
+
+  const actions: Action[] = []
+  const signatures = new Map<string, string>()
+  for (const group of statsGroups(tracked, now)) {
+    if (!group.some(r => liveIds.has(r.id))) continue
+    const base = group.map(r => statsBase.get(r.id)!).reduce((a, b) => (b.at < a.at ? b : a))
+    if (base === snap) continue // baselined just now: nothing to count yet
+    const share = attribute(base, snap, group[0]!.model)
+    const overlapping = tracked.filter(r => r.startedAt <= snap.at && (r.endedAt ?? now) >= base.at).length
+    const approx = share.approx || snap.sessions - base.sessions > overlapping
+    // the earliest start names the group: a run joining it cannot move that, and a later group of the same folder and model gets its own key
+    const sharedKey =
+      group.length > 1 ? fingerprint(`${dir}|${shortModel(group[0]!.model)}|${Math.min(...group.map(r => r.startedAt))}`) : undefined
+    for (const run of group) {
+      const u = share.usage
+      const signature = `${u.uncached}|${u.output}|${u.cacheRead}|${u.cacheWrite}|${share.cost}|${approx}|${sharedKey ?? ''}|${group.length}`
+      if (statsSent.get(run.id) === signature) continue
+      signatures.set(run.id, signature)
+      actions.push({
+        type: 'adapterUsage',
+        id: run.id,
+        source: 'stats',
+        usage: u,
+        cost: share.cost,
+        costSource: 'reported',
+        ...(approx ? { approx: true } : {}),
+        ...(sharedKey !== undefined ? { sharedKey, sharedSize: group.length } : {}),
+        at: now,
+      })
+    }
+  }
+
+  let applied = false
+  await update($, ledgerAtom, l => {
+    applied = l.generation === seen.generation
+    return applied ? actions.reduce((acc, a) => reduce(acc, a, table), l) : l
+  })
+  if (!applied) return
+  for (const [id, signature] of signatures) statsSent.set(id, signature)
+  for (const run of live) if (run.status !== 'running') statsFinal.add(run.id)
+}
+
+async function statsTick($: EngineInterface, table: PriceTable, options: PluginOptions): Promise<void> {
+  if (statsBusy || options.opencodeStats !== 'on') return
+  statsBusy = true
+  try {
+    const seen = await read($, ledgerAtom)
+    syncStatsGeneration(seen)
+    if (statsFailures >= STATS_MAX_FAILURES) return
+    const byDir = new Map<string, Run[]>()
+    for (const run of statsLive(seen, Date.now())) byDir.set(dirOf(run), [...(byDir.get(dirOf(run)) ?? []), run])
+    for (const [dir, live] of byDir) {
+      // the engine's clock paces the snapshots; run times are wall-clock like the rest of the ledger
+      const tickAt = await $.clock.now()
+      const last = statsAttempt.get(dir)
+      if (last !== undefined && tickAt - last < STATS_EVERY_MS - STATS_SLACK_MS) continue
+      let cwd = live.find(r => r.workdir !== undefined)?.workdir
+      if (cwd === undefined) {
+        try {
+          cwd = await $.session.root()
+        } catch {
+          // the process then starts in the session's own directory
+        }
+      }
+      statsAttempt.set(dir, tickAt)
+      const snap = await takeStats($, cwd)
+      if (snap === null) {
+        statsFailures += 1
+        if (statsFailures >= STATS_MAX_FAILURES) {
+          statsTimer?.cancel()
+          statsTimer = undefined
+          return
+        }
+        continue
+      }
+      statsFailures = 0
+      if ((await read($, ledgerAtom)).generation !== seen.generation) return
+      await applyStats($, table, seen, dir, live, snap)
+    }
+  } catch {
+    // the next tick tries again
+  } finally {
+    statsBusy = false
+  }
+}
+
+/** Called by the watch tick: the stats timer exists while the setting is on and an opencode run needs a snapshot; a run not seen yet is looked at at once. */
+function watchStats($: EngineInterface, table: PriceTable, options: PluginOptions, l: Ledger, now: number): void {
+  syncStatsGeneration(l)
+  const live = options.opencodeStats === 'on' && statsFailures < STATS_MAX_FAILURES ? statsLive(l, now) : []
+  if (live.length === 0) {
+    statsTimer?.cancel()
+    statsTimer = undefined
+    return
+  }
+  if (!statsTimer) statsTimer = $.clock.every(STATS_EVERY_MS, () => void statsTick($, table, options))
+  if (live.some(r => !statsBase.has(r.id))) void statsTick($, table, options)
+}
+
 async function saveWhileActive($: EngineInterface, options: PluginOptions): Promise<void> {
   try {
     const l = await read($, ledgerAtom)
@@ -661,7 +872,7 @@ async function drawMotion($: EngineInterface, options: PluginOptions): Promise<v
   }
 }
 
-async function watchTick($: EngineInterface, options: PluginOptions): Promise<void> {
+async function watchTick($: EngineInterface, options: PluginOptions, table: PriceTable): Promise<void> {
   if (watching) return
   watching = true
   try {
@@ -692,6 +903,8 @@ async function watchTick($: EngineInterface, options: PluginOptions): Promise<vo
         }
       }
     }
+
+    watchStats($, table, options, l, now)
 
     if (options.motion !== 'off') {
       let ticking = false
@@ -780,7 +993,7 @@ export function registerLifecycle(on: On, table: PriceTable, options: PluginOpti
       saveTimer = $.clock.every(SAVE_MS, () => void saveWhileActive($, options))
       relayTimer = $.clock.every(RELAY_POLL_MS, () => void pollRelays($, table, options))
       seed(await read($, ledgerAtom))
-      watchTimer = $.clock.every(WATCH_MS, () => void watchTick($, options))
+      watchTimer = $.clock.every(WATCH_MS, () => void watchTick($, options, table))
     } catch {
       // the collectors still work without the timers
     }

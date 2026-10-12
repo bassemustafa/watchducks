@@ -47,6 +47,8 @@ export type Run = {
   suspectedHandlers: string[]
   /** Short hash of the working directory; live only, never written to history. */
   workdirKey?: string
+  /** The normalized working directory the `workdirKey` hashes; live only (the opencode stats process runs there), never written to history. */
+  workdir?: string
   /** Background task id from the Bash result, when the run was backgrounded. */
   backgroundTaskId?: string
   /** Resolved relay --out-dir; live only, used to poll result.json after a reload. */

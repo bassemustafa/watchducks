@@ -73,6 +73,16 @@
         "off"
       ]
     },
+    "opencodeStats": {
+      "type": "string",
+      "title": "opencode stats",
+      "description": "Run `opencode stats` (numbers only) to give opencode runs live token and cost numbers",
+      "default": "off",
+      "options": [
+        "on",
+        "off"
+      ]
+    },
     "showEngineOverhead": {
       "type": "string",
       "title": "Show engine overhead",
