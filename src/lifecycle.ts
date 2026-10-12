@@ -3,13 +3,14 @@ import type { EngineInterface, FsStat, On, PluginOptions, Timer } from 'claude-c
 
 import type { HistoryRecord, Ledger, RelayProjection, Run } from '../types'
 import {
+  DISCOVERY_BUDGET_MS,
   DISCOVERY_EVERY,
+  DiscoveryMemory,
   MATCH_AHEAD_MS,
   MAX_DISCOVERY_READS,
+  MAX_DISCOVERY_ROOTS,
   MAX_DISCOVERY_STATS,
-  MAX_IDENTITIES,
   MAX_LISTED_ENTRIES,
-  MAX_SKIPPED,
   RELAY_POLL_MS,
   allowedRoots,
   duePolls,
@@ -20,9 +21,9 @@ import {
   type FoundResult,
 } from './collect/relay'
 import { HISTORY_PREFIX, pruneHistory, recordFromLedger } from './history'
-import { emptyLedger, isKnownLoop, reduce, type Action } from './ledger'
+import { emptyLedger, isKnownLoop, normalizeDir, reduce, type Action } from './ledger'
 import type { PriceTable } from './price'
-import { MAX_RESULT_BYTES, isInsideRoots, projectRelayResult, relayIdentity, type RelayIdentity } from './relay-result'
+import { MAX_RESULT_BYTES, isInsideRoots, projectRelayResult, relayIdentity } from './relay-result'
 import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, recordsHeadless } from './state'
 import { ROSTER_SPEC, VERDICT_SPEC } from './tools'
 import { blipsFor, radar } from './ui/animate'
@@ -52,8 +53,8 @@ let pollingRelays = false
 
 function stopTimers(): void {
   discoveryPolls = 0
-  discoveryGeneration = -1 // the next pass starts with no claimed or skipped directory
-  identityCache.clear()
+  discoveryGeneration = -1 // the next pass starts with nothing remembered
+  resetDiscovery()
   agentTimer?.cancel()
   saveTimer?.cancel()
   relayTimer?.cancel()
@@ -141,8 +142,11 @@ async function pollAgents($: EngineInterface, table: PriceTable): Promise<void> 
   }
 }
 
-/** The relay roots, each resolved to where it really lands (a root that cannot be resolved is skipped), and where the session root landed. */
-async function resolvedRoots($: EngineInterface, options: PluginOptions): Promise<{ roots: string[]; session: string }> {
+/**
+ * The relay roots, each resolved to where it really lands (a root that cannot be resolved is skipped), where the
+ * session root landed, and how many `$.fs.stat` calls the resolving took (discovery counts them in its budget).
+ */
+async function resolvedRoots($: EngineInterface, options: PluginOptions): Promise<{ roots: string[]; session: string; stats: number }> {
   let tmpDir = '/tmp'
   try {
     const dir = await $.env.get('TMPDIR')
@@ -158,7 +162,9 @@ async function resolvedRoots($: EngineInterface, options: PluginOptions): Promis
   }
   const resolved: string[] = []
   let session = ''
+  let stats = 0
   for (const root of relayRoots(options, tmpDir, sessionRoot)) {
+    stats += 1
     try {
       const stat = await $.fs.stat(root, { resolve: true })
       if (stat.realPath === undefined) continue
@@ -168,7 +174,7 @@ async function resolvedRoots($: EngineInterface, options: PluginOptions): Promis
       // a root that is not there allows nothing
     }
   }
-  return { roots: allowedRoots(resolved), session }
+  return { roots: allowedRoots(resolved), session, stats }
 }
 
 // A result.json older than the run (a reused --out-dir) belongs to an earlier run.
@@ -199,42 +205,30 @@ async function readRelayResult(
   return projectRelayResult(await $.fs.read(realPath))
 }
 
-// Discovery state (a relay run with no --out-dir): the polls since a run became pending, the directories
-// already given to a run, and result files known to be older than every pending run. The sets are dropped
-// when the ledger generation changes, and all of it with a hot reload.
+// Discovery state (a relay run with no --out-dir): the polls since a run became pending, and what earlier passes
+// learned. Nothing here holds the path of a candidate that was passed over: files and roots are remembered under
+// a fingerprint, and only a directory given to a run (stored as its out-dir anyway) is kept by name. All of it is
+// dropped when the ledger generation changes, and with a hot reload.
 let discoveryPolls = 0
 let discoveryGeneration = -1
 let claimedDirs = new Set<string>()
-const skippedResults = new Set<string>()
-// What a result.json identified as when it was last read, keyed by file and valid while its mtime and size
-// stay the same: a fresh file that matches no pending run is then read once, not on every pass. Never any text.
-const identityCache = new Map<string, { mtimeMs: number; size: number; identity: RelayIdentity | null }>()
+// what earlier passes learned (identities, skipped result files, where each root's listing stopped), by fingerprint
+const memory = new DiscoveryMemory()
+// which root the last pass stopped in
+let rootTurn = 0
 
-function rememberIdentity(file: string, entry: { mtimeMs: number; size: number; identity: RelayIdentity | null }): void {
-  identityCache.delete(file)
-  if (identityCache.size >= MAX_IDENTITIES) {
-    const oldest = identityCache.keys().next()
-    if (!oldest.done) identityCache.delete(oldest.value)
-  }
-  identityCache.set(file, entry)
-}
-
-function rememberSkipped(file: string): void {
-  if (skippedResults.size >= MAX_SKIPPED) {
-    const oldest = skippedResults.values().next()
-    if (!oldest.done) skippedResults.delete(oldest.value)
-  }
-  skippedResults.add(file)
-}
-
-function trimSlash(dir: string): string {
-  return dir.length > 1 && dir.endsWith('/') ? dir.slice(0, -1) : dir
+function resetDiscovery(): void {
+  claimedDirs = new Set()
+  memory.clear()
+  rootTurn = 0
 }
 
 /**
  * One pass over the allowed roots for the result.json of relay runs that have no out-dir. Directory names
  * are read only to walk; a candidate is identified by what its result.json says (start, tool, a hash of the
- * working directory), never by its name. Only the matched directory is stored, as the run's out-dir.
+ * working directory), never by its name. A match is read again, must say the same, and is applied at once (its
+ * directory becomes the run's out-dir). The home directory is never walked, and a pass stops after 512 fs calls
+ * (the root resolving counts) or 2 s.
  */
 async function discoverRelays(
   $: EngineInterface,
@@ -242,18 +236,45 @@ async function discoverRelays(
   pending: readonly Run[],
   roots: readonly string[],
   session: string,
+  rootStats: number,
   table: PriceTable,
 ): Promise<void> {
   if (seen.generation !== discoveryGeneration) {
     discoveryGeneration = seen.generation
-    claimedDirs = new Set()
-    skippedResults.clear()
-    identityCache.clear()
+    resetDiscovery()
   }
-  const t0 = Math.min(...pending.map(r => r.startedAt)) - STALE_SLACK_MS
-  let stats = 0
+  const began = Date.now()
+  let stats = rootStats
   let reads = 0
-  const exhausted = (): boolean => stats >= MAX_DISCOVERY_STATS
+  const exhausted = (): boolean => stats >= MAX_DISCOVERY_STATS || Date.now() - began >= DISCOVERY_BUDGET_MS
+
+  // the roots to walk: never the home directory (or the file system root), at most 16
+  const dropped = new Set<string>(['/'])
+  try {
+    const home = await $.env.get('HOME')
+    if (home !== undefined && home.startsWith('/')) {
+      dropped.add(normalizeDir(home, undefined) ?? '/')
+      stats += 1
+      try {
+        const landed = (await $.fs.stat(home, { resolve: true })).realPath
+        if (landed !== undefined) dropped.add(normalizeDir(landed, undefined) ?? '/')
+      } catch {
+        // the unresolved spelling is still dropped
+      }
+    }
+  } catch {
+    // no HOME: nothing more to drop
+  }
+  const walk: string[] = []
+  for (const root of roots) {
+    const dir = normalizeDir(root, undefined)
+    if (dir === undefined || dropped.has(dir) || walk.includes(dir)) continue
+    walk.push(dir)
+    if (walk.length >= MAX_DISCOVERY_ROOTS) break
+  }
+  if (walk.length === 0) return
+  const sessionDir = normalizeDir(session, undefined)
+  const t0 = Math.min(...pending.map(r => r.startedAt)) - STALE_SLACK_MS
 
   const statOf = async (target: string, resolve: boolean): Promise<FsStat | null> => {
     if (exhausted()) return null
@@ -266,6 +287,8 @@ async function discoverRelays(
   }
 
   const childDirs = async (dir: string): Promise<string[]> => {
+    if (exhausted()) return []
+    stats += 1
     try {
       const names: string[] = []
       for (const entry of (await $.fs.list(dir)).slice(0, MAX_LISTED_ENTRIES)) {
@@ -282,26 +305,23 @@ async function discoverRelays(
   const found: FoundResult[] = []
   const considerResult = async (dir: string): Promise<void> => {
     const file = dir + '/result.json'
-    if (skippedResults.has(file)) return
     const stat = await statOf(file, true)
-    const realPath = stat === null ? null : readablePath(stat, t0, roots, false)
+    const realPath = stat === null ? null : readablePath(stat, t0, walk, false)
     if (stat === null || realPath === null) return
+    if (memory.isSkipped(file, stat.mtimeMs, stat.size)) return
     try {
       // an unchanged file keeps its identity: it is not read again and does not use up the pass's reads
-      const cached = identityCache.get(file)
-      let identity: RelayIdentity | null
-      if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-        identity = cached.identity
-      } else {
+      let identity = memory.identity(file, stat.mtimeMs, stat.size)
+      if (identity === undefined) {
         if (reads >= MAX_DISCOVERY_READS) return
         reads += 1
         // the text lives only for this identification: a start, a tool and a hash leave it
         identity = relayIdentity(await $.fs.read(realPath))
-        rememberIdentity(file, { mtimeMs: stat.mtimeMs, size: stat.size, identity })
+        memory.rememberIdentity(file, stat.mtimeMs, stat.size, identity)
       }
       if (!identity) return
       if (identity.startedAt < t0 - MATCH_AHEAD_MS) {
-        rememberSkipped(file)
+        memory.skip(file, stat.mtimeMs, stat.size)
         return
       }
       found.push({
@@ -327,28 +347,87 @@ async function discoverRelays(
     return fresh
   }
 
-  for (const root of new Set(roots)) {
-    const shallow = root === session
-    for (const name of await childDirs(root)) {
-      if (exhausted()) break
-      const dir = trimSlash(root) + '/' + name
+  // Each pass resumes in the root and at the directory where the previous one ran out of budget, so a root
+  // with more directories than one pass can look at is still covered over a few passes.
+  let stoppedAt = -1
+  for (let n = 0; n < walk.length; n++) {
+    const turn = (rootTurn + n) % walk.length
+    if (exhausted()) {
+      stoppedAt = turn
+      break
+    }
+    const root = walk[turn]!
+    const names = await childDirs(root)
+    const first = names.length === 0 ? 0 : memory.cursor(root) % names.length
+    let finished = true
+    for (let k = 0; k < names.length; k++) {
+      const at = (first + k) % names.length
+      if (exhausted()) {
+        memory.setCursor(root, at)
+        finished = false
+        break
+      }
+      const dir = root + '/' + names[at]!
       const fresh = await visit(dir)
-      if (!fresh || shallow) continue
+      if (!fresh || root === sessionDir) continue
       for (const inner of await childDirs(dir)) {
         if (exhausted()) break
         await visit(dir + '/' + inner)
       }
     }
+    if (!finished) {
+      stoppedAt = turn
+      break
+    }
+    memory.setCursor(root, 0)
   }
+  rootTurn = stoppedAt < 0 ? 0 : stoppedAt
 
   const taken = new Set(claimedDirs)
-  for (const run of Object.values(seen.runs)) if (run.outDir !== undefined) taken.add(trimSlash(run.outDir))
+  for (const run of Object.values(seen.runs)) {
+    const dir = run.outDir === undefined ? undefined : normalizeDir(run.outDir, undefined)
+    if (dir !== undefined) taken.add(dir)
+  }
+  const byDir = new Map(found.map(f => [f.dir, f] as const))
+  const byId = new Map(pending.map(r => [r.id, r] as const))
   for (const { id, outDir } of matchDiscovered(pending, found, taken)) {
-    // a /clear or a session change while the pass was running: the match belongs to the old ledger
+    const match = byDir.get(outDir)
+    const run = byId.get(id)
+    if (!match || !run) continue
+    // Between the walk and now the file may have been replaced or swapped for a link: look again, read it once,
+    // and apply only if it still says what matched; a failed check applies nothing and the next pass retries.
+    let projection: RelayProjection | null = null
+    try {
+      const stat = await $.fs.stat(match.dir + '/result.json', { resolve: true })
+      const realPath = readablePath(stat, run.startedAt - STALE_SLACK_MS, walk, false)
+      if (realPath !== null) {
+        const text = await $.fs.read(realPath)
+        const again = relayIdentity(text)
+        if (
+          again &&
+          again.startedAt === match.startedAt &&
+          again.tool === match.tool &&
+          again.workdirKey === match.workdirKey
+        ) {
+          projection = projectRelayResult(text)
+        }
+      }
+    } catch {
+      // not confirmed: the next pass tries again
+    }
+    const result = projection
+    if (!result) continue
+    // a /clear or a session change while the pass was running: the match belongs to the old ledger, so the
+    // generation is checked in the same atomic update that sets the out-dir and applies the result
     let applied = false
+    const at = Date.now()
     await update($, ledgerAtom, l => {
       applied = l.generation === seen.generation
-      return applied ? reduce(l, { type: 'relayFound', id, outDir, at: Date.now() }, table) : l
+      if (!applied) return l
+      const found = reduce(l, { type: 'relayFound', id, outDir, at }, table)
+      // the run took an out-dir or a result elsewhere meanwhile: this match is not its result
+      if (found === l) return l
+      return reduce(found, { type: 'relayResult', id, proj: result, at }, table)
     })
     if (!applied) return
     claimedDirs.add(outDir)
@@ -366,15 +445,8 @@ async function pollRelays($: EngineInterface, table: PriceTable, options: Plugin
     const pending = pendingDiscovery(seen, now)
     discoveryPolls = pending.length === 0 ? 0 : discoveryPolls + 1
     if (due.length === 0 && pending.length === 0) return
-    const { roots, session } = await resolvedRoots($, options)
-    // the pass only sets an out-dir; the loop below reads the result on the next tick, the one way a result is applied
-    if (pending.length > 0 && discoveryPolls % DISCOVERY_EVERY === 0) {
-      try {
-        await discoverRelays($, seen, pending, roots, session, table)
-      } catch {
-        // the next pass tries again
-      }
-    }
+    const { roots, session, stats } = await resolvedRoots($, options)
+    // runs with an explicit out-dir first: a slow discovery pass never delays them
     for (const id of due) {
       const run = Object.hasOwn(seen.runs, id) ? seen.runs[id] : undefined
       if (run?.outDir === undefined) continue
@@ -392,6 +464,13 @@ async function pollRelays($: EngineInterface, table: PriceTable, options: Plugin
         if (!applied) return
       } catch {
         // not there yet, unreadable or hostile: the run keeps its status and the next tick tries again
+      }
+    }
+    if (pending.length > 0 && discoveryPolls % DISCOVERY_EVERY === 0) {
+      try {
+        await discoverRelays($, seen, pending, roots, session, stats, table)
+      } catch {
+        // the next pass tries again
       }
     }
   } catch {

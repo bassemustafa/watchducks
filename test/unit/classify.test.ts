@@ -168,6 +168,40 @@ test('a cd segment inside the chain sets the workdir for the segments after it; 
   expect(c('cd /repo -P && node /x/claude-delegate/scripts/relay.mjs').workdir).toBeUndefined()
 })
 
+test('a cd carries to later segments only before && or ;, and a refused dir leaves the workdir unknown', () => {
+  const relay = 'node /x/claude-delegate/scripts/relay.mjs --lane quick'
+  expect(c('cd /repo && cd /a | ' + relay).workdir).toBe('/repo')
+  expect(c('cd /missing || ' + relay).workdir).toBeUndefined()
+  expect(c('cd /repo && cd /a || ' + relay).workdir).toBe('/repo')
+  expect(c('cd /repo && cd sub && ' + relay).workdir).toBeUndefined()
+  expect(c('cd /repo && cd ../x ; ' + relay).workdir).toBeUndefined()
+  expect(c('ls && cd /repo ; ' + relay).workdir).toBe('/repo')
+})
+
+test('interpreter options that take a value do not hide or become the script', () => {
+  expect(c('node --require /srv/delegate/preload.js server.js').kind).toBe('shell')
+  expect(c('node -r ts-node/register /x/claude-delegate/scripts/relay.mjs --lane quick').implementer).toBe('claude')
+  expect(c('node -r ts-node/register /x/claude-delegate/scripts/relay.mjs --lane quick').kind).toBe('relay')
+  for (const option of ['--import', '--loader', '--experimental-loader', '-C', '--conditions', '--env-file', '--title', '--inspect-port']) {
+    expect(c(`node ${option} /srv/delegate/v server.js`).kind).toBe('shell')
+    expect(c(`node ${option} v /x/codex-delegate/scripts/relay.mjs`).implementer).toBe('codex')
+  }
+  for (const option of ['-X', '-W', '-Q']) {
+    expect(c(`python3 ${option} /srv/delegate/v main.py`).kind).toBe('shell')
+    expect(c(`python3 ${option} v /x/gemini-delegate/scripts/relay.py`).implementer).toBe('gemini')
+  }
+})
+
+test('inline code options in any form leave no script to classify', () => {
+  const script = ' /x/claude-delegate/scripts/relay.mjs --lane quick'
+  for (const head of [
+    'node -e 1', 'node -p 1', 'node --eval 1', 'node --print 1', 'node --eval=1', 'node --print=1', 'node -e1', 'node -pe 1',
+    'python3 -c 1', 'python3 -c1', 'python3 -m mod', 'python3 -mmod', 'bash -c 1', 'node --eval="1"',
+  ]) {
+    expect(c(head + script).kind).toBe('shell')
+  }
+})
+
 test('a script that is not a relay stays shell, piped or not', () => {
   expect(c('node build.mjs | tail').kind).toBe('shell')
   expect(c('node build.mjs && npm test').kind).toBe('shell')

@@ -51,6 +51,10 @@ We aim to acknowledge a report within 7 days. There is no bounty.
 - **Whole file in memory.** result.json, including `finalMessage`, is in memory for one parse.
 - **State is readable by other plugins.** Values in state are allow-listed, but they are not secret from other installed plugins.
 - **Discovery reads folder names.** While a relay runs without an `--out-dir`, discovery reads the names of folders in the allowed roots. The names are read transiently and never stored.
+- **Large folders are listed in full.** The engine's folder listing has no limit, so discovery receives a folder's whole listing before it keeps the first 2048 entries. A folder with a very large number of entries in an allowed root makes one discovery pass slower. Each pass also stops after about 2 seconds.
+- **A folder swapped during a pass.** Between the check that a folder is a real folder and its listing, a local process could swap it for a link, and discovery would read the names in the folder the link points to. Names are not stored, and a result.json is read only if its resolved path is inside an allowed root.
+- **Results rewritten in old folders are not found.** Discovery looks only in folders created or changed since the run started. A relay that rewrites a result.json inside an older folder, without `--out-dir`, is not found. Relays that create a new folder per run, and any run given `--out-dir`, are not affected.
+- **Late starts are not matched.** A result is paired with a run only when its start is between 5 seconds before and 60 seconds after the Bash call. A relay started later in the same command (for example after `sleep 90`) is not found by discovery; pass `--out-dir` for such commands.
 
 ## Mod standards
 

@@ -187,17 +187,45 @@ function nodesOf(dirs: string[], files: Record<string, string> = {}, mtimeMs: nu
   return out
 }
 
-function memfs(on: On, nodes: Record<string, Node>): { reads: () => string[]; lists: () => number } {
+type MemHooks = {
+  /** The text `fs.read` answers for a path on its n-th read (1-based); undefined keeps the node's text. */
+  read?: (path: string, count: number) => string | undefined
+  /** True when `fs.stat` answers a path as a link on its n-th stat (1-based). */
+  link?: (path: string, count: number) => boolean
+  /** How long a directory stat takes (spins the real clock). */
+  dirStatMs?: (path: string) => number
+}
+
+function spin(ms: number): void {
+  const end = Date.now() + ms
+  for (let i = 0; i < 5e7 && Date.now() < end; i++) {
+    // wait
+  }
+}
+
+type Mem = { reads: () => string[]; lists: () => number; stats: () => number; log: () => string[] }
+
+function memfs(on: On, nodes: Record<string, Node>, hooks: MemHooks = {}): Mem {
   const reads: string[] = []
+  const log: string[] = []
+  const statCounts = new Map<string, number>()
+  let stats = 0
   let lists = 0
   const at = (path: string): Node | undefined => (Object.hasOwn(nodes, path) ? nodes[path] : undefined)
   on('fs.stat', async ($, e) => {
+    stats += 1
+    log.push('stat:' + e.path)
+    const count = (statCounts.get(e.path) ?? 0) + 1
+    statCounts.set(e.path, count)
     const node = at(e.path)
     if (!node) return { value: { kind: 'other' as const, size: 0, mtimeMs: 0, isLink: false } }
-    return { value: { kind: node.kind, size: node.text?.length ?? 0, mtimeMs: node.mtimeMs, isLink: false, realPath: e.path } }
+    if (node.kind === 'dir' && hooks.dirStatMs !== undefined) spin(hooks.dirStatMs(e.path))
+    const isLink = hooks.link?.(e.path, count) === true
+    return { value: { kind: node.kind, size: node.text?.length ?? 0, mtimeMs: node.mtimeMs, isLink, realPath: e.path } }
   })
   on('fs.list', async ($, e) => {
     lists += 1
+    log.push('list:' + e.path)
     const entries = Object.entries(nodes)
       .filter(([path]) => path.slice(0, path.lastIndexOf('/')) === e.path)
       .map(([path, node]) => ({
@@ -211,9 +239,10 @@ function memfs(on: On, nodes: Record<string, Node>): { reads: () => string[]; li
   })
   on('fs.read', async ($, e) => {
     reads.push(e.path)
-    return { value: at(e.path)?.text ?? '' }
+    const count = reads.filter(path => path === e.path).length
+    return { value: hooks.read?.(e.path, count) ?? at(e.path)?.text ?? '' }
   })
-  return { reads: () => reads, lists: () => lists }
+  return { reads: () => reads, lists: () => lists, stats: () => stats, log: () => log }
 }
 
 const USAGE = { input_tokens: 20, output_tokens: 100, cache_read_input_tokens: 300, cache_creation_input_tokens: 0 }
@@ -407,4 +436,179 @@ test('--out-dir ~/o is read at /home/u/o/result.json', async ($, on) => {
   const run = ledger().runs['bash:u1']!
   expect(run.outDir).toBe('/home/u/o')
   near(run.cost, 0.5)
+})
+
+// Every ledger the plugin wrote, in order.
+function ledgerStates(on: On): () => Ledger[] {
+  const all: Ledger[] = []
+  on('state.set', { plugin: 'watchducks', key: 'ledger' }, async ($, e, next) => {
+    all.push(e.value as Ledger)
+    return next(e)
+  })
+  return () => all
+}
+
+test('a result.json passed over as too old is looked at again once it is rewritten', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-rewrite'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const dir = `${tmp}/delegate-relay/repo-r`
+  const nodes = nodesOf([tmp, `${tmp}/delegate-relay`, dir], { [`${dir}/result.json`]: resultText({ startedAt: new Date(Date.now() - 600_000).toISOString() }) })
+  memfs(on, nodes)
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 6)
+  expect(ledger().runs['bash:u1']!.outDir).toBeUndefined()
+  nodes[`${dir}/result.json`] = { kind: 'file', mtimeMs: Date.now() + 1000, text: resultText({ totalCostUsd: 0.75 }) }
+  await polls(clock, 6)
+  const run = ledger().runs['bash:u1']!
+  expect(run.outDir).toBe(dir)
+  near(run.cost, 0.75)
+})
+
+test('the home directory is never searched', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-nohome'
+  // the session root is the home directory
+  const clock = world(on, () => 'S1', { TMPDIR: tmp, HOME: '/work' })
+  memfs(on, nodesOf([tmp, '/work/out-1'], { '/work/out-1/result.json': resultText() }))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 9)
+  expect(ledger().runs['bash:u1']!.outDir).toBeUndefined()
+})
+
+const MANY_ROOTS = Array.from({ length: 20 }, (_, i) => `/srv/wd-r${String(i + 1).padStart(2, '0')}`)
+
+test('discovery walks at most 16 roots', { options: { relayRoots: MANY_ROOTS.join(':') } }, async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-roots'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  // roots: the temp dir, /tmp, /work, then r01..r20: the 16th is r13
+  const last = MANY_ROOTS[19]!
+  memfs(on, nodesOf([tmp, ...MANY_ROOTS, `${last}/out-1`], { [`${last}/out-1/result.json`]: resultText() }))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 9)
+  expect(ledger().runs['bash:u1']!.outDir).toBeUndefined()
+})
+
+test('a root among the first 16 is walked', { options: { relayRoots: MANY_ROOTS.join(':') } }, async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-roots-in'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const inside = MANY_ROOTS[9]!
+  memfs(on, nodesOf([tmp, ...MANY_ROOTS, `${inside}/out-1`], { [`${inside}/out-1/result.json`]: resultText() }))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 6)
+  expect(ledger().runs['bash:u1']!.outDir).toBe(`${inside}/out-1`)
+})
+
+test('a match whose result.json changed since the walk is not applied; the next pass applies it', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-changed'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const dir = `${tmp}/delegate-relay/repo-c`
+  const file = `${dir}/result.json`
+  // the walk's read is the first, the re-check's read the second: it says another working directory
+  memfs(on, nodesOf([tmp, `${tmp}/delegate-relay`, dir], { [file]: resultText() }), {
+    read: (path, count) => (path === file && count === 2 ? resultText({ workdir: '/elsewhere', totalCostUsd: 9.9 }) : undefined),
+  })
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 3)
+  expect(ledger().runs['bash:u1']!.outDir).toBeUndefined()
+  expect(ledger().runs['bash:u1']!.cost).toBeNull()
+  await polls(clock, 3)
+  const run = ledger().runs['bash:u1']!
+  expect(run.outDir).toBe(dir)
+  near(run.cost, 0.5)
+})
+
+test('a match whose result.json became a link since the walk is not applied', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-link'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const dir = `${tmp}/delegate-relay/repo-l`
+  const file = `${dir}/result.json`
+  // the walk's stat is the first, the re-check's stat the second: a link
+  memfs(on, nodesOf([tmp, `${tmp}/delegate-relay`, dir], { [file]: resultText() }), { link: (path, count) => path === file && count === 2 })
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 3)
+  expect(ledger().runs['bash:u1']!.outDir).toBeUndefined()
+  await polls(clock, 3)
+  near(ledger().runs['bash:u1']!.cost, 0.5)
+})
+
+test('a discovered run gets its out-dir and its result in one ledger write', async ($, on) => {
+  const states = ledgerStates(on)
+  const tmp = '/tmp/wd-disc-atomic'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const dir = `${tmp}/delegate-relay/repo-a`
+  memfs(on, nodesOf([tmp, `${tmp}/delegate-relay`, dir], { [`${dir}/result.json`]: resultText() }))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 6)
+  const withDir = states().map(l => l.runs['bash:u1']).filter(r => r?.outDir !== undefined)
+  expect(withDir.length).toBeGreaterThan(0)
+  for (const run of withDir) expect(run!.resultRead).toBe(true)
+})
+
+test('a run whose out-dir is given is read before discovery starts looking', async ($, on) => {
+  const tmp = '/tmp/wd-disc-order'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const fs = memfs(on, nodesOf([tmp]))
+  await $.session.start(START)
+  await $.tool.call({ ...BARE_CALL, tool_use_id: 'u1', command: 'node /x/claude-delegate/scripts/relay.mjs --lane quick --out-dir /tmp/wd-disc-order-o' } as never)
+  await $.tool.call({ ...BARE_CALL, tool_use_id: 'u2' } as never)
+  await polls(clock, 3)
+  const log = fs.log()
+  const firstList = log.findIndex(entry => entry.startsWith('list:'))
+  expect(firstList).toBeGreaterThan(0)
+  // the explicit run's result.json was asked for in each of the three polls, the third before the first listing
+  expect(log.slice(0, firstList).filter(entry => entry === 'stat:/tmp/wd-disc-order-o/result.json').length).toBe(3)
+})
+
+test('a pass that runs out of time stops walking', async ($, on) => {
+  const tmp = '/tmp/wd-disc-time'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const dirs = Array.from({ length: 30 }, (_, i) => `${tmp}/e-${String(i).padStart(2, '0')}`)
+  const fs = memfs(on, nodesOf([tmp, ...dirs]), { dirStatMs: path => (path.startsWith(`${tmp}/e-`) ? 300 : 0) })
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 3)
+  const looked = fs.log().filter(entry => entry.startsWith(`stat:${tmp}/e-`) && !entry.endsWith('result.json'))
+  expect(looked.length).toBeGreaterThan(0)
+  expect(looked.length).toBeLessThan(12)
+})
+
+test('a root with more directories than one pass can look at is covered over a few passes', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-cursor'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const empty = Array.from({ length: 300 }, (_, i) => `${tmp}/e-${String(i).padStart(3, '0')}`)
+  const mine = `${tmp}/zz-match`
+  memfs(on, nodesOf([tmp, ...empty, mine], { [`${mine}/result.json`]: resultText() }))
+  await $.session.start(START)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 12)
+  const run = ledger().runs['bash:u1']!
+  expect(run.outDir).toBe(mine)
+  near(run.cost, 0.5)
+})
+
+test('a directory another run uses as its out-dir is not given away, however it is spelled', async ($, on) => {
+  const ledger = watchLedger(on)
+  const tmp = '/tmp/wd-disc-spelled'
+  const clock = world(on, () => 'S1', { TMPDIR: tmp })
+  const dir = `${tmp}/delegate-relay/repo-s`
+  memfs(on, nodesOf([tmp, `${tmp}/delegate-relay`, dir], { [`${dir}/result.json`]: resultText() }))
+  await $.session.start(START)
+  await $.tool.call({ ...BARE_CALL, tool_use_id: 'u2', command: `node /x/claude-delegate/scripts/relay.mjs --lane quick --cd /repo --out-dir ${dir}/.//` } as never)
+  await $.tool.call(BARE_CALL as never)
+  await polls(clock, 9)
+  expect(ledger().runs['bash:u2']!.outDir).toBe(dir)
+  expect(ledger().runs['bash:u1']!.outDir).toBeUndefined()
 })

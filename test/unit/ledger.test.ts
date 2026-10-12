@@ -358,6 +358,25 @@ test('seriesWindow aligns to the current minute, zero-fills and ages old activit
   expect(seriesWindow(l, T0 + 2 * MIN, 3)).toEqual([1100, 0, 1100])
 })
 
+test('normalizeDir makes two spellings of one directory the same', () => {
+  expect(normalizeDir('/a/./b', undefined)).toBe('/a/b')
+  expect(normalizeDir('/a/b/.', undefined)).toBe('/a/b')
+  expect(normalizeDir('/a//b///c/', undefined)).toBe('/a/b/c')
+  expect(normalizeDir('/./a', undefined)).toBe('/a')
+  expect(normalizeDir('/.', undefined)).toBe('/')
+  expect(normalizeDir('~/./a//b', '/home/u')).toBe('/home/u/a/b')
+  expect(normalizeDir('/a/../b', undefined)).toBe('/a/../b')
+})
+
+test('relayFound and a start with an explicit out-dir store the normalized form', () => {
+  const start = apply(emptyLedger('s1', T0),
+    { type: 'bashStart', id: 'bash:r', cls: { kind: 'relay', implementer: 'unknown', readOnly: false }, at: T0 },
+    { type: 'bashStart', id: 'bash:o', cls: { kind: 'relay', implementer: 'codex', readOnly: false, outDir: '/tmp//o/./x/' }, at: T0 })
+  expect(start.runs['bash:o']!.outDir).toBe('/tmp/o/x')
+  const found = apply(start, { type: 'relayFound', id: 'bash:r', outDir: '/tmp/./d1//', at: T0 + 1 })
+  expect(found.runs['bash:r']!.outDir).toBe('/tmp/d1')
+})
+
 test('normalizeDir expands ~, drops trailing slashes and refuses what it cannot resolve', () => {
   expect(normalizeDir('~', '/home/u')).toBe('/home/u')
   expect(normalizeDir('~/a', '/home/u')).toBe('/home/u/a')

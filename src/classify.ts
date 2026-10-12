@@ -15,8 +15,11 @@ const TOOLS: readonly Tool[] = ['opencode', 'codex', 'gemini', 'claude']
 
 const INTERPRETERS = new Set(['node', 'bun', 'deno', 'tsx', 'python', 'python3', 'bash', 'sh'])
 const SCRIPT_EXT = /\.(?:mjs|cjs|js|ts|mts|cts|py|sh|bash)$/
-/** Interpreter options that take code, not a script. */
-const CODE_FLAGS = new Set(['-c', '-e', '-p', '-m', '--eval', '--print'])
+/** Interpreter options whose next word is their value, not the script. */
+const NODE_VALUED = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '-C', '--conditions', '--env-file', '--title', '--inspect-port'])
+const PYTHON_VALUED = new Set(['-X', '-W', '-Q'])
+/** Inline code (`-e`, `-c`, `-m`, `-p`, also attached as `-e<code>`, or `--eval[=…]`): there is no script to look at. */
+const CODE_OPTION = /^(?:-[ecpm]|--eval(?:=|$)|--print(?:=|$))/
 const WORKDIR_FLAGS = new Set(['--cd', '--cwd', '--workdir', '--dir', '-C'])
 const OUT_DIR_FLAGS = new Set(['--out-dir', '--outdir', '--output-dir', '--out', '--artifacts-dir', '--artifacts'])
 const RELAY_VALUED = new Set([
@@ -171,9 +174,11 @@ function scriptIndex(words: string[]): number {
   if (!INTERPRETERS.has(program) && !/^python[0-9.]+$/.test(program)) return -1
   let i = 1
   if (program === 'deno' && words[i] === 'run') i++
+  const valued = program === 'node' ? NODE_VALUED : program.startsWith('python') ? PYTHON_VALUED : NO_FLAGS
   while ((words[i] ?? '').startsWith('-')) {
-    if (CODE_FLAGS.has(words[i]!)) return -1
-    i++
+    const option = words[i]!
+    if (CODE_OPTION.test(option)) return -1
+    i += valued.has(option) ? 2 : 1
   }
   const script = words[i]
   return script === undefined || /\s/.test(script) ? -1 : i
@@ -310,25 +315,26 @@ export function classify(command: string): Classification {
   if (remaining.length > MAX_COMMAND || /[\n\r]/.test(remaining) || substitution) return shell(workdir)
 
   // The first segment (split at `&&`, `||`, `;`, `|`) that runs a relay or a CLI gives the class;
-  // what follows it (`| tail`, `&& echo done`) never changes it.
+  // what follows it (`| tail`, `&& echo done`) never changes it. Each segment keeps the operator after it.
   let segment: string[] = []
-  const segments: string[][] = []
+  const segments: Array<{ words: string[]; op: string | null }> = []
   for (const t of rest) {
     if (t.kind === 'op') {
-      segments.push(segment)
+      segments.push({ words: segment, op: t.value })
       segment = []
     } else {
       segment.push(t.value)
     }
   }
-  segments.push(segment)
-  // A segment that is exactly `cd <dir>` sets the workdir for the segments after it.
+  segments.push({ words: segment, op: null })
+  // A segment that is exactly `cd <dir>` sets the workdir for the segments after it, but only where the
+  // shell carries it: before `&&` or `;`. A dir the classifier refuses (relative, `..`) leaves it unknown.
   let current = workdir
   for (const seg of segments) {
-    const words = stripWrappers(seg)
+    const words = stripWrappers(seg.words)
     if (words.length === 0) continue
     if (words.length === 2 && words[0] === 'cd') {
-      current = path(words[1])
+      if (seg.op === '&&' || seg.op === ';') current = path(words[1])
       continue
     }
     const found = classifyRelay(words, current) ?? classifyCli(words, current)

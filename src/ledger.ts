@@ -101,7 +101,8 @@ function emptySpend(): Spend {
 
 /**
  * A directory the classifier extracted, made comparable: a leading `~` expands against `home` (undefined when
- * there is no absolute home or the form is `~user`), trailing slashes drop, `/` stays.
+ * there is no absolute home or the form is `~user`), repeated and trailing slashes and `.` segments drop, `/` stays.
+ * Two spellings of one directory come out the same, so claims and keys compare.
  */
 export function normalizeDir(path: string, home: string | undefined): string | undefined {
   let dir = path
@@ -111,9 +112,8 @@ export function normalizeDir(path: string, home: string | undefined): string | u
   } else if (dir.startsWith('~')) {
     return undefined
   }
-  let end = dir.length
-  while (end > 1 && dir[end - 1] === '/') end -= 1
-  return dir.slice(0, end)
+  const parts = dir.split('/').filter(part => part !== '' && part !== '.')
+  return dir.startsWith('/') ? '/' + parts.join('/') : parts.join('/')
 }
 
 export function workdirKey(path: string): string {
@@ -393,7 +393,8 @@ function reduceBgSnapshot(ledger: Ledger, a: Extract<Action, { type: 'bgSnapshot
 function reduceRelayFound(ledger: Ledger, a: Extract<Action, { type: 'relayFound' }>): Ledger {
   const run = getRun(ledger, a.id)
   if (!run || run.kind !== 'relay' || run.outDir !== undefined || run.resultRead) return ledger
-  return putRun(ledger, { ...run, outDir: a.outDir })
+  const outDir = normalizeDir(a.outDir, undefined)
+  return outDir === undefined ? ledger : putRun(ledger, { ...run, outDir })
 }
 
 function reduceRelayResult(ledger: Ledger, a: Extract<Action, { type: 'relayResult' }>, prices: PriceTable): Ledger {
