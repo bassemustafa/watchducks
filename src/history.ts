@@ -29,23 +29,28 @@ export function utcDay(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10)
 }
 
-function addRun(c: Counters, run: Run): void {
+/**
+ * `own` false: the run's tokens and cost are not added here (they land on its rows' buckets, a Claude child, or
+ * were counted through the first member of its shared group). `unknown` false: its unknown-cost mark is not added either.
+ * Its op, status, reviews and bugs always are.
+ */
+function addRun(c: Counters, run: Run, own = true, unknown = true): void {
   c.ops += 1
   if (run.status === 'done') c.done += 1
   else if (run.status === 'failed') c.failed += 1
   else if (run.status === 'killed') c.killed += 1
   else if (run.status === 'ended') c.ended += 1
-  if (run.usage) {
+  if (own && run.usage) {
     c.usageOps += 1
     c.uncached += run.usage.uncached
     c.output += run.usage.output
     c.cacheRead += run.usage.cacheRead
     c.cacheWrite += run.usage.cacheWrite
   }
-  if (run.cost !== null) c.costOps += 1
-  if (run.cost !== null && run.costSource === 'reported') c.costReported += run.cost
-  else if (run.cost !== null && run.costSource === 'estimated') c.costEstimated += run.cost
-  else if (run.cost === null && (run.kind === 'agent' || (run.kind === 'relay' && run.implementer !== 'codex' && run.outDir !== undefined))) {
+  if (own && run.cost !== null) c.costOps += 1
+  if (own && run.cost !== null && run.costSource === 'reported') c.costReported += run.cost
+  else if (own && run.cost !== null && run.costSource === 'estimated') c.costEstimated += run.cost
+  else if (unknown && run.cost === null && (run.kind === 'agent' || (run.kind === 'relay' && run.implementer !== 'codex' && run.outDir !== undefined))) {
     // a codex relay, or one without an out dir, can never report a cost (as in runCost)
     c.unknownCostOps += 1
   }
@@ -56,6 +61,43 @@ function addRun(c: Counters, run: Run): void {
 
 function bucketKey(run: Run): string {
   return `${run.implementer}|${run.model ?? '—'}`
+}
+
+/** One breakdown row of a Claude child: its spend only, no op (the run's op is counted once, on the run's own bucket). */
+function addRow(c: Counters, row: NonNullable<Run['rows']>[number]): void {
+  c.usageOps += 1
+  c.uncached += row.usage.uncached
+  c.output += row.usage.output
+  c.cacheRead += row.usage.cacheRead
+  c.cacheWrite += row.usage.cacheWrite
+  if (row.cost !== null) c.costOps += 1
+  if (row.cost !== null && row.costSource === 'reported') c.costReported += row.cost
+  else if (row.cost !== null && row.costSource === 'estimated') c.costEstimated += row.cost
+}
+
+/**
+ * Adds one run to its bucket, or a run with child rows to the buckets of its rows: the run's own op stays
+ * on its own implementer × model. `spend` false (a shared group's later members): only the op and its marks.
+ */
+function addToBuckets(bucketOf: (key: string) => Counters, run: Run, spend: boolean): void {
+  const rows = run.rows
+  if (!spend) addRun(bucketOf(bucketKey(run)), run, false, false)
+  else if (rows === undefined || rows.length === 0) addRun(bucketOf(bucketKey(run)), run)
+  else {
+    addRun(bucketOf(bucketKey(run)), run, false)
+    for (const row of rows) addRow(bucketOf(`${row.implementer}|${row.model}`), row)
+  }
+}
+
+/** Says per run whether its spend counts: a shared group's tokens and cost count once, through the first member given. */
+function spendOnce(): (run: Run) => boolean {
+  const seen = new Set<string>()
+  return run => {
+    if (run.sharedKey === undefined) return true
+    if (seen.has(run.sharedKey)) return false
+    seen.add(run.sharedKey)
+    return true
+  }
 }
 
 function orderedRuns(ledger: Ledger): Run[] {
@@ -101,11 +143,11 @@ export function addRunsToDays(days: HistoryRecord['days'], runs: readonly Run[])
     for (const [key, counters] of Object.entries(byKey)) bucket[key] = { ...emptyCounters(), ...counters }
     out[day] = bucket
   }
+  // every member is an op on its own end day; a group's spend counts once, on the day of its first member
+  const spends = spendOnce()
   for (const run of runs) {
     const bucket = (out[utcDay(run.endedAt ?? run.startedAt)] ??= {})
-    const key = bucketKey(run)
-    const counters = (bucket[key] ??= emptyCounters())
-    addRun(counters as Counters, run)
+    addToBuckets(key => (bucket[key] ??= emptyCounters()) as Counters, run, spends(run))
   }
   return out
 }
@@ -118,12 +160,13 @@ export function recordFromLedger(ledger: Ledger): HistoryRecord {
 /** Station rows for the live session (all runs, no day split). */
 export function stationRowsFromLedger(ledger: Ledger): StationRow[] {
   const buckets = new Map<string, Counters>()
-  for (const run of orderedRuns(ledger)) {
-    const key = bucketKey(run)
+  const bucketOf = (key: string): Counters => {
     let c = buckets.get(key)
     if (!c) buckets.set(key, (c = emptyCounters()))
-    addRun(c, run)
+    return c
   }
+  const spends = spendOnce()
+  for (const run of orderedRuns(ledger)) addToBuckets(bucketOf, run, spends(run))
   return rowsFromBuckets(buckets)
 }
 

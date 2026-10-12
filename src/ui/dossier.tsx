@@ -42,6 +42,14 @@ export function runCost(run: Run): string {
   return fmtCost(run.cost, run.costSource, run.costPartial)
 }
 
+const SOURCE_WORDS = { relay: 'result.json', child: 'child report', stats: 'opencode stats', steps: 'per request', complete: 'per request' } as const
+
+/** Where a run's numbers came from, with the approximate mark; "—" when it has no numbers yet. */
+export function runSource(run: Run): string {
+  if (run.usageSource === null) return '—'
+  return SOURCE_WORDS[run.usageSource] + (run.approx ? ' (approximate)' : '')
+}
+
 export function runElapsed(run: Run, now: number): number {
   if (run.status === 'running') return now - run.startedAt
   return run.durationMs ?? (run.endedAt !== undefined ? run.endedAt - run.startedAt : Number.NaN)
@@ -126,6 +134,7 @@ export function dossierView(
       {row('ended', run.status === 'running' ? '—' : clock(run.endedAt))}
       {row('duration', fmtDuration(runElapsed(run, now)))}
       <Text> </Text>
+      {run.usageSource !== null && row('source', runSource(run))}
       {row('input', u ? fmtTokens(u.uncached + u.cacheRead + u.cacheWrite) : runTokens(run))}
       {row('  uncached', u ? fmtTokens(u.uncached) : runTokens(run))}
       {row('  cache read', u ? fmtTokens(u.cacheRead) : runTokens(run))}

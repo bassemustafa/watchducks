@@ -141,3 +141,67 @@ test('addRunsToDays adds to a copy: the input days are not changed', () => {
   expect(more['2026-10-09']!['opencode|openai/gpt-6.1-sol']!.ops).toBe(2)
   expect(more['2026-10-10']!['claude|m']!.ops).toBe(1)
 })
+
+const SHARED = { ...OPENCODE, usageSource: 'stats' as const, cost: 1.5, sharedKey: 'oc|/w', sharedSize: 3 }
+
+test('a shared group adds every member as an op on its own end day, and its spend once on the first member\'s day', () => {
+  const next = Date.UTC(2026, 9, 10, 1)
+  const days = addRunsToDays({}, [run('s1', SHARED), run('s2', { ...SHARED, endedAt: next }), run('s3', SHARED)])
+  const first = days['2026-10-09']!['opencode|openai/gpt-6.1-sol']!
+  expect(first.ops).toBe(2)
+  expect(first.uncached).toBe(100)
+  expect(first.costReported).toBe(1.5)
+  expect(first.usageOps).toBe(1)
+  expect(first.costOps).toBe(1)
+  const later = days['2026-10-10']!['opencode|openai/gpt-6.1-sol']!
+  expect(later.ops).toBe(1)
+  expect(later.done).toBe(1)
+  expect(later.uncached).toBe(0)
+  expect(later.costReported).toBe(0)
+  expect(later.usageOps).toBe(0)
+  expect(later.costOps).toBe(0)
+})
+
+test('each member of a shared group keeps its own status, review and bugs; only spend and unknown-cost marks are taken once', () => {
+  const group = { kind: 'agent' as const, implementer: 'claude' as const, model: 'm', sharedKey: 'k', sharedSize: 3 }
+  const review = { reviewerId: 'hq', bugs: 2, edits: 1, source: 'verdict' as const, at: 1 }
+  const days = addRunsToDays({}, [
+    run('g1', { ...group, status: 'done' }),
+    run('g2', { ...group, status: 'failed', reviews: [review], bugsReported: 3 }),
+    run('g3', { ...group, status: 'killed' }),
+  ])
+  const c = days['2026-10-09']!['claude|m']!
+  expect([c.ops, c.done, c.failed, c.killed]).toEqual([3, 1, 1, 1])
+  expect([c.vetted, c.bugs]).toEqual([1, 5])
+  expect(c.unknownCostOps).toBe(1)
+})
+
+test('shared groups count their spend once and every member as an op on the live station rows, with the record shape unchanged', () => {
+  const ledger = ledgerOf([run('s1', SHARED), run('s2', SHARED), run('o1', OPENCODE)])
+  const rows = stationRowsFromLedger(ledger)
+  expect(rows.length).toBe(1)
+  expect(rows[0]!.ops).toBe(3)
+  expect(rows[0]!.uncached).toBe(200)
+  expect(rows[0]!.usageOps).toBe(2)
+  expect(Object.keys(recordFromLedger(ledger)).sort()).toEqual(['days', 'sessionStartedAt', 'v'])
+})
+
+test('a run with child rows adds its spend to the rows implementer × model and its op to its own', () => {
+  const child = run('c1', {
+    kind: 'cli', implementer: 'claude', model: 'claude-opus-5-5', usageSource: 'child',
+    usage: { uncached: 150, output: 10, cacheRead: 0, cacheWrite: 0 }, cost: 2.5, costSource: 'estimated',
+    rows: [
+      { implementer: 'claude', model: 'claude-opus-5-5', usage: { uncached: 100, output: 5, cacheRead: 0, cacheWrite: 0 }, cost: 2, costSource: 'estimated' },
+      { implementer: 'opencode', model: 'openai/gpt-6.1-sol', usage: { uncached: 50, output: 5, cacheRead: 0, cacheWrite: 0 }, cost: 0.5, costSource: 'reported' },
+    ],
+  })
+  const bucket = recordFromLedger(ledgerOf([child])).days['2026-10-09']!
+  expect(Object.keys(bucket).sort()).toEqual(['claude|claude-opus-5-5', 'opencode|openai/gpt-6.1-sol'])
+  expect(bucket['claude|claude-opus-5-5']!.ops).toBe(1)
+  expect(bucket['claude|claude-opus-5-5']!.uncached).toBe(100)
+  expect(bucket['claude|claude-opus-5-5']!.costEstimated).toBe(2)
+  expect(bucket['opencode|openai/gpt-6.1-sol']!.ops).toBe(0)
+  expect(bucket['opencode|openai/gpt-6.1-sol']!.uncached).toBe(50)
+  expect(bucket['opencode|openai/gpt-6.1-sol']!.costReported).toBe(0.5)
+  expect(stationRowsFromLedger(ledgerOf([child])).length).toBe(2)
+})

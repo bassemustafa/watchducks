@@ -37,7 +37,7 @@ export type Run = {
   endedAt?: number
   durationMs?: number
   usage: Usage | null
-  usageSource: 'steps' | 'complete' | 'relay' | null
+  usageSource: 'steps' | 'complete' | 'relay' | 'stats' | 'child' | null
   cost: number | null
   costSource: 'reported' | 'estimated' | null
   costPartial: boolean
@@ -53,6 +53,14 @@ export type Run = {
   outDir?: string
   /** True once a relay result.json was applied; live only, so a reload never reads a reused out-dir again. */
   resultRead?: boolean
+  /** True when the figures are a best estimate (a stats counter fell, or opencode was used elsewhere in the folder). */
+  approx?: boolean
+  /** Same-model, same-folder opencode runs share one key; their combined total is counted once. */
+  sharedKey?: string
+  /** How many runs share `sharedKey`. */
+  sharedSize?: number
+  /** A Claude child's whole spend by implementer × model, at most 32. */
+  rows?: Array<{ implementer: Implementer; model: string; usage: Usage; cost: number | null; costSource: 'reported' | 'estimated' | null }>
 }
 
 export type Ledger = {
@@ -65,6 +73,8 @@ export type Ledger = {
   /** Run ids in creation order (codename collisions resolve in this order). */
   order: string[]
   hq: Spend
+  /** The main loop's spend by model (at most 16 models, then `'other'`); live only, never written to history. Absent in state saved before v0.2. */
+  hqByModel?: Record<string, Spend>
   overhead: Spend
   /** `${loop}|${turnId}` for every turn that reported step usage (loop = agentId or 'main'). */
   turnsWithSteps: Record<string, true>

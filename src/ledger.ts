@@ -25,6 +25,21 @@ export type Action =
   | { type: 'bgSnapshot'; taskIds: readonly string[]; at: number }
   | { type: 'relayResult'; id: string; proj: RelayProjection; at: number }
   | { type: 'relayFound'; id: string; outDir: string; at: number }
+  | {
+      type: 'adapterUsage'
+      id: string
+      source: 'stats' | 'child'
+      usage: Usage
+      cost: number | null
+      costSource: 'reported' | 'estimated' | null
+      approx?: boolean
+      sharedKey?: string
+      sharedSize?: number
+      model?: string
+      rows?: Run['rows']
+      status?: 'running' | 'done' | 'failed'
+      at: number
+    }
   | { type: 'editCall'; loop?: string; at: number }
   | { type: 'findings'; loop?: string; toolUseId: string; count: number; at: number }
   | { type: 'verdict'; targetId: string; reviewerId?: string; bugs?: number; edits?: number; at: number }
@@ -50,6 +65,11 @@ const MAX_HANDLERS = 3
 const MAX_STEP_KEYS = 1024
 /** Trimming to a quarter below the cap keeps the rebuild to once per 256 new keys. */
 const STEP_KEYS_KEPT = 768
+/** Named models kept in `hqByModel`; the next one folds into OTHER_MODEL. */
+const MAX_HQ_MODELS = 16
+const OTHER_MODEL = 'other'
+/** A child report's breakdown is capped here (spec §4.5). */
+const MAX_ROWS = 32
 
 export function emptyLedger(sessionId: string, at: number): Ledger {
   return {
@@ -60,6 +80,7 @@ export function emptyLedger(sessionId: string, at: number): Ledger {
     runs: {},
     order: [],
     hq: emptySpend(),
+    hqByModel: {},
     overhead: emptySpend(),
     turnsWithSteps: {},
     countedSteps: {},
@@ -201,6 +222,13 @@ function addSpend(spend: Spend, usage: Usage, cost: number | null): Spend {
   }
 }
 
+/** `byModel` plus one request under `model`; a model past the 16th named one is added to `'other'`. */
+function addByModel(byModel: Record<string, Spend>, model: string, usage: Usage, cost: number | null): Record<string, Spend> {
+  let key = model
+  if (!Object.hasOwn(byModel, key) && Object.keys(byModel).filter(k => k !== OTHER_MODEL).length >= MAX_HQ_MODELS) key = OTHER_MODEL
+  return { ...byModel, [key]: addSpend(Object.hasOwn(byModel, key) ? byModel[key]! : emptySpend(), usage, cost) }
+}
+
 /** Add total tokens to the minute bucket; the series always ends at the newest minute seen. */
 function bumpSeries(ledger: Ledger, at: number, tokens: number): Ledger {
   const minute = Math.floor(at / MINUTE_MS)
@@ -231,7 +259,10 @@ function charge(
 ): Ledger {
   const used = usageFromApi(usage)
   const cost = estimateCost(used, usage.model || fallbackModel, prices)
-  if (loop === undefined) return { ...ledger, hq: addSpend(ledger.hq, used, cost) }
+  if (loop === undefined) {
+    const hqByModel = addByModel(ledger.hqByModel ?? {}, usage.model || fallbackModel, used, cost)
+    return { ...ledger, hq: addSpend(ledger.hq, used, cost), hqByModel }
+  }
   const run = getRun(ledger, loop)
   if (!run) return { ...ledger, overhead: addSpend(ledger.overhead, used, cost) }
   const charged: Run = {
@@ -442,6 +473,44 @@ function reduceRelayResult(ledger: Ledger, a: Extract<Action, { type: 'relayResu
   return bumpSeries(next, a.at, p.usage.uncached + p.usage.output + p.usage.cacheRead + p.usage.cacheWrite)
 }
 
+/**
+ * Usage an adapter measured for a run (spec §3, §4, §4.7): the values are totals and replace the run's.
+ * A relay's reported result wins over everything; a child report wins over stats.
+ */
+function reduceAdapterUsage(ledger: Ledger, a: Extract<Action, { type: 'adapterUsage' }>): Ledger {
+  const run = getRun(ledger, a.id)
+  if (!run) return ledger
+  if (run.usageSource === 'relay' && run.costSource === 'reported') return ledger
+  if (run.usageSource === 'child' && a.source === 'stats') return ledger
+  const rows = a.rows?.slice(0, MAX_ROWS)
+  const { approx: _approx, sharedKey: _sharedKey, sharedSize: _sharedSize, rows: _rows, ...rest } = run
+  const updated: Run = {
+    ...rest,
+    usage: a.usage,
+    usageSource: a.source,
+    cost: a.cost,
+    costSource: a.costSource,
+    costPartial: rows?.some(r => r.cost === null) ?? false,
+    ...(a.model !== undefined ? { model: a.model } : {}),
+    ...(a.approx ? { approx: true } : {}),
+    ...(a.sharedKey !== undefined ? { sharedKey: a.sharedKey } : {}),
+    ...(a.sharedKey !== undefined && a.sharedSize !== undefined ? { sharedSize: a.sharedSize } : {}),
+    ...(rows !== undefined ? { rows } : {}),
+  }
+  // a report's end only counts while the Bash side has not ended the run
+  const settled = a.status !== undefined && a.status !== 'running' && run.status === 'running'
+  const next = settled ? withHandlers(putRun(ledger, finish(updated, a.status!, a.at))) : putRun(ledger, updated)
+  // the rise joins the tokens-per-minute series; a shared group's members all show the group's total, so the
+  // rise is measured against the highest total any member already showed and the group adds it once
+  const total = (u: Usage | null): number => (u ? u.uncached + u.output + u.cacheRead + u.cacheWrite : 0)
+  let before = total(run.usage)
+  if (a.sharedKey !== undefined) {
+    for (const other of Object.values(ledger.runs)) if (other.sharedKey === a.sharedKey) before = Math.max(before, total(other.usage))
+  }
+  const rise = total(a.usage) - before
+  return rise > 0 ? bumpSeries(next, a.at, rise) : next
+}
+
 function reduceFindings(ledger: Ledger, a: Extract<Action, { type: 'findings' }>): Ledger {
   const runId = a.loop ?? 'main'
   const count = Number.isFinite(a.count) && a.count > 0 ? a.count : 0
@@ -556,6 +625,8 @@ export function reduce(ledger: Ledger, action: Action, prices: PriceTable): Ledg
       return reduceRelayResult(ledger, action, prices)
     case 'relayFound':
       return reduceRelayFound(ledger, action)
+    case 'adapterUsage':
+      return reduceAdapterUsage(ledger, action)
     case 'editCall': {
       const run = action.loop === undefined ? undefined : getRun(ledger, action.loop)
       return run ? putRun(ledger, { ...run, editCalls: run.editCalls + 1 }) : ledger
@@ -582,12 +653,23 @@ export function totals(ledger: Ledger): Totals {
     costPartial: false,
     byImplementer: {},
   }
+  // runs of a shared group each show the group's total: it is counted once, through the first in order
+  const firstOf = new Map<string, string>()
+  for (const id of ledger.order) {
+    const key = getRun(ledger, id)?.sharedKey
+    if (key !== undefined && !firstOf.has(key)) firstOf.set(key, id)
+  }
   for (const run of Object.values(ledger.runs)) {
     t[run.status] += 1
+    if (run.sharedKey !== undefined && firstOf.has(run.sharedKey) && firstOf.get(run.sharedKey) !== run.id) continue
     if (run.usage) t.usage = addUsage(t.usage, run.usage)
     if (run.cost !== null) t.cost = (t.cost ?? 0) + run.cost
     if ((run.kind === 'agent' || run.kind === 'relay') && (run.cost === null || run.costPartial)) t.costPartial = true
-    t.byImplementer[run.implementer] = (t.byImplementer[run.implementer] ?? 0) + (run.cost ?? 0)
+    if (run.rows !== undefined && run.rows.length > 0) {
+      for (const row of run.rows) t.byImplementer[row.implementer] = (t.byImplementer[row.implementer] ?? 0) + (row.cost ?? 0)
+    } else {
+      t.byImplementer[run.implementer] = (t.byImplementer[run.implementer] ?? 0) + (run.cost ?? 0)
+    }
   }
   return t
 }

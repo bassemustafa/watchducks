@@ -1,7 +1,9 @@
 import type { On } from 'claude-code'
 import { expect, mock, test, type Engine } from 'claude-code/testing'
 
-import type { UiState } from '../types'
+import type { Ledger, UiState } from '../types'
+import { reduce, type Action } from '../src/ledger'
+import { PRICES } from '../src/price'
 import { INITIAL_UI } from '../src/state'
 
 const RELAY_CALL = { tool: 'Bash', tool_use_id: 'u1', run_in_background: true, command: 'node x/opencode-delegate/scripts/relay.mjs --lane debate --out-dir /tmp/o1' }
@@ -522,4 +524,91 @@ test('the desktop card shows the final token total at once', async ($, on) => {
   const text = await view($, 'desktop', 52)
   expect(text).toContain('230k tok')
   expect(text).not.toMatch(/22[1-9]k tok/)
+})
+
+// ---- v0.2: adapter markers and the source line
+
+// The adapters' glue is not part of these tests: the ledger the plugin writes is rewritten as the reducer would
+// after an adapter measured usage, so the cards and the dossier draw what they will draw then.
+function rewriting(on: On, change: (ledger: Ledger) => Ledger): void {
+  on('state.set', { plugin: 'watchducks', key: 'ledger' }, async ($, e, next) => next({ ...e, value: change(e.value as Ledger) } as never))
+}
+
+type Measured = Omit<Extract<Action, { type: 'adapterUsage' }>, 'type' | 'id' | 'at'>
+
+function measured(on: On, ids: string[], over: Measured): void {
+  rewriting(on, ledger =>
+    ids.reduce((l, id) => (l.runs[id] && l.runs[id].usageSource !== over.source ? reduce(l, { type: 'adapterUsage', id, at: 1, ...over }, PRICES) : l), ledger),
+  )
+}
+
+const OC_RUN = (n: number) => ({ tool: 'Bash', tool_use_id: 'c' + n, command: `opencode run -m openai/gpt-6.1-sol "task ${n}"` }) as never
+const MEASURED = { uncached: 12000, output: 3000, cacheRead: 0, cacheWrite: 0 }
+
+// Opens the dossier of the card keyed `key` on the field view and draws it. The ui state outlives the pane, so the
+// way Back returns to the field before the next card is opened.
+async function dossierText($: Engine, surface: 'terminal' | 'desktop', key: string): Promise<string> {
+  const ui = await pane($, surface, 52)
+  try {
+    expect(await drawn(ui)).toContain(`"key":"${key}"`)
+    await ui.press({ key })
+    const text = await drawn(ui)
+    await ui.press({ key: 'back' })
+    return text
+  } finally {
+    await ui.unmount()
+  }
+}
+
+test('an approximate card reads ≈ before its tokens and an exact one does not, on both surfaces', async ($, on) => {
+  backgroundRelay(on)
+  measured(on, ['bash:c1'], { source: 'stats', usage: MEASURED, cost: 0.4, costSource: 'reported', approx: true })
+  measured(on, ['bash:c2'], { source: 'stats', usage: { ...MEASURED, uncached: 18000 }, cost: 0.4, costSource: 'reported' })
+  await $.tool.call(OC_RUN(1))
+  await $.tool.call(OC_RUN(2))
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const text = await view($, surface, 52)
+    expect(text).toContain('≈15k tok')
+    expect(text).toContain('21k tok')
+    expect(text).not.toContain('≈21k')
+  }
+})
+
+test('the cards of a shared group read shared ×3 and the header counts the group once', async ($, on) => {
+  backgroundRelay(on)
+  measured(on, ['bash:c1', 'bash:c2', 'bash:c3'], { source: 'stats', usage: MEASURED, cost: 0.4, costSource: 'reported', sharedKey: 'oc|/w', sharedSize: 3 })
+  measured(on, ['bash:c4'], { source: 'stats', usage: MEASURED, cost: 0.4, costSource: 'reported', sharedKey: 'lone', sharedSize: 1 })
+  for (const n of [1, 2, 3, 4]) await $.tool.call(OC_RUN(n))
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const text = await view($, surface, 52)
+    expect(text.match(/shared ×3/g)?.length).toBe(3)
+    expect(text).not.toContain('shared ×1')
+    // two groups of 15k: 30k delegated, never 60k (every card counted)
+    expect(text).toContain('30k')
+    expect(text).not.toContain('60k')
+  }
+})
+
+test('the dossier names where the numbers came from, and marks approximate ones', async ($, on) => {
+  backgroundRelay(on)
+  runningAgent(on)
+  measured(on, ['bash:c1'], { source: 'stats', usage: MEASURED, cost: 0.4, costSource: 'reported', approx: true })
+  measured(on, ['bash:c2'], { source: 'child', usage: MEASURED, cost: 0.4, costSource: 'estimated' })
+  rewriting(on, l =>
+    l.runs['bash:u1'] && l.runs['bash:u1'].usageSource !== 'relay'
+      ? reduce(l, { type: 'relayResult', id: 'bash:u1', at: 1, proj: { status: 'running', readOnly: false, costReported: 0.1, usage: MEASURED, touchedFiles: null } }, PRICES)
+      : l,
+  )
+  await $.tool.call(OC_RUN(1))
+  await $.tool.call(OC_RUN(2))
+  await $.tool.call(RELAY_CALL as never)
+  await stepAgent($)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    expect(await dossierText($, surface, 'bash:c1')).toContain('opencode stats (approximate)')
+    const child = await dossierText($, surface, 'bash:c2')
+    expect(child).toContain('child report')
+    expect(child).not.toContain('approximate')
+    expect(await dossierText($, surface, 'bash:u1')).toContain('result.json')
+    expect(await dossierText($, surface, 'a1')).toContain('per request')
+  }
 })

@@ -387,3 +387,221 @@ test('normalizeDir expands ~, drops trailing slashes and refuses what it cannot 
   expect(normalizeDir('~/a', undefined)).toBeUndefined()
   expect(normalizeDir('~/a', 'rel')).toBeUndefined()
 })
+
+// ---- v0.2: adapter usage, precedence, shared groups, HQ by model
+
+const OC_MODEL = 'openai/gpt-6.1-sol'
+const cliStart = (id: string, implementer: 'opencode' | 'claude' = 'opencode', model = OC_MODEL): Action =>
+  ({ type: 'bashStart', id, cls: { kind: 'cli', implementer, model, workdir: '/w' }, at: T0 })
+const used = (uncached: number) => ({ uncached, output: 10, cacheRead: 0, cacheWrite: 0 })
+const adapter = (id: string, source: 'stats' | 'child', uncached: number, over: Partial<Extract<Action, { type: 'adapterUsage' }>> = {}): Action =>
+  ({ type: 'adapterUsage', id, source, usage: used(uncached), cost: 0.5, costSource: 'reported', at: T0 + 5000, ...over })
+const relayDone = (id: string, costReported: number | null): Action => ({
+  type: 'relayResult', id, at: T0 + 4000,
+  proj: { status: 'done', readOnly: false, costReported, usage: used(777), touchedFiles: null },
+})
+const relayStart = (id: string): Action =>
+  ({ type: 'bashStart', id, cls: { kind: 'relay', implementer: 'opencode', readOnly: false, model: OC_MODEL, workdir: '/w', outDir: '/o/1' }, at: T0 })
+
+test('stats usage alone applies and its next snapshot replaces it rather than adding', () => {
+  const l = apply(emptyLedger('s1', T0), cliStart('r1'), adapter('r1', 'stats', 100), adapter('r1', 'stats', 250, { cost: 0.75 }))
+  const r = l.runs['r1']!
+  expect(r.usage).toEqual(used(250))
+  expect(r.usageSource).toBe('stats')
+  expect(r.cost).toBe(0.75)
+  expect(r.costSource).toBe('reported')
+})
+
+test('relay-reported usage and cost beat a child report and stats', () => {
+  const l = apply(emptyLedger('s1', T0), relayStart('r1'), relayDone('r1', 0.9), adapter('r1', 'child', 1), adapter('r1', 'stats', 2))
+  const r = l.runs['r1']!
+  expect(r.usage).toEqual(used(777))
+  expect(r.usageSource).toBe('relay')
+  expect(r.cost).toBe(0.9)
+})
+
+test('a relay result without a reported cost does not block an adapter', () => {
+  const l = apply(emptyLedger('s1', T0), relayStart('r1'), relayDone('r1', null), adapter('r1', 'stats', 5))
+  expect(l.runs['r1']!.usageSource).toBe('stats')
+  expect(l.runs['r1']!.usage).toEqual(used(5))
+})
+
+test('a child report beats stats whichever arrives first', () => {
+  const stale = apply(emptyLedger('s1', T0), cliStart('r1'), adapter('r1', 'child', 40), adapter('r1', 'stats', 9))
+  expect(stale.runs['r1']!.usageSource).toBe('child')
+  expect(stale.runs['r1']!.usage).toEqual(used(40))
+  const late = apply(emptyLedger('s1', T0), cliStart('r1'), adapter('r1', 'stats', 9), adapter('r1', 'child', 40))
+  expect(late.runs['r1']!.usageSource).toBe('child')
+  expect(late.runs['r1']!.usage).toEqual(used(40))
+})
+
+test('an adapter report for an unknown run changes nothing', () => {
+  const l = emptyLedger('s1', T0)
+  expect(apply(l, adapter('nope', 'stats', 1))).toEqual(l)
+})
+
+test('a newer adapter report without the approximate and shared fields clears them', () => {
+  const l = apply(emptyLedger('s1', T0), cliStart('r1'),
+    adapter('r1', 'stats', 10, { approx: true, sharedKey: 'k', sharedSize: 2 }), adapter('r1', 'stats', 20))
+  const r = l.runs['r1']!
+  expect(r.approx).toBeUndefined()
+  expect(r.sharedKey).toBeUndefined()
+  expect(r.sharedSize).toBeUndefined()
+})
+
+test('a child report ends a running run once, and never one the Bash side already ended', () => {
+  const ended = apply(emptyLedger('s1', T0), cliStart('r1'), adapter('r1', 'child', 5, { status: 'done' }))
+  expect(ended.runs['r1']!.status).toBe('done')
+  expect(ended.runs['r1']!.endedAt).toBe(T0 + 5000)
+  const running = apply(emptyLedger('s1', T0), cliStart('r1'), adapter('r1', 'child', 5, { status: 'running' }))
+  expect(running.runs['r1']!.status).toBe('running')
+  const failedBySide = apply(emptyLedger('s1', T0), cliStart('r1'),
+    { type: 'bashResult', id: 'r1', isError: true, interrupted: false, at: T0 + 2000 }, adapter('r1', 'child', 5, { status: 'done' }))
+  expect(failedBySide.runs['r1']!.status).toBe('failed')
+  expect(failedBySide.runs['r1']!.endedAt).toBe(T0 + 2000)
+})
+
+const group = (extra: Partial<Extract<Action, { type: 'adapterUsage' }>> = {}): Action[] =>
+  ['r1', 'r2', 'r3'].map(id => adapter(id, 'stats', 300, { sharedKey: 'oc|/w', sharedSize: 3, cost: 1.5, ...extra }))
+
+test('a shared group of three counts once in totals and the station rows, also after one member ends', () => {
+  const started = apply(emptyLedger('s1', T0), cliStart('r1'), cliStart('r2'), cliStart('r3'), ...group())
+  const check = (l: Ledger) => {
+    const t = totals(l)
+    expect(t.usage).toEqual(used(300))
+    near(t.cost, 1.5)
+    near(t.byImplementer['opencode'], 1.5)
+    const rows = stationRowsFromLedger(l)
+    expect(rows.length).toBe(1)
+    expect(rows[0]!.uncached).toBe(300)
+    near(rows[0]!.costReported, 1.5)
+    // three runs are three ops; only the spend is taken once
+    expect(rows[0]!.ops).toBe(3)
+    expect(rows[0]!.usageOps).toBe(1)
+    for (const id of ['r1', 'r2', 'r3']) expect(l.runs[id]!.sharedSize).toBe(3)
+  }
+  check(started)
+  // a later member ends: nothing moves
+  const lateEnd = apply(started, { type: 'bashResult', id: 'r3', isError: false, interrupted: false, at: T0 + 6000 })
+  check(lateEnd)
+  expect(totals(lateEnd).done).toBe(1)
+  expect(totals(lateEnd).running).toBe(2)
+  // the first member ends early and the others catch up to the same total: still once
+  const earlyEnd = apply(started, { type: 'bashResult', id: 'r1', isError: false, interrupted: false, at: T0 + 6000 },
+    ...group({ at: T0 + 7000 }))
+  check(earlyEnd)
+})
+
+test('runs with the same model but no shared key still count separately', () => {
+  const l = apply(emptyLedger('s1', T0), cliStart('r1'), cliStart('r2'), adapter('r1', 'stats', 100), adapter('r2', 'stats', 100))
+  expect(totals(l).usage).toEqual({ uncached: 200, output: 20, cacheRead: 0, cacheWrite: 0 })
+  expect(stationRowsFromLedger(l)[0]!.uncached).toBe(200)
+})
+
+test('a child run puts its rows on their implementer × model station rows and not on HQ', () => {
+  const rows = [
+    { implementer: 'claude' as const, model: OPUS, usage: used(1000), cost: 2, costSource: 'estimated' as const },
+    { implementer: 'opencode' as const, model: OC_MODEL, usage: used(400), cost: 0.5, costSource: 'reported' as const },
+  ]
+  const l = apply(emptyLedger('s1', T0), cliStart('c1', 'claude', OPUS), adapter('c1', 'child', 1400, { rows, cost: 2.5, costSource: 'estimated', model: OPUS }))
+  const board = stationRowsFromLedger(l)
+  const byKey = Object.fromEntries(board.map(r => [`${r.implementer}|${r.model}`, r]))
+  expect(Object.keys(byKey).sort()).toEqual([`claude|${OPUS}`, `opencode|${OC_MODEL}`])
+  expect(byKey[`opencode|${OC_MODEL}`]!.uncached).toBe(400)
+  near(byKey[`opencode|${OC_MODEL}`]!.costReported, 0.5)
+  expect(byKey[`claude|${OPUS}`]!.uncached).toBe(1000)
+  near(byKey[`claude|${OPUS}`]!.costEstimated, 2)
+  // one op, on the child's own row
+  expect(byKey[`claude|${OPUS}`]!.ops).toBe(1)
+  expect(byKey[`opencode|${OC_MODEL}`]!.ops).toBe(0)
+  expect(l.hq.usage).toEqual({ uncached: 0, output: 0, cacheRead: 0, cacheWrite: 0 })
+  expect(l.hqByModel).toEqual({})
+  near(totals(l).byImplementer['opencode'], 0.5)
+  near(totals(l).byImplementer['claude'], 2)
+  expect(totals(l).usage).toEqual(used(1400))
+})
+
+test('a stored record keeps its shape with shared groups and child rows, and hqByModel is not in it', () => {
+  const rows = [{ implementer: 'opencode' as const, model: OC_MODEL, usage: used(400), cost: 0.5, costSource: 'reported' as const }]
+  const l = apply(emptyLedger('s1', T0), cliStart('c1', 'claude', OPUS), cliStart('r2'), cliStart('r3'),
+    adapter('c1', 'child', 400, { rows }),
+    adapter('r2', 'stats', 300, { sharedKey: 'k', sharedSize: 2 }), adapter('r3', 'stats', 300, { sharedKey: 'k', sharedSize: 2 }),
+    { type: 'step', turnId: 't1', index: 0, model: OPUS, usage: stepUsage(OPUS), at: T0 })
+  const record = recordFromLedger(l)
+  expect(Object.keys(record).sort()).toEqual(['days', 'sessionStartedAt', 'v'])
+  expect(JSON.stringify(record)).not.toContain('hqByModel')
+  const day = Object.values(record.days)[0]!
+  expect(day[`opencode|${OC_MODEL}`]!.uncached).toBe(700)
+})
+
+const flat = (tokens: number) => ({ uncached: tokens, output: 0, cacheRead: 0, cacheWrite: 0 })
+const reported = (id: string, tokens: number, over: Partial<Extract<Action, { type: 'adapterUsage' }>> = {}): Action =>
+  adapter(id, 'stats', 0, { usage: flat(tokens), ...over })
+const nowSeries = (l: Ledger): number => seriesWindow(l, T0 + 5000, 1)[0]!
+
+test('adapter usage adds only its rise to the tokens-per-minute series', () => {
+  const l = apply(emptyLedger('s1', T0), cliStart('r1'), reported('r1', 10_000), reported('r1', 25_000))
+  expect(nowSeries(l)).toBe(25_000)
+  // a counter that fell adds nothing and takes nothing away
+  expect(nowSeries(apply(l, reported('r1', 20_000)))).toBe(25_000)
+})
+
+test('a shared group adds its rise to the series once, whichever member reports first', () => {
+  const shared = { sharedKey: 'k', sharedSize: 2 }
+  const start = [cliStart('r1'), cliStart('r2')]
+  const inOrder = apply(emptyLedger('s1', T0), ...start,
+    reported('r1', 10_000, shared), reported('r2', 10_000, shared), reported('r1', 25_000, shared), reported('r2', 25_000, shared))
+  expect(nowSeries(inOrder)).toBe(25_000)
+  const crossed = apply(emptyLedger('s1', T0), ...start,
+    reported('r1', 10_000, shared), reported('r2', 10_000, shared), reported('r2', 25_000, shared), reported('r1', 25_000, shared))
+  expect(nowSeries(crossed)).toBe(25_000)
+})
+
+test('an adapter report a higher source ignores adds nothing to the series', () => {
+  const l = apply(emptyLedger('s1', T0), relayStart('r1'), relayDone('r1', 0.9))
+  const before = nowSeries(l)
+  expect(nowSeries(apply(l, reported('r1', 50_000)))).toBe(before)
+})
+
+test('hqByModel: main-loop steps on two models are kept apart and add up to hq', () => {
+  const l = apply(emptyLedger('s1', T0),
+    { type: 'step', turnId: 't1', index: 0, model: OPUS, usage: stepUsage(OPUS), at: T0 },
+    { type: 'step', turnId: 't1', index: 1, model: 'claude-sonnet-5-5', usage: stepUsage('claude-sonnet-5-5'), at: T0 },
+    { type: 'step', turnId: 't2', index: 0, model: OPUS, usage: stepUsage(OPUS), at: T0 })
+  const by = l.hqByModel!
+  expect(Object.keys(by).sort()).toEqual([OPUS, 'claude-sonnet-5-5'])
+  expect(by[OPUS]!.usage.uncached).toBe(2000)
+  expect(by['claude-sonnet-5-5']!.usage.uncached).toBe(1000)
+  const sum = Object.values(by).reduce((acc, s) => acc + s.usage.uncached, 0)
+  expect(sum).toBe(l.hq.usage.uncached)
+  near(Object.values(by).reduce((acc, s) => acc + (s.cost ?? 0), 0), l.hq.cost ?? 0)
+})
+
+test('hqByModel: a subagent step does not touch it, a main-loop turnComplete does', () => {
+  const sub = apply(emptyLedger('s1', T0), spawn('a1'), step(0))
+  expect(sub.hqByModel).toEqual({})
+  const main = apply(sub, { type: 'turnComplete', turnId: 't9', reason: 'answer', usage: stepUsage(OPUS), at: T0 })
+  expect(Object.keys(main.hqByModel!)).toEqual([OPUS])
+  expect(main.hqByModel![OPUS]!.usage.uncached).toBe(1000)
+})
+
+test('hqByModel: the 17th model folds into other', () => {
+  const steps: Action[] = []
+  for (let i = 0; i < 17; i++) steps.push({ type: 'step', turnId: 't1', index: i, model: `m${i}`, usage: stepUsage(`m${i}`), at: T0 })
+  steps.push({ type: 'step', turnId: 't1', index: 17, model: 'm0', usage: stepUsage('m0'), at: T0 })
+  steps.push({ type: 'step', turnId: 't1', index: 18, model: 'm18', usage: stepUsage('m18'), at: T0 })
+  const l = apply(emptyLedger('s1', T0), ...steps)
+  const keys = Object.keys(l.hqByModel!)
+  expect(keys.length).toBe(17)
+  expect(keys.filter(k => k !== 'other').length).toBe(16)
+  expect(l.hqByModel!['other']!.usage.uncached).toBe(2000)
+  // a named model keeps accumulating after the cap
+  expect(l.hqByModel!['m0']!.usage.uncached).toBe(2000)
+})
+
+test('hqByModel is read as empty on a ledger saved without it', () => {
+  const { hqByModel: _gone, ...old } = emptyLedger('s1', T0)
+  const l = apply(old, { type: 'step', turnId: 't1', index: 0, model: OPUS, usage: stepUsage(OPUS), at: T0 })
+  expect(Object.keys(l.hqByModel!)).toEqual([OPUS])
+  expect(emptyLedger('s1', T0).hqByModel).toEqual({})
+})

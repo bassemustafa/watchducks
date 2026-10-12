@@ -348,7 +348,8 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
     const live = tick && now - tick.startedAt < TICK_MS ? tickerValue(tick, now) : undefined
     const tokens = live ? fmtTokens(live.tokens) : runTokens(run)
     const cost = live && run.cost !== null ? fmtCost(live.cost, run.costSource, run.costPartial) : runCost(run)
-    const figures = [(coarse && run.status === 'running' ? fmtElapsedCoarse : fmtDuration)(runElapsed(run, now)), `${tokens} tok`, cost]
+    const figures = [(coarse && run.status === 'running' ? fmtElapsedCoarse : fmtDuration)(runElapsed(run, now)), `${run.approx ? '≈' : ''}${tokens} tok`, cost]
+    if (run.sharedSize !== undefined && run.sharedSize > 1) figures.push(`shared ×${run.sharedSize}`)
     const whole = `${status}   ${figures.join('   ')}`
     // too long for one line: the status keeps its own line, the figures wrap whole so tokens and cost never get cut
     const lines = Array.from(whole).length <= inner ? [whole] : [fit(status, inner), ...packFigures(figures, inner)]
