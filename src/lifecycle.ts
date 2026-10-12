@@ -2,7 +2,24 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, FsStat, On, PluginOptions, Timer } from 'claude-code'
 
 import type { HistoryRecord, Ledger, RelayProjection, Run } from '../types'
-import { STATS_ARGV, STATS_EVERY_MS, STATS_TIMEOUT_MS, attribute, projectStats, type StatsSnapshot } from './adapters/opencode-stats'
+import {
+  STATS_ARGV,
+  STATS_EVERY_MS,
+  STATS_MAX_FOLDERS,
+  STATS_MAX_RUNS,
+  STATS_TIMEOUT_MS,
+  baselineFrom,
+  capped,
+  chainByOverlap,
+  planShares,
+  projectStats,
+  type StatsExact,
+  type StatsLast,
+  type StatsRun,
+  type StatsShare,
+  type StatsSnapshot,
+  type StatsTaken,
+} from './adapters/opencode-stats'
 import {
   DISCOVERY_BUDGET_MS,
   DISCOVERY_EVERY,
@@ -24,7 +41,7 @@ import {
   type FoundResult,
 } from './collect/relay'
 import { HISTORY_PREFIX, pruneHistory, recordFromLedger } from './history'
-import { emptyLedger, isKnownLoop, normalizeDir, reduce, type Action } from './ledger'
+import { emptyLedger, isKnownLoop, normalizeDir, reduce, workdirKey, type Action } from './ledger'
 import type { PriceTable } from './price'
 import { fnv1a } from './codename'
 import { MAX_RESULT_BYTES, isInsideRoots, projectRelayResult, relayIdentity } from './relay-result'
@@ -497,89 +514,96 @@ async function pollRelays($: EngineInterface, table: PriceTable, options: Plugin
 // grace ago), one timer takes `opencode stats` snapshots per working directory and gives each run its share. The
 // process runs one at a time for the session, at most once per STATS_EVERY_MS per directory; its stdout is projected to
 // numbers by `projectStats` and its stderr is never read. What is kept here is numbers and run ids: the working
-// directory is read from the run for the call and not kept.
+// directory is read from the run for the call and not kept. The pure parts (groups, shares, baselines) are in
+// `adapters/opencode-stats.ts`.
 
 const STATS_SLACK_MS = 50 // a timer tick may land a hair before the interval is over
 const STATS_MAX_FAILURES = 3
+const STATS_EXIT_TIMEOUT_MS = 3000
+const STATS_EXIT_FOLDERS = 2
 
 let statsTimer: Timer | undefined
 let statsBusy = false
+// session-wide: the failure breaker and the pace per folder do not reset with /flock clear
 let statsFailures = 0
+let statsSession = ''
 let statsGeneration = -1
-// the snapshot each run was first seen at
-const statsBase = new Map<string, StatsSnapshot>()
-// runs whose final snapshot has been applied
+// per run, at most STATS_MAX_RUNS each: where a run was first looked at (and whether that was late), the runs given their
+// final figures, the figures last given, and the runs that already used a snapshot of their own as baseline
+const statsBase = new Map<string, { snap: StatsSnapshot; approx: boolean }>()
 const statsFinal = new Set<string>()
-// when the process last started for a working directory key
+let statsFinalBefore = 0 // a run that ended before this was final when its marker was dropped
+const statsLast = new Map<string, StatsLast>()
+const statsTried = new Set<string>()
+// per folder, at most STATS_MAX_FOLDERS each: when the process last started, and the snapshot it gave
 const statsAttempt = new Map<string, number>()
-// the figures last sent for a run, so an unchanged run writes nothing
-const statsSent = new Map<string, string>()
+const statsTaken = new Map<string, StatsTaken>()
 
 function resetStats(): void {
   statsFailures = 0
+  statsSession = ''
   statsGeneration = -1
   statsBase.clear()
   statsFinal.clear()
+  statsFinalBefore = 0
+  statsLast.clear()
+  statsTried.clear()
   statsAttempt.clear()
-  statsSent.clear()
+  statsTaken.clear()
 }
 
-function syncStatsGeneration(l: Ledger): void {
+/** A new session starts the adapter over; a /flock clear only drops what belongs to runs the ledger no longer has. */
+function syncStatsSession(l: Ledger): void {
+  if (l.sessionId !== statsSession) {
+    resetStats()
+    statsSession = l.sessionId
+    statsGeneration = l.generation
+    return
+  }
   if (l.generation === statsGeneration) return
-  resetStats()
   statsGeneration = l.generation
+  const gone = (id: string): boolean => !Object.hasOwn(l.runs, id)
+  for (const id of [...statsBase.keys()]) if (gone(id)) statsBase.delete(id)
+  for (const id of [...statsFinal]) if (gone(id)) statsFinal.delete(id)
+  for (const id of [...statsLast.keys()]) if (gone(id)) statsLast.delete(id)
+  for (const id of [...statsTried]) if (gone(id)) statsTried.delete(id)
 }
 
-const dirOf = (run: Run): string => run.workdirKey ?? 'session'
-const shortModel = (model: string | undefined): string => (model === undefined ? '' : model.slice(model.lastIndexOf('/') + 1))
+const isOpencode = (run: Run): boolean => run.implementer === 'opencode' && (run.kind === 'cli' || run.kind === 'relay')
+/** A relay result gave this run's usage: it is exact, taken away from the runs around it, and never measured here. */
+const isExact = (run: Run): boolean => run.usageSource === 'relay'
+const wantsStats = (run: Run): boolean => isOpencode(run) && !isExact(run) && run.usageSource !== 'child'
 
-function isStatsRun(run: Run): boolean {
-  if (run.implementer !== 'opencode' || (run.kind !== 'cli' && run.kind !== 'relay')) return false
-  // an exact relay result wins over stats: no process is needed for it
-  return !(run.usageSource === 'relay' && run.costSource === 'reported')
+/** The folder a run is measured in: the one it ran in, else the session root; one key for either spelling of it. */
+function folderOf(run: Run, root: string | undefined): string {
+  if (run.workdir !== undefined) return workdirKey(run.workdir)
+  if (run.workdirKey !== undefined) return run.workdirKey
+  return root !== undefined ? workdirKey(root) : 'session'
 }
 
-/** Opencode runs that need a snapshot: running, or ended less than the grace ago and not yet given their final one. */
+/** Opencode runs that need a snapshot: running, or ended less than the grace ago and not yet given their final figures. */
 function statsLive(l: Ledger, now: number): Run[] {
   const live: Run[] = []
   for (const id of l.order) {
     const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
-    if (!run || !isStatsRun(run)) continue
+    if (!run || !wantsStats(run)) continue
     if (run.status === 'running') live.push(run)
-    else if (run.endedAt !== undefined && now - run.endedAt < POLL_GRACE_MS && !statsFinal.has(run.id)) live.push(run)
+    else if (run.endedAt !== undefined && now - run.endedAt < POLL_GRACE_MS && run.endedAt > statsFinalBefore && !statsFinal.has(run.id)) live.push(run)
   }
   return live
 }
 
-/** Runs of one model whose running intervals overlap (chained) form one group; a lone run is a group of one. */
-function statsGroups(members: readonly Run[], now: number): Run[][] {
-  const byModel = new Map<string, Run[]>()
-  for (const run of members) {
-    const key = shortModel(run.model)
-    byModel.set(key, [...(byModel.get(key) ?? []), run])
+async function statsRoot($: EngineInterface): Promise<string | undefined> {
+  try {
+    return normalizeDir(await $.session.root(), undefined)
+  } catch {
+    return undefined
   }
-  const groups: Run[][] = []
-  for (const runs of byModel.values()) {
-    let current: Run[] = []
-    let reach = 0
-    for (const run of [...runs].sort((a, b) => a.startedAt - b.startedAt)) {
-      if (current.length > 0 && run.startedAt <= reach) {
-        current.push(run)
-        reach = Math.max(reach, run.endedAt ?? now)
-      } else {
-        if (current.length > 0) groups.push(current)
-        current = [run]
-        reach = run.endedAt ?? now
-      }
-    }
-    if (current.length > 0) groups.push(current)
-  }
-  return groups
 }
 
-async function takeStats($: EngineInterface, cwd: string | undefined): Promise<StatsSnapshot | null> {
+async function takeStats($: EngineInterface, cwd: string | undefined, timeoutMs: number): Promise<StatsSnapshot | null> {
   try {
-    const r = await $.process.run(STATS_ARGV, { ...(cwd !== undefined ? { cwd } : {}), timeoutMs: STATS_TIMEOUT_MS })
+    const r = await $.process.run(STATS_ARGV, { ...(cwd !== undefined ? { cwd } : {}), timeoutMs })
     if (r.exitCode !== 0 || r.isStdoutTruncated) return null
     return projectStats(r.stdout, Date.now())
   } catch {
@@ -587,57 +611,166 @@ async function takeStats($: EngineInterface, cwd: string | undefined): Promise<S
   }
 }
 
-/** Gives every run of one working directory its share of the snapshot, in one atomic ledger update. */
-async function applyStats($: EngineInterface, table: PriceTable, seen: Ledger, dir: string, live: readonly Run[], snap: StatsSnapshot): Promise<void> {
-  const now = Date.now()
-  for (const run of live) if (!statsBase.has(run.id)) statsBase.set(run.id, snap)
-  const liveIds = new Set(live.map(r => r.id))
-  // every run of the directory this adapter has followed, so a group keeps its members after one of them leaves
-  const tracked: Run[] = []
-  for (const id of seen.order) {
-    const run = Object.hasOwn(seen.runs, id) ? seen.runs[id] : undefined
-    if (run && isStatsRun(run) && dirOf(run) === dir && statsBase.has(id)) tracked.push(run)
+/** Marks a run final; past the cap the oldest marker goes, and its end time becomes the line under which no run is picked up again. */
+function markFinal(l: Ledger, id: string): void {
+  statsFinal.add(id)
+  while (statsFinal.size > STATS_MAX_RUNS) {
+    const first = statsFinal.values().next()
+    if (first.done) return
+    statsFinal.delete(first.value)
+    const endedAt = Object.hasOwn(l.runs, first.value) ? l.runs[first.value]?.endedAt : undefined
+    if (endedAt !== undefined) statsFinalBefore = Math.max(statsFinalBefore, endedAt)
   }
+}
 
-  const actions: Action[] = []
-  const signatures = new Map<string, string>()
-  for (const group of statsGroups(tracked, now)) {
-    if (!group.some(r => liveIds.has(r.id))) continue
-    const base = group.map(r => statsBase.get(r.id)!).reduce((a, b) => (b.at < a.at ? b : a))
-    if (base === snap) continue // baselined just now: nothing to count yet
-    const share = attribute(base, snap, group[0]!.model)
-    const overlapping = tracked.filter(r => r.startedAt <= snap.at && (r.endedAt ?? now) >= base.at).length
-    const approx = share.approx || snap.sessions - base.sessions > overlapping
-    // the earliest start names the group: a run joining it cannot move that, and a later group of the same folder and model gets its own key
-    const sharedKey =
-      group.length > 1 ? fingerprint(`${dir}|${shortModel(group[0]!.model)}|${Math.min(...group.map(r => r.startedAt))}`) : undefined
-    for (const run of group) {
-      const u = share.usage
-      const signature = `${u.uncached}|${u.output}|${u.cacheRead}|${u.cacheWrite}|${share.cost}|${approx}|${sharedKey ?? ''}|${group.length}`
-      if (statsSent.get(run.id) === signature) continue
-      signatures.set(run.id, signature)
-      actions.push({
-        type: 'adapterUsage',
-        id: run.id,
-        source: 'stats',
-        usage: u,
-        cost: share.cost,
-        costSource: 'reported',
-        ...(approx ? { approx: true } : {}),
-        ...(sharedKey !== undefined ? { sharedKey, sharedSize: group.length } : {}),
-        at: now,
-      })
+/**
+ * Keeps the adapter's memory to what can still matter: nothing of a run the ledger lost, nothing of a run that is
+ * finished and whose neighbours (runs it overlaps, chained) are all finished too, nothing of a folder not looked at for a
+ * poll; and no map past its cap.
+ */
+function pruneStats(l: Ledger, now: number, clockNow: number, root: string | undefined): void {
+  const known = (id: string): boolean => Object.hasOwn(l.runs, id)
+  for (const id of [...statsFinal]) {
+    const run = known(id) ? l.runs[id] : undefined
+    if (!run || run.endedAt === undefined || now - run.endedAt >= POLL_GRACE_MS) statsFinal.delete(id)
+  }
+  const live = new Set(statsLive(l, now).map(r => r.id))
+  const byFolder = new Map<string, Run[]>()
+  for (const id of l.order) {
+    const run = known(id) ? l.runs[id] : undefined
+    if (!run || !isOpencode(run) || (!live.has(id) && !statsBase.has(id))) continue
+    const folder = folderOf(run, root)
+    byFolder.set(folder, [...(byFolder.get(folder) ?? []), run])
+  }
+  const keep = new Set<string>()
+  for (const runs of byFolder.values()) {
+    for (const chain of chainByOverlap(runs, r => [r.startedAt, r.endedAt ?? now] as const)) {
+      if (chain.some(r => live.has(r.id))) for (const r of chain) keep.add(r.id)
     }
   }
+  for (const id of [...statsBase.keys()]) if (!keep.has(id)) statsBase.delete(id)
+  for (const id of [...statsLast.keys()]) if (!keep.has(id)) statsLast.delete(id)
+  for (const id of [...statsTried]) if (!keep.has(id)) statsTried.delete(id)
+  for (const [folder, at] of [...statsAttempt]) if (clockNow - at >= STATS_EVERY_MS) statsAttempt.delete(folder)
+  for (const [folder, taken] of [...statsTaken]) if (clockNow - taken.clockAt >= STATS_EVERY_MS) statsTaken.delete(folder)
+  capped(statsBase, STATS_MAX_RUNS)
+  capped(statsLast, STATS_MAX_RUNS)
+  capped(statsTried, STATS_MAX_RUNS)
+  capped(statsAttempt, STATS_MAX_FOLDERS)
+  capped(statsTaken, STATS_MAX_FOLDERS)
+}
 
-  let applied = false
-  await update($, ledgerAtom, l => {
-    applied = l.generation === seen.generation
-    return applied ? actions.reduce((acc, a) => reduce(acc, a, table), l) : l
-  })
+/** A run without a baseline takes the folder's last snapshot when that one can serve (taken just before it started, or after). */
+function adoptBaselines(folder: string, runs: readonly Run[]): void {
+  const taken = statsTaken.get(folder)
+  if (!taken) return
+  for (const run of runs) {
+    if (statsBase.has(run.id)) continue
+    const served = baselineFrom(run.startedAt, taken)
+    if (served) statsBase.set(run.id, { snap: taken.snap, approx: served.approx })
+  }
+  capped(statsBase, STATS_MAX_RUNS)
+}
+
+const sameFigures = (run: Run, share: StatsShare): boolean =>
+  run.usageSource === 'stats' &&
+  run.usage !== null &&
+  run.usage.uncached === share.usage.uncached &&
+  run.usage.output === share.usage.output &&
+  run.usage.cacheRead === share.usage.cacheRead &&
+  run.usage.cacheWrite === share.usage.cacheWrite &&
+  (run.costLocked === 'relay' || (run.cost === share.cost && run.costSource === 'reported')) &&
+  (run.approx === true) === share.approx &&
+  run.sharedKey === share.sharedKey &&
+  run.sharedSize === share.sharedSize
+
+/**
+ * Gives every opencode run of one folder its share of a snapshot, in one atomic ledger update. What a run shows is
+ * compared with the ledger as it is now, so a relay result that changed the run is not hidden behind figures sent before.
+ */
+async function applyStats(
+  $: EngineInterface,
+  table: PriceTable,
+  sessionId: string,
+  folder: string,
+  taken: StatsTaken,
+  root: string | undefined,
+): Promise<void> {
+  const l = await read($, ledgerAtom)
+  if (l.sessionId !== sessionId) return
+  const now = Date.now()
+  const mine: Run[] = []
+  const exacts: StatsExact[] = []
+  for (const id of l.order) {
+    const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
+    if (!run || !isOpencode(run) || folderOf(run, root) !== folder) continue
+    if (isExact(run) && run.usage) exacts.push({ id, model: run.model, startedAt: run.startedAt, endedAt: run.endedAt, usage: run.usage, cost: run.cost })
+    else if (wantsStats(run)) mine.push(run)
+  }
+  const liveIds = new Set(statsLive(l, now).map(r => r.id))
+  // a live run nothing could serve takes this snapshot as its baseline
+  for (const run of mine) {
+    if (!liveIds.has(run.id) || statsBase.has(run.id)) continue
+    statsBase.set(run.id, { snap: taken.snap, approx: (baselineFrom(run.startedAt, taken) ?? { approx: true }).approx })
+  }
+  capped(statsBase, STATS_MAX_RUNS)
+
+  const measured: StatsRun[] = []
+  for (const run of mine) {
+    const base = statsBase.get(run.id)
+    if (!base) continue
+    const last = statsLast.get(run.id)
+    measured.push({
+      id: run.id,
+      model: run.model,
+      startedAt: run.startedAt,
+      endedAt: run.endedAt,
+      base: base.snap,
+      baseApprox: base.approx,
+      live: liveIds.has(run.id),
+      ...(last !== undefined ? { last } : {}),
+    })
+  }
+  const shares = planShares(folder, measured, exacts, taken.snap, now)
+
+  const actions: Action[] = []
+  for (const share of shares) {
+    const run = Object.hasOwn(l.runs, share.id) ? l.runs[share.id] : undefined
+    const base = statsBase.get(share.id)
+    if (!run || !base) continue
+    const nothingYet = share.usage.uncached + share.usage.output + share.usage.cacheRead + share.usage.cacheWrite === 0 && share.cost === 0
+    // a running run whose first look is this snapshot has nothing to show yet; a run whose only look came after it ended was never measured
+    if (nothingYet && run.usage === null && run.status === 'running') continue
+    if (share.sharedKey === undefined && run.endedAt !== undefined && base.snap.at > run.endedAt) continue
+    if (sameFigures(run, share)) continue
+    actions.push({
+      type: 'adapterUsage',
+      id: share.id,
+      source: 'stats',
+      usage: share.usage,
+      cost: share.cost,
+      costSource: 'reported',
+      ...(share.approx ? { approx: true } : {}),
+      ...(share.sharedKey !== undefined && share.sharedSize !== undefined ? { sharedKey: share.sharedKey, sharedSize: share.sharedSize } : {}),
+      at: now,
+    })
+  }
+
+  let applied = actions.length === 0
+  if (actions.length > 0) {
+    await update($, ledgerAtom, cur => {
+      applied = cur.sessionId === sessionId
+      return applied ? actions.reduce((acc, a) => reduce(acc, a, table), cur) : cur
+    })
+  }
   if (!applied) return
-  for (const [id, signature] of signatures) statsSent.set(id, signature)
-  for (const run of live) if (run.status !== 'running') statsFinal.add(run.id)
+  for (const share of shares) statsLast.set(share.id, { usage: share.usage, cost: share.cost, basis: share.basis })
+  capped(statsLast, STATS_MAX_RUNS)
+  // a run is final once a snapshot that began after it ended has given it its figures
+  const attributed = new Set(shares.map(s => s.id))
+  for (const run of mine) {
+    if (liveIds.has(run.id) && run.status !== 'running' && run.endedAt !== undefined && taken.from >= run.endedAt && attributed.has(run.id)) markFinal(l, run.id)
+  }
 }
 
 async function statsTick($: EngineInterface, table: PriceTable, options: PluginOptions): Promise<void> {
@@ -645,25 +778,33 @@ async function statsTick($: EngineInterface, table: PriceTable, options: PluginO
   statsBusy = true
   try {
     const seen = await read($, ledgerAtom)
-    syncStatsGeneration(seen)
+    syncStatsSession(seen)
     if (statsFailures >= STATS_MAX_FAILURES) return
-    const byDir = new Map<string, Run[]>()
-    for (const run of statsLive(seen, Date.now())) byDir.set(dirOf(run), [...(byDir.get(dirOf(run)) ?? []), run])
-    for (const [dir, live] of byDir) {
-      // the engine's clock paces the snapshots; run times are wall-clock like the rest of the ledger
+    const root = await statsRoot($)
+    const now = Date.now()
+    // the engine's clock paces the snapshots; run times are wall-clock like the rest of the ledger
+    const clockNow = await $.clock.now()
+    pruneStats(seen, now, clockNow, root)
+    const byFolder = new Map<string, Run[]>()
+    for (const run of statsLive(seen, now)) {
+      const folder = folderOf(run, root)
+      byFolder.set(folder, [...(byFolder.get(folder) ?? []), run])
+    }
+    for (const [folder, runs] of byFolder) {
+      adoptBaselines(folder, runs)
+      // a run nothing could serve may take one snapshot of its own past the pace; once
+      const lacking = runs.filter(r => !statsBase.has(r.id))
+      const own = lacking.filter(r => !statsTried.has(r.id))
       const tickAt = await $.clock.now()
-      const last = statsAttempt.get(dir)
-      if (last !== undefined && tickAt - last < STATS_EVERY_MS - STATS_SLACK_MS) continue
-      let cwd = live.find(r => r.workdir !== undefined)?.workdir
-      if (cwd === undefined) {
-        try {
-          cwd = await $.session.root()
-        } catch {
-          // the process then starts in the session's own directory
-        }
-      }
-      statsAttempt.set(dir, tickAt)
-      const snap = await takeStats($, cwd)
+      const last = statsAttempt.get(folder)
+      const due = last === undefined || tickAt - last >= STATS_EVERY_MS - STATS_SLACK_MS
+      if (!due && own.length === 0) continue
+      for (const run of lacking) statsTried.add(run.id)
+      capped(statsTried, STATS_MAX_RUNS)
+      statsAttempt.set(folder, tickAt)
+      capped(statsAttempt, STATS_MAX_FOLDERS)
+      const from = Date.now()
+      const snap = await takeStats($, runs.find(r => r.workdir !== undefined)?.workdir ?? root, STATS_TIMEOUT_MS)
       if (snap === null) {
         statsFailures += 1
         if (statsFailures >= STATS_MAX_FAILURES) {
@@ -674,8 +815,10 @@ async function statsTick($: EngineInterface, table: PriceTable, options: PluginO
         continue
       }
       statsFailures = 0
-      if ((await read($, ledgerAtom)).generation !== seen.generation) return
-      await applyStats($, table, seen, dir, live, snap)
+      const taken: StatsTaken = { snap, from, clockAt: tickAt }
+      statsTaken.set(folder, taken)
+      capped(statsTaken, STATS_MAX_FOLDERS)
+      await applyStats($, table, seen.sessionId, folder, taken, root)
     }
   } catch {
     // the next tick tries again
@@ -684,9 +827,43 @@ async function statsTick($: EngineInterface, table: PriceTable, options: PluginO
   }
 }
 
+/**
+ * Before the session ends: one snapshot per folder (at most two, a short timeout, the pace ignored) for the runs that
+ * have ended but not yet had their final figures, so the history keeps them. A failure leaves the last live figures.
+ */
+async function finalStats($: EngineInterface, table: PriceTable, options: PluginOptions): Promise<void> {
+  if (statsBusy || options.opencodeStats !== 'on') return
+  statsBusy = true
+  try {
+    const seen = await read($, ledgerAtom)
+    syncStatsSession(seen)
+    if (statsFailures >= STATS_MAX_FAILURES) return
+    const root = await statsRoot($)
+    const byFolder = new Map<string, Run[]>()
+    for (const run of statsLive(seen, Date.now())) {
+      if (run.status === 'running' || !statsBase.has(run.id)) continue
+      const folder = folderOf(run, root)
+      byFolder.set(folder, [...(byFolder.get(folder) ?? []), run])
+    }
+    for (const [folder, runs] of [...byFolder].slice(0, STATS_EXIT_FOLDERS)) {
+      const tickAt = await $.clock.now()
+      const from = Date.now()
+      const snap = await takeStats($, runs.find(r => r.workdir !== undefined)?.workdir ?? root, STATS_EXIT_TIMEOUT_MS)
+      if (snap === null) continue
+      const taken: StatsTaken = { snap, from, clockAt: tickAt }
+      statsTaken.set(folder, taken)
+      await applyStats($, table, seen.sessionId, folder, taken, root)
+    }
+  } catch {
+    // the history keeps the last live figures
+  } finally {
+    statsBusy = false
+  }
+}
+
 /** Called by the watch tick: the stats timer exists while the setting is on and an opencode run needs a snapshot; a run not seen yet is looked at at once. */
 function watchStats($: EngineInterface, table: PriceTable, options: PluginOptions, l: Ledger, now: number): void {
-  syncStatsGeneration(l)
+  syncStatsSession(l)
   const live = options.opencodeStats === 'on' && statsFailures < STATS_MAX_FAILURES ? statsLive(l, now) : []
   if (live.length === 0) {
     statsTimer?.cancel()
@@ -1003,6 +1180,8 @@ export function registerLifecycle(on: On, table: PriceTable, options: PluginOpti
   // One history write; a /clear then starts an empty ledger under the new session id.
   on('session.end', async ($, e, next) => {
     let old: Ledger | undefined
+    // runs that ended since the last poll get their final figures before the record is written
+    await finalStats($, table, options)
     try {
       old = await read($, ledgerAtom)
       await writeHistory($, old, options)

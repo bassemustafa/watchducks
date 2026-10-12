@@ -205,3 +205,17 @@ test('a run with child rows adds its spend to the rows implementer × model and 
   expect(bucket['opencode|openai/gpt-6.1-sol']!.costReported).toBe(0.5)
   expect(stationRowsFromLedger(ledgerOf([child])).length).toBe(2)
 })
+
+test('a shared group still held elsewhere adds its members ops to the days but not its spend', () => {
+  const member = (id: string) => run(id, { ...SHARED, sharedKey: 'k' })
+  const held = addRunsToDays({}, [member('a'), member('b')], new Set(['k']))
+  const day = Object.values(held)[0]!['opencode|openai/gpt-6.1-sol']!
+  expect(day.ops).toBe(2)
+  expect(day.uncached).toBe(0)
+  expect(day.costReported).toBe(0)
+  // without the hold the group's spend counts once
+  const whole = Object.values(addRunsToDays({}, [member('a'), member('b')]))[0]!['opencode|openai/gpt-6.1-sol']!
+  expect(whole.ops).toBe(2)
+  expect(whole.uncached).toBe(100)
+  expect(whole.costReported).toBe(1.5)
+})

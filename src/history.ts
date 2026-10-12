@@ -90,10 +90,11 @@ function addToBuckets(bucketOf: (key: string) => Counters, run: Run, spend: bool
 }
 
 /** Says per run whether its spend counts: a shared group's tokens and cost count once, through the first member given. */
-function spendOnce(): (run: Run) => boolean {
+function spendOnce(deferred?: ReadonlySet<string>): (run: Run) => boolean {
   const seen = new Set<string>()
   return run => {
     if (run.sharedKey === undefined) return true
+    if (deferred?.has(run.sharedKey)) return false
     if (seen.has(run.sharedKey)) return false
     seen.add(run.sharedKey)
     return true
@@ -135,8 +136,11 @@ export function dropOldDays(days: HistoryRecord['days'], nowMs: number): History
   return out
 }
 
-/** A copy of `days` with every run added by its UTC end day and implementer × model bucket; the input is not changed. */
-export function addRunsToDays(days: HistoryRecord['days'], runs: readonly Run[]): HistoryRecord['days'] {
+/**
+ * A copy of `days` with every run added by its UTC end day and implementer × model bucket; the input is not changed.
+ * A shared group in `deferred` still has members elsewhere (the ledger): its members here add their ops, not the spend.
+ */
+export function addRunsToDays(days: HistoryRecord['days'], runs: readonly Run[], deferred?: ReadonlySet<string>): HistoryRecord['days'] {
   const out: HistoryRecord['days'] = {}
   for (const [day, byKey] of Object.entries(days)) {
     const bucket: HistoryRecord['days'][string] = {}
@@ -144,7 +148,7 @@ export function addRunsToDays(days: HistoryRecord['days'], runs: readonly Run[])
     out[day] = bucket
   }
   // every member is an op on its own end day; a group's spend counts once, on the day of its first member
-  const spends = spendOnce()
+  const spends = spendOnce(deferred)
   for (const run of runs) {
     const bucket = (out[utcDay(run.endedAt ?? run.startedAt)] ??= {})
     addToBuckets(key => (bucket[key] ??= emptyCounters()) as Counters, run, spends(run))

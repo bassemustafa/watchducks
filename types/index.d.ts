@@ -61,6 +61,8 @@ export type Run = {
   sharedKey?: string
   /** How many runs share `sharedKey`. */
   sharedSize?: number
+  /** Set when a relay result reported the cost: no adapter replaces that cost, whether or not the result carried usage. */
+  costLocked?: 'relay'
   /** A Claude child's whole spend by implementer × model, at most 32. */
   rows?: Array<{ implementer: Implementer; model: string; usage: Usage; cost: number | null; costSource: 'reported' | 'estimated' | null }>
 }
