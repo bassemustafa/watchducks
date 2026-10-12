@@ -26,7 +26,7 @@ function statusOf(v: unknown): RunStatus {
   return typeof v === 'string' && Object.hasOwn(STATUS, v) ? STATUS[v]! : 'ended'
 }
 
-function ident(v: unknown): string | undefined {
+export function ident(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 && v.length <= MAX_IDENT && IDENT.test(v) ? v : undefined
 }
 
