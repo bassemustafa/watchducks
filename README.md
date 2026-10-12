@@ -53,7 +53,9 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
 🦆 FLOCK  ▸ 2 in field · 3 debriefed · 1 dark   412k tok · 61% cache · $1.84   /flock
 ```
 
-<!-- screenshots: added after the v0.1 smoke test -->
+| Terminal | Desktop app |
+|---|---|
+| <img src=".github/media/terminal.png" alt="The flock sidebar in the terminal: duck and radar, counters, signal, and two relay cards, a claude relay and an opencode relay, both debriefed with reported costs" width="380"> | <img src=".github/media/desktop.png" alt="The flock sidebar in the desktop app: vector header with radar, counters, signal bars, a background shell in field and a debriefed subagent" width="380"> |
 
 ## Per run
 
