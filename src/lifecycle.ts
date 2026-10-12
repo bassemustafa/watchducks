@@ -29,7 +29,7 @@ import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, recordsHeadless } from './
 import { ROSTER_SPEC, VERDICT_SPEC } from './tools'
 import { blipsFor, radar } from './ui/animate'
 import { fmtCost } from './ui/format'
-import { STAMP_MS, dotFrame, dotRaster, duckPoseAt, motion, stampFrame, stampRaster } from './ui/motion'
+import { BURST_MS, STAMP_MS, TICK_MS, dotFrame, dotRaster, duckPoseAt, motion, stampFrame, stampRaster, tickerValue } from './ui/motion'
 import { duckLogo, radarFrame } from './ui/raster'
 import { glyphs, statusWords } from './ui/theme'
 
@@ -50,6 +50,7 @@ let saveTimer: Timer | undefined
 let relayTimer: Timer | undefined
 let watchTimer: Timer | undefined
 let animTimer: Timer | undefined
+let burstTimer: Timer | undefined
 let pollingAgents = false
 let pollingRelays = false
 
@@ -62,6 +63,9 @@ function stopTimers(): void {
   relayTimer?.cancel()
   watchTimer?.cancel()
   animTimer?.cancel()
+  burstTimer?.cancel()
+  burstTimer = undefined
+  motion.tickers = {}
   watchTimer = undefined
   animTimer = undefined
   agentTimer = undefined
@@ -510,6 +514,35 @@ let watchCount = 0
 let seenGeneration = -1
 let seenSession = ''
 const seenStatus = new Map<string, string>()
+// the totals each running card last had, so a change counts up from there
+const seenTotals = new Map<string, { tokens: number; cost: number | null }>()
+
+/** One redraw timer for all count-ups (at most ~15 redraws a second); it stops itself when the last ticker has finished. */
+function startBurst($: EngineInterface): void {
+  if (burstTimer) return
+  burstTimer = $.clock.every(BURST_MS, () => {
+    const now = Date.now()
+    for (const [id, t] of Object.entries(motion.tickers)) if (now - t.startedAt >= TICK_MS) delete motion.tickers[id]
+    $.ui.invalidate('ui.render')
+    if (Object.keys(motion.tickers).length === 0) stopBurst()
+  })
+}
+
+function stopBurst(): void {
+  burstTimer?.cancel()
+  burstTimer = undefined
+}
+
+/** Compare a running run's totals with the last seen ones and (re)start its count-up; true when a ticker was set. */
+function trackTotals(run: Run, now: number): boolean {
+  const tokens = run.usage ? run.usage.uncached + run.usage.output + run.usage.cacheRead + run.usage.cacheWrite : 0
+  const prev = seenTotals.get(run.id)
+  seenTotals.set(run.id, { tokens, cost: run.cost })
+  if (!prev || (prev.tokens === tokens && prev.cost === run.cost)) return false
+  const shown = Object.hasOwn(motion.tickers, run.id) ? tickerValue(motion.tickers[run.id]!, now) : { tokens: prev.tokens, cost: prev.cost ?? 0 }
+  motion.tickers[run.id] = { fromTokens: shown.tokens, toTokens: tokens, fromCost: shown.cost, toCost: run.cost ?? shown.cost, startedAt: now }
+  return true
+}
 let historyPending = false
 // history saves run one at a time; a change that arrives while one is in flight is saved right after it
 let saving = false
@@ -522,6 +555,8 @@ function seed(l: Ledger): void {
   seenSession = l.sessionId
   motion.seed = fnv1a(l.sessionId)
   seenStatus.clear()
+  seenTotals.clear()
+  motion.tickers = {}
   for (const id of l.order) {
     const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
     if (!run) continue
@@ -656,6 +691,15 @@ async function watchTick($: EngineInterface, options: PluginOptions): Promise<vo
           $.ui.toast(`${g.duck} ${run.codename} ${statusWords(run.status).spy.toLowerCase()} · ${fmtCost(run.cost, run.costSource, run.costPartial)}`)
         }
       }
+    }
+
+    if (options.motion !== 'off') {
+      let ticking = false
+      for (const id of l.order) {
+        const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
+        if (run && run.status === 'running' && trackTotals(run, now)) ticking = true
+      }
+      if (ticking) startBurst($)
     }
 
     // any change to the stored record (a status, relay usage or cost arriving late, a replaced verdict) schedules one save

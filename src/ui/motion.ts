@@ -6,6 +6,8 @@ export type StampKind = 'done' | 'failed' | 'killed'
 export const TICK_MS = 600
 export const STAMP_MS = 1500
 export const BREATH_MS = 1600
+/** Period of the redraw burst while a ticker runs: 1000 / 67 stays under 15 redraws a second. */
+export const BURST_MS = 67
 
 const REVEAL_MS = 1000
 const BLINK_MS = 150
@@ -25,6 +27,9 @@ const STAMP_COLOR: Record<StampKind, number> = {
   killed: hex(PALETTE.ended),
 }
 
+/** One card's count-up: tokens and dollars from what was shown to the new ledger value, started at `startedAt`. */
+export type Ticker = { fromTokens: number; toTokens: number; fromCost: number; toCost: number; startedAt: number }
+
 /** What the terminal pane render and the animation timer hand to each other; never persisted. Reset on every pane render. */
 export const motion: {
   /** Run ids of the running-card dots (`dot:<id>`) the last terminal pane render mounted. */
@@ -34,7 +39,15 @@ export const motion: {
   duckMounted: boolean
   /** Per-session duck seed, fnv1a(sessionId). */
   seed: number
-} = { dots: [], stamps: {}, duckMounted: false, seed: 0 }
+  /** Running count-ups by run id; set by the watch tick, read by the card render, never reset by a render. */
+  tickers: Record<string, Ticker>
+} = { dots: [], stamps: {}, duckMounted: false, seed: 0, tickers: {} }
+
+/** The figures a ticker shows at `now`: tokens as an integer, cost in dollars (tweened in micro-dollars so cents move). */
+export function tickerValue(t: Ticker, now: number): { tokens: number; cost: number } {
+  const p = (now - t.startedAt) / TICK_MS
+  return { tokens: tween(t.fromTokens, t.toTokens, p), cost: tween(t.fromCost * 1e6, t.toCost * 1e6, p) / 1e6 }
+}
 
 /** The stamp text as one row of cells; characters past `visible` are blank. */
 export function stampRaster(runId: string, kind: StampKind, progress: number): RasterSpec {

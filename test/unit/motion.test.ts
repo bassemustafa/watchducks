@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { dotFrame, duckFrame, duckPoseAt, stampFrame, stampRaster, tween } from '../../src/ui/motion'
+import { BURST_MS, TICK_MS, dotFrame, duckFrame, duckPoseAt, stampFrame, stampRaster, tickerValue, tween } from '../../src/ui/motion'
 import { duckLogo, duckPixels, duckPose } from '../../src/ui/raster'
 
 const SHADES = [0xfbbf24, 0xf59e0b, 0xd97706, 0xb45309]
@@ -146,3 +146,18 @@ test('duckPoseAt on a 200 ms tick never misses a blink', () => {
   }
 })
 
+
+test('tickerValue counts tokens and dollars up over TICK_MS and holds the end', () => {
+  const t = { fromTokens: 1000, toTokens: 11000, fromCost: 0.1, toCost: 0.5, startedAt: 5000 }
+  expect(tickerValue(t, 5000)).toEqual({ tokens: 1000, cost: 0.1 })
+  const mid = tickerValue(t, 5300)
+  expect(mid.tokens).toBe(1000 + Math.round(10000 * 0.875))
+  expect(Math.abs(mid.cost - (0.1 + 0.4 * 0.875))).toBeLessThan(1e-6)
+  expect(tickerValue(t, 5000 + TICK_MS)).toEqual({ tokens: 11000, cost: 0.5 })
+  expect(tickerValue(t, 99999)).toEqual({ tokens: 11000, cost: 0.5 })
+  expect(tickerValue(t, 1)).toEqual({ tokens: 1000, cost: 0.1 })
+})
+
+test('the redraw burst stays within 15 redraws a second', () => {
+  expect(Math.floor(1000 / BURST_MS)).toBeLessThanOrEqual(15)
+})

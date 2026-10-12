@@ -472,3 +472,54 @@ test('motion off keeps the running dot as Text', { options: { motion: 'off' } },
   await $.tool.call(RELAY_CALL as never)
   expect(await view($, 'terminal', 52)).not.toContain('"key":"dot:')
 })
+
+function spin(ms: number): void {
+  const end = Date.now() + ms
+  for (let i = 0; i < 5e7 && Date.now() < end; i++) {
+    // wait
+  }
+}
+
+// A running agent whose second step adds 10k tokens; the watch tick that sees it starts the count-up.
+async function tickedWorld($: Engine, on: On) {
+  on('command.register', async () => ({ value: { command: 'flock' } }))
+  on('session.id', async () => ({ value: 'S1' }))
+  on('session.start', async ($, e) => ({ cwd: e.cwd }))
+  on('agent.spawn', async () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+  on('turn.complete', async () => ({ text: '' }))
+  on('ui.panes', async () => ({ value: [] }))
+  let steps = 0
+  on('turn.step', async function* ($, e) {
+    // each answer names the step it answers; a repeated (turn, index) would be dropped as a replay
+    const input = steps++ === 0 ? 200000 : 10000
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: { ...BIG_USAGE, input_tokens: input, output_tokens: steps === 1 ? 20000 : 0 } } as never
+  })
+  mock.store(on)
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/work', surface: null, isInteractive: true })
+  await stepAgent($)
+  await clock.advance(600) // the first watch tick records 220k
+  for await (const _ of $.turn.step({ agentId: 'a1', turnId: 't1', index: 1, model: 'claude-sonnet-5-5', effort: 'high' } as never)) {
+    /* chunks are never read */
+  }
+  await clock.advance(600) // the next one sees 230k and starts the count-up
+  return clock
+}
+
+test('the terminal card counts up to a new token total and settles on it', async ($, on) => {
+  await tickedWorld($, on)
+  spin(200)
+  const mid = await view($, 'terminal', 52)
+  expect(mid).toMatch(/22[1-9]k tok/)
+  expect(mid).not.toContain('230k tok')
+  spin(500)
+  const done = await view($, 'terminal', 52)
+  expect(done).toContain('230k tok')
+})
+
+test('the desktop card shows the final token total at once', async ($, on) => {
+  await tickedWorld($, on)
+  const text = await view($, 'desktop', 52)
+  expect(text).toContain('230k tok')
+  expect(text).not.toMatch(/22[1-9]k tok/)
+})

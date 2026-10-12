@@ -8,7 +8,7 @@ import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord } from '../state'
 import { RADAR_FULL, RADAR_SMALL, blipsFor, radar, svgBlipsFor } from './animate'
 import { codenameOf, dossierView, fit, runCost, runElapsed, runTokens, totalTokens, type Glyphs, type Press, type Table } from './dossier'
 import { cachePct, fmtCost, fmtDuration, fmtElapsedCoarse, fmtTokens, sparkline } from './format'
-import { STAMP_MS, STAMP_TEXT, dotFrame, dotRaster, motion as motionState, stampRaster, type StampKind } from './motion'
+import { STAMP_MS, STAMP_TEXT, TICK_MS, dotFrame, dotRaster, motion as motionState, stampRaster, tickerValue, type StampKind } from './motion'
 import { duckLogo, gradientBar, hex, radarFrame, type RasterSpec } from './raster'
 import { stationView } from './station'
 import { BAR_HEIGHT, barSvg, barWidth, headerHeight, headerSvg, headerWidth } from './svg'
@@ -343,7 +343,12 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
     line2 = <Text color={PALETTE.handler}>{fit(`suspected handler? ${codenameOf(ledger, id)}`, inner)}</Text>
   } else {
     const status = `${words.spy} · ${words.plain}`
-    const figures = [(coarse && run.status === 'running' ? fmtElapsedCoarse : fmtDuration)(runElapsed(run, now)), `${runTokens(run)} tok`, runCost(run)]
+    // the terminal counts up while a ticker runs; the desktop and motion off always show the ledger value
+    const tick = stampTable && run.status === 'running' && Object.hasOwn(motionState.tickers, run.id) ? motionState.tickers[run.id] : undefined
+    const live = tick && now - tick.startedAt < TICK_MS ? tickerValue(tick, now) : undefined
+    const tokens = live ? fmtTokens(live.tokens) : runTokens(run)
+    const cost = live && run.cost !== null ? fmtCost(live.cost, run.costSource, run.costPartial) : runCost(run)
+    const figures = [(coarse && run.status === 'running' ? fmtElapsedCoarse : fmtDuration)(runElapsed(run, now)), `${tokens} tok`, cost]
     const whole = `${status}   ${figures.join('   ')}`
     // too long for one line: the status keeps its own line, the figures wrap whole so tokens and cost never get cut
     const lines = Array.from(whole).length <= inner ? [whole] : [fit(status, inner), ...packFigures(figures, inner)]
