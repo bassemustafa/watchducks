@@ -8,7 +8,8 @@ import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord } from '../state'
 import { RADAR_FULL, RADAR_SMALL, blipsFor, radar, svgBlipsFor } from './animate'
 import { codenameOf, dossierView, fit, runCost, runElapsed, runTokens, totalTokens, type Glyphs, type Press, type Table } from './dossier'
 import { cachePct, fmtCost, fmtDuration, fmtElapsedCoarse, fmtTokens, sparkline } from './format'
-import { duckLogo, gradientBar, hex, radarFrame, type RasterSpec } from './raster'
+import { STAMP_MS, STAMP_TEXT, stampFrame, type StampKind } from './motion'
+import { DEFAULT_COLOR, duckLogo, encodeCells, gradientBar, hex, radarFrame, type RasterSpec } from './raster'
 import { stationView } from './station'
 import { BAR_HEIGHT, barSvg, barWidth, headerHeight, headerSvg, headerWidth } from './svg'
 import { PALETTE, glyphs, statusColor, statusWords } from './theme'
@@ -54,7 +55,24 @@ function raster(spec: RasterSpec): { key: string; columns: number; rows: number;
   return { key: spec.key, columns: spec.columns, rows: spec.rows, cells: spec.cells }
 }
 
-type Layout = { columns: number; inner: number; tier: 'full' | 'mid' | 'compact'; g: Glyphs; showOverhead: boolean; coarse: boolean }
+/** The stamp text as one row of cells; characters past `visible` are blank. Drawn at progress 0 until the animation timer blits the reveal. */
+function stampRaster(runId: string, kind: StampKind, progress: number): RasterSpec {
+  const { visible, color } = stampFrame(progress, kind)
+  const chars = Array.from(STAMP_TEXT[kind])
+  const cells = chars.map((ch, i): [number, number, number] => (i < visible ? [ch.codePointAt(0) ?? 0x20, color, DEFAULT_COLOR] : [0x20, DEFAULT_COLOR, DEFAULT_COLOR]))
+  return { key: `stamp:${runId}`, columns: chars.length, rows: 1, cells: encodeCells(cells) }
+}
+
+type Layout = {
+  columns: number
+  inner: number
+  tier: 'full' | 'mid' | 'compact'
+  g: Glyphs
+  showOverhead: boolean
+  coarse: boolean
+  /** The terminal element table when stamps may animate; null on the desktop and with motion off. */
+  stampTable: Elements['terminal'] | null
+}
 
 /** What the surface-specific part of the field view contributes. */
 type Art = { header: El; cacheBar: El; spendBar: El | null }
@@ -289,7 +307,17 @@ function packFigures(parts: readonly string[], width: number): string[] {
   return lines.map(line => fit(line, width))
 }
 
-function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g: Glyphs, stamped: boolean, press: Press, coarse: boolean): El {
+function hexOf(kind: StampKind): string {
+  return kind === 'done' ? PALETTE.done : kind === 'failed' ? PALETTE.failed : PALETTE.ended
+}
+
+function stampOf(ui: UiState, runId: string, now: number): { kind: StampKind; progress: number } | undefined {
+  const s = ui.stamps && Object.hasOwn(ui.stamps, runId) ? ui.stamps[runId] : undefined
+  // the progress a redraw shows; the animation timer reveals the rest between redraws
+  return s && s.until > now ? { kind: s.kind, progress: 1 - (s.until - now) / STAMP_MS } : undefined
+}
+
+function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g: Glyphs, stamp: { kind: StampKind; progress: number } | undefined, stampTable: Elements['terminal'] | null, press: Press, coarse: boolean): El {
   const { Box, Text, Button } = t
   const color = statusColor(run.status)
   const words = statusWords(run.status)
@@ -298,12 +326,17 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
 
   const review = run.reviews.length > 0 ? run.reviews[run.reviews.length - 1] : undefined
   let line2: El
-  if (stamped) {
-    line2 = (
-      <Text bold color={PALETTE.done}>
-        {'✦ DEBRIEFED ✦'}
-      </Text>
-    )
+  if (stamp) {
+    if (stampTable) {
+      const Raster = stampTable.Raster
+      line2 = <Raster {...raster(stampRaster(run.id, stamp.kind, stamp.progress))} />
+    } else {
+      line2 = (
+        <Text bold color={hexOf(stamp.kind)}>
+          {STAMP_TEXT[stamp.kind]}
+        </Text>
+      )
+    }
   } else if (run.status !== 'running' && review) {
     line2 = (
       <Text color={PALETTE.handler}>
@@ -348,7 +381,6 @@ function fieldView(
   const runs = orderedRuns(ledger)
   const delegated = totalTokens(tot.usage) ?? 0
   const series = sparkline(seriesWindow(ledger, now, 30), Math.min(15, Math.max(4, inner - LABEL - 2)))
-  const stampId = ui.stamp && ui.stamp.until > now ? ui.stamp.runId : undefined
   const parts = spendParts(tot)
 
   const kv = (label: string, value: string, color?: string) => (
@@ -408,7 +440,7 @@ function fieldView(
       {runs.length === 0 && <Text dimColor>No operatives yet — the flock is watching.</Text>}
       {runs.map((run, i) => (
         <Box flexDirection="column" key={'card:' + run.id} marginBottom={i === runs.length - 1 ? 0 : 1}>
-          {card(t, ledger, run, now, inner, g, run.id === stampId, press, lay.coarse)}
+          {card(t, ledger, run, now, inner, g, stampOf(ui, run.id, now), lay.stampTable, press, lay.coarse)}
         </Box>
       ))}
     </Box>
@@ -444,7 +476,7 @@ export function registerSidebar(on: On, options: PluginOptions): void {
     const now = Date.now()
     const columns = e.props.bodyColumns > 0 ? e.props.bodyColumns : e.viewport?.columns && e.viewport.columns > 0 ? e.viewport.columns : DEFAULT_COLUMNS
     const tier = columns >= 48 ? 'full' : columns >= 36 ? 'mid' : 'compact'
-    const lay: Layout = { columns, inner: Math.max(16, columns - PAD * 2), tier, g, showOverhead, coarse: e.surface === 'desktop' }
+    const lay: Layout = { columns, inner: Math.max(16, columns - PAD * 2), tier, g, showOverhead, coarse: e.surface === 'desktop', stampTable: e.surface === 'terminal' && motion ? $.ui.resolve(e) : null }
     const press: Press = patch => void update($, uiAtom, u => ({ ...u, ...patch })).catch(() => undefined)
     radar.mounted = null
 

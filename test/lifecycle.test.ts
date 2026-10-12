@@ -1,7 +1,7 @@
 import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
-import type { Ledger } from '../types'
+import type { Ledger, UiState } from '../types'
 import { utcDay } from '../src/history'
 import { emptyLedger } from '../src/ledger'
 import { INITIAL_UI } from '../src/state'
@@ -40,7 +40,13 @@ function memoryStore(on: On): Map<string, unknown> {
 }
 
 // The world beneath the plugin for a session: ids, surfaces, a store and a clock.
-function world(on: On, surfaces: readonly string[], sessionId: () => string = () => 'S1', surfacesGate: () => Promise<void> = async () => {}) {
+function world(
+  on: On,
+  surfaces: readonly string[],
+  sessionId: () => string = () => 'S1',
+  surfacesGate: () => Promise<void> = async () => {},
+  agentId: () => string = () => 'l1',
+) {
   on('command.register', async () => ({ value: { command: 'flock' } }))
   on('tool.register', async () => ({ value: { tool: 'mcp__watchducks__x' } }))
   on('session.id', async () => ({ value: sessionId() }))
@@ -51,7 +57,7 @@ function world(on: On, surfaces: readonly string[], sessionId: () => string = ()
   })
   on('session.start', async ($, e) => ({ cwd: e.cwd }))
   on('session.end', async () => ({ sessionId: 'S1' }))
-  on('agent.spawn', async () => ({ model: 'claude-sonnet-5-5', agentId: 'l1' }))
+  on('agent.spawn', async () => ({ model: 'claude-sonnet-5-5', agentId: agentId() }))
   on('tool.call', { tool: 'Bash' }, async () => ({ result: { backgroundTaskId: 't2' } }) as never)
   mock.env(on, {})
   return { store: memoryStore(on), clock: mock.clock(on) }
@@ -246,4 +252,26 @@ test('a new session id resets the UI atom; a same-id reload leaves it', async ($
   await $.session.end({ reason: 'clear', sessionId: 'S2', resume: { id: 'S2' } })
   expect(writes.length).toBe(first + 2)
   expect(writes[writes.length - 1]).toEqual(INITIAL_UI)
+})
+
+test('runs ending in one tick each get a stamp entry and each entry clears on its own', async ($, on) => {
+  let n = 0
+  const { clock } = world(on, ['terminal'], undefined, undefined, () => `m${++n}`)
+  let latest: UiState = INITIAL_UI
+  on('state.set', { plugin: 'watchducks', key: 'ui' }, async ($, e, next) => {
+    latest = e.value as UiState
+    return next(e)
+  })
+  on('turn.complete', async () => ({ text: '' }))
+  await $.session.start(START)
+  await $.agent.spawn({ subagentType: 'Explore' } as never)
+  await $.agent.spawn({ subagentType: 'Explore' } as never)
+  await clock.advance(100)
+  await $.turn.complete({ agentId: 'm1', turnId: 't1', reason: 'answer', answer: '', durationMs: 1, isAborted: false } as never)
+  await $.turn.complete({ agentId: 'm2', turnId: 't2', reason: 'aborted', answer: '', durationMs: 1, isAborted: true } as never)
+  await clock.advance(600)
+  expect(latest.stamps?.['m1']?.kind).toBe('done')
+  expect(latest.stamps?.['m2']?.kind).toBe('killed')
+  await clock.advance(1600)
+  expect(latest.stamps).toBeUndefined()
 })

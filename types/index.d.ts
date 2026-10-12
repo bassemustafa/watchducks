@@ -90,8 +90,8 @@ export type UiState = {
   /** True once the person closed the sidebar this session: no more auto-open. */
   closedByPerson: boolean
   autoOpened: boolean
-  /** A DEBRIEFED stamp shown on one card until `until` (epoch ms). */
-  stamp?: { runId: string; until: number }
+  /** Debrief stamps by run id, each shown on its card until `until` (epoch ms); at most 16, oldest dropped. */
+  stamps?: Record<string, { kind: 'done' | 'failed' | 'killed'; until: number }>
 }
 
 /** What the Bash classifier extracts (spec §6.2); never the raw command. */

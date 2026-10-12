@@ -28,6 +28,7 @@ import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, recordsHeadless } from './
 import { ROSTER_SPEC, VERDICT_SPEC } from './tools'
 import { blipsFor, radar } from './ui/animate'
 import { fmtCost } from './ui/format'
+import { STAMP_MS } from './ui/motion'
 import { radarFrame } from './ui/raster'
 import { glyphs, statusWords } from './ui/theme'
 
@@ -499,7 +500,6 @@ async function saveWhileActive($: EngineInterface, options: PluginOptions): Prom
 
 const WATCH_MS = 500
 const ANIM_MS = 200
-const STAMP_MS = 1500
 const HISTORY_DELAY_MS = 2000
 const PANE = 'flock'
 
@@ -572,9 +572,13 @@ async function saveHistory($: EngineInterface, options: PluginOptions, force: bo
 async function clearStamp($: EngineInterface, runId: string): Promise<void> {
   try {
     await update($, uiAtom, u => {
-      if (u.stamp?.runId !== runId) return u
-      const { stamp: _stamp, ...rest } = u
-      return rest
+      if (!u.stamps || !Object.hasOwn(u.stamps, runId)) return u
+      const { [runId]: _gone, ...left } = u.stamps
+      if (Object.keys(left).length === 0) {
+        const { stamps: _stamps, ...rest } = u
+        return rest
+      }
+      return { ...u, stamps: left }
     })
   } catch {
     // a stale stamp is ignored by the render once its time has passed
@@ -621,8 +625,13 @@ async function watchTick($: EngineInterface, options: PluginOptions): Promise<vo
         const before = seenStatus.get(id)
         if (before === run.status) continue
         seenStatus.set(id, run.status)
-        if (run.status === 'done') {
-          await update($, uiAtom, u => ({ ...u, stamp: { runId: id, until: now + STAMP_MS } }))
+        if (run.status === 'done' || run.status === 'failed' || run.status === 'killed') {
+          const kind = run.status
+          await update($, uiAtom, u => {
+            const next = Object.entries({ ...(u.stamps ?? {}), [id]: { kind, until: now + STAMP_MS } })
+            const kept = next.sort((a, b) => a[1].until - b[1].until).slice(-16)
+            return { ...u, stamps: Object.fromEntries(kept) }
+          })
           $.clock.after(STAMP_MS, () => void clearStamp($, id))
         }
         if (run.status !== 'running' && (before === undefined || before === 'running') && options.notify === 'on') {

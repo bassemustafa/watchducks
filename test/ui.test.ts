@@ -161,9 +161,60 @@ test('a run that turns done is stamped for 1.5 s and the stamp then clears', asy
   await clock.advance(600)
   await $.turn.complete({ agentId: 'a1', turnId: 't1', reason: 'answer', answer: '', durationMs: 1, isAborted: false } as never)
   await clock.advance(600)
-  expect(state().stamp?.runId).toBe('a1')
+  expect(state().stamps?.['a1']?.kind).toBe('done')
   await clock.advance(1600)
-  expect(state().stamp).toBeUndefined()
+  expect(state().stamps).toBeUndefined()
+})
+
+// Two agents that end in the same watch tick: a1 answers, a2 errors.
+async function endTwo(on: On, ui: Engine) {
+  let n = 0
+  on('command.register', async () => ({ value: { command: 'flock' } }))
+  on('session.id', async () => ({ value: 'S1' }))
+  on('session.start', async ($, e) => ({ cwd: e.cwd }))
+  on('agent.spawn', async () => ({ model: 'claude-sonnet-5-5', agentId: `a${++n}` }))
+  on('turn.complete', async () => ({ text: '' }))
+  on('ui.panes', async () => ({ value: [] }))
+  mock.store(on)
+  const clock = mock.clock(on)
+  await ui.session.start({ cwd: '/work', surface: null, isInteractive: true })
+  await ui.agent.spawn({ subagentType: 'Explore' } as never)
+  await ui.agent.spawn({ subagentType: 'Explore' } as never)
+  await clock.advance(100)
+  await ui.turn.complete({ agentId: 'a1', turnId: 't1', reason: 'answer', answer: '', durationMs: 1, isAborted: false } as never)
+  await ui.turn.complete({ agentId: 'a2', turnId: 't2', reason: 'error', answer: '', durationMs: 1, isAborted: false } as never)
+  await clock.advance(600)
+  return clock
+}
+
+test('two runs ending in one tick each get a raster stamp on the terminal', async ($, on) => {
+  await endTwo(on, $)
+  const text = await view($, 'terminal', 52)
+  expect(text).toContain('"key":"stamp:a1"')
+  expect(text).toContain('"key":"stamp:a2"')
+})
+
+test('two runs ending in one tick each show a stamp text on the desktop; a failed run reads WENT DARK', async ($, on) => {
+  await endTwo(on, $)
+  const text = await view($, 'desktop', 52)
+  expect(text).toContain('✦ DEBRIEFED ✦')
+  expect(text).toContain('✕ WENT DARK ✕')
+  expect(text).not.toContain('Raster')
+})
+
+test('both stamps are gone once STAMP_MS has passed', async ($, on) => {
+  const clock = await endTwo(on, $)
+  await clock.advance(1600)
+  const text = await view($, 'terminal', 52)
+  expect(text).not.toContain('stamp:')
+})
+
+test('motion off draws the stamp as Text, not a stamp raster', { options: { motion: 'off' } }, async ($, on) => {
+  await endTwo(on, $)
+  const text = await view($, 'terminal', 52)
+  expect(text).not.toContain('stamp:')
+  expect(text).toContain('✦ DEBRIEFED ✦')
+  expect(text).toContain('✕ WENT DARK ✕')
 })
 
 // ---- batch B: review findings
