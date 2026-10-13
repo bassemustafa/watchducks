@@ -84,14 +84,17 @@ let burstTimer: Timer | undefined
 let pollingAgents = false
 let pollingRelays = false
 
+// bumped by stopTimers: an end step that finds it moved on knows a new session started while it waited
+let timersTurn = 0
+
 function stopTimers(): void {
   discoveryPolls = 0
   discoveryGeneration = -1 // the next pass starts with nothing remembered
   resetDiscovery()
+  timersTurn += 1
   statsTimer?.cancel()
   statsTimer = undefined
-  statsBusy = false
-  resetStats()
+  resetStats() // a process call in flight keeps its lock until it returns, then sees its epoch changed
   resetChild()
   reportsTimer?.cancel()
   reportsTimer = undefined
@@ -550,13 +553,20 @@ type StatsAcc = {
   approx: boolean
   shared: number
   allocated: boolean
+  folder: string
+  run: FolderRun
+  /** The ledger cleared the run (ended) before its last interval: it stays a member of that interval, unpaid. */
+  gone?: boolean
   sent?: { usage: Usage; cost: number; approx: boolean; shared: number }
 }
 type StatsFolder = { key: string; cwd: string; runs: Run[] }
 
 let statsTimer: Timer | undefined
-let statsBusy = false
+// single flight: whoever runs the process holds the lock and releases only its own; a session change does not release it
+let statsOwner: object | undefined
 let statsInflight: Promise<void> | undefined
+// set when the session is ending: a tick starts no further process
+let statsStopping = false
 // session-wide: the failure breaker does not reset with /flock clear
 let statsFailures = 0
 let statsSession = ''
@@ -568,9 +578,13 @@ const statsAcc = new Map<string, StatsAcc>()
 // per folder with pending runs, at most STATS_MAX_FOLDERS: the last snapshot, and when the process was last called
 const statsShots = new Map<string, StatsSnapshot>()
 const statsCalled = new Map<string, number>()
+// runs given their last interval: they never re-enter, even if their end moves later (ids the ledger still has)
+const statsFinalized = new Set<string>()
 
 function resetStats(): void {
   statsEpoch += 1
+  statsStopping = false
+  statsFinalized.clear()
   statsFailures = 0
   statsSession = ''
   statsGeneration = -1
@@ -589,8 +603,16 @@ function syncStatsSession(l: Ledger): void {
   }
   if (l.generation === statsGeneration) return
   statsGeneration = l.generation
-  for (const id of [...statsAcc.keys()]) if (!Object.hasOwn(l.runs, id)) statsAcc.delete(id)
+  // a clear removes only runs that ended; one that ended after the last look has no end time here, so the clear is it
+  const at = Date.now()
+  for (const acc of statsAcc.values()) {
+    if (Object.hasOwn(l.runs, acc.run.id)) continue
+    acc.gone = true
+    acc.run = { ...acc.run, endedAt: acc.run.endedAt ?? at }
+  }
 }
+
+const folderRun = (run: Run): FolderRun => ({ id: run.id, model: run.model, startedAt: run.startedAt, endedAt: run.endedAt })
 
 const isOpencode = (run: Run): boolean => run.implementer === 'opencode' && (run.kind === 'cli' || run.kind === 'relay')
 
@@ -629,9 +651,10 @@ async function takeStats($: EngineInterface, cwd: string, timeoutMs: number): Pr
  */
 function statsFolders(l: Ledger, root: string | undefined, now: number): Map<string, StatsFolder> {
   const folders = new Map<string, StatsFolder>()
+  for (const id of [...statsFinalized]) if (!Object.hasOwn(l.runs, id)) statsFinalized.delete(id)
   for (const id of l.order) {
     const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
-    if (!run || !statsCandidate(run, now)) continue
+    if (!run || statsFinalized.has(id) || !statsCandidate(run, now)) continue
     const cwd = run.workdir ?? root
     if (cwd === undefined) continue
     if (run.workdir === undefined && run.workdirKey !== undefined && run.workdirKey !== workdirKey(cwd)) continue
@@ -640,9 +663,13 @@ function statsFolders(l: Ledger, root: string | undefined, now: number): Map<str
       const shot = statsShots.get(key)
       if (shot === undefined || run.endedAt === undefined || shot.at >= run.endedAt) continue
     }
-    if (!statsAcc.has(id)) {
+    const acc = statsAcc.get(id)
+    if (acc) {
+      acc.folder = key
+      acc.run = folderRun(run)
+    } else {
       if (statsAcc.size >= STATS_MAX_RUNS) continue
-      statsAcc.set(id, { usage: { ...ZERO_USAGE }, cost: 0, approx: false, shared: 1, allocated: false })
+      statsAcc.set(id, { usage: { ...ZERO_USAGE }, cost: 0, approx: false, shared: 1, allocated: false, folder: key, run: folderRun(run) })
     }
     const folder = folders.get(key)
     if (folder) folder.runs.push(run)
@@ -696,8 +723,10 @@ async function applyStats(
   }
   statsShots.set(key, cur)
   const given = new Map<string, Allocation>()
+  // runs the ledger cleared before their last interval still take their part of it, so no neighbour absorbs it
+  const ghosts = [...statsAcc].filter(([, a]) => a.gone && a.folder === key)
   if (prev !== undefined) {
-    const runs: FolderRun[] = folder.runs.map(r => ({ id: r.id, model: r.model, startedAt: r.startedAt, endedAt: r.endedAt }))
+    const runs: FolderRun[] = [...folder.runs.map(folderRun), ...ghosts.map(([, a]) => a.run)]
     for (const a of allocate(prev, cur, runs)) given.set(a.id, a)
   }
 
@@ -746,15 +775,19 @@ async function applyStats(
   }
   if (epoch !== statsEpoch) return
   if (applied) for (const [acc, sent] of sending) acc.sent = sent
-  for (const id of finished) statsAcc.delete(id)
-  if (folder.runs.every(r => finished.includes(r.id))) statsShots.delete(key)
+  for (const id of finished) {
+    statsAcc.delete(id)
+    statsFinalized.add(id)
+  }
+  for (const [id, acc] of ghosts) if (acc.run.endedAt === undefined || cur.at >= acc.run.endedAt) statsAcc.delete(id)
 }
 
 const totalOf = (u: Usage): number => u.uncached + u.output + u.cacheRead + u.cacheWrite
 
 async function statsTick($: EngineInterface, table: PriceTable, options: PluginOptions): Promise<void> {
-  if (statsBusy || options.opencodeStats !== 'on') return
-  statsBusy = true
+  if (statsOwner || options.opencodeStats !== 'on') return
+  const me = {}
+  statsOwner = me
   const work = (async (): Promise<void> => {
     try {
       const seen = await read($, ledgerAtom)
@@ -765,13 +798,18 @@ async function statsTick($: EngineInterface, table: PriceTable, options: PluginO
       // the engine's clock paces the snapshots; run times are wall-clock like the rest of the ledger
       const clockNow = await $.clock.now()
       if (epoch !== statsEpoch) return
-      const folders = statsFolders(seen, root, Date.now())
+      const now = Date.now()
+      const folders = statsFolders(seen, root, now)
       const pending = new Set<string>()
       for (const folder of folders.values()) for (const run of folder.runs) pending.add(run.id)
-      for (const id of [...statsAcc.keys()]) if (!pending.has(id)) statsAcc.delete(id)
+      for (const [id, acc] of [...statsAcc]) {
+        const stale = acc.gone ? !folders.has(acc.folder) || now - (acc.run.endedAt ?? 0) >= POLL_GRACE_MS : !pending.has(id)
+        if (stale) statsAcc.delete(id)
+      }
       for (const key of [...statsShots.keys()]) if (!folders.has(key)) statsShots.delete(key)
       for (const [key, at] of [...statsCalled]) if (clockNow - at >= STATS_EVERY_MS - STATS_SLACK_MS) statsCalled.delete(key)
       for (const folder of statsOrder(folders)) {
+        if (statsStopping) return // the session is ending: its exit step takes the last snapshots
         // one call per folder per pace, never more; a folder past the cap waits for room
         if (statsCalled.has(folder.key) || statsCalled.size >= STATS_MAX_FOLDERS) continue
         if (!statsShots.has(folder.key) && statsShots.size >= STATS_MAX_FOLDERS) continue
@@ -794,7 +832,7 @@ async function statsTick($: EngineInterface, table: PriceTable, options: PluginO
     } catch {
       // the next tick tries again
     } finally {
-      statsBusy = false
+      if (statsOwner === me) statsOwner = undefined
     }
   })()
   statsInflight = work
@@ -802,46 +840,79 @@ async function statsTick($: EngineInterface, table: PriceTable, options: PluginO
   if (statsInflight === work) statsInflight = undefined
 }
 
+/** What the end hook knows of the session it is ending, taken before it awaits anything. */
+type StatsExit = { sessionId: string; epoch: number; deadline: number }
+
+/**
+ * The first thing the end hook does: remembers which session and epoch are ending and when the whole step must be over,
+ * and tells ticks to start no further process. Nothing here awaits.
+ */
+function beginStatsExit(): StatsExit {
+  statsStopping = true
+  return { sessionId: statsSession, epoch: statsEpoch, deadline: Date.now() + STATS_EXIT_TIMEOUT_MS }
+}
+
 /**
  * Before the session ends, within one deadline of STATS_EXIT_TIMEOUT_MS for the whole step: the tick in flight is awaited
  * and applied, then one snapshot per folder that has an ended pending run (the pace ignored), so the history keeps their
- * last growth. A failure leaves the last live figures.
+ * last growth. A failure leaves the last live figures. When the deadline wins, the epoch moves on so nothing the step
+ * started can dispatch later; a session that changed in the meantime is never touched.
  */
-async function finalStats($: EngineInterface, table: PriceTable, options: PluginOptions): Promise<void> {
-  if (options.opencodeStats !== 'on') return
-  const deadline = Date.now() + STATS_EXIT_TIMEOUT_MS
-  const inflight = statsInflight
-  if (inflight) {
+async function finalStats($: EngineInterface, table: PriceTable, options: PluginOptions, exit: StatsExit): Promise<void> {
+  try {
+    if (options.opencodeStats !== 'on') return
     let timer: Timer | undefined
-    const expired = new Promise<void>(resolve => {
-      timer = $.clock.after(STATS_EXIT_TIMEOUT_MS, () => resolve())
+    let expired = false
+    const lapse = new Promise<void>(resolve => {
+      try {
+        timer = $.clock.after(Math.max(0, exit.deadline - Date.now()), () => {
+          expired = true
+          resolve()
+        })
+      } catch {
+        // without a timer the step is bounded by its calls' own timeouts
+      }
     })
-    await Promise.race([inflight, expired])
+    await Promise.race([exitSnapshots($, table, exit), lapse])
     timer?.cancel()
+    if (expired && exit.epoch === statsEpoch) statsEpoch += 1
+  } catch {
+    // the history keeps the last live figures
+  } finally {
+    statsStopping = false
   }
-  if (statsBusy) return
-  statsBusy = true
+}
+
+async function exitSnapshots($: EngineInterface, table: PriceTable, exit: StatsExit): Promise<void> {
+  try {
+    if (statsInflight) await statsInflight
+  } catch {
+    return
+  }
+  if (exit.epoch !== statsEpoch || statsOwner) return
+  const me = {}
+  statsOwner = me
   try {
     const seen = await read($, ledgerAtom)
-    syncStatsSession(seen)
+    if (seen.sessionId !== exit.sessionId || exit.epoch !== statsEpoch) return
     if (statsFailures >= STATS_MAX_FAILURES) return
-    const epoch = statsEpoch
     const root = await statsRoot($)
+    if (exit.epoch !== statsEpoch) return
     const folders = statsFolders(seen, root, Date.now())
     for (const folder of statsOrder(folders)) {
       if (!statsShots.has(folder.key) || !folder.runs.some(r => r.status !== 'running')) continue
-      const remaining = deadline - Date.now()
+      const remaining = exit.deadline - Date.now()
       if (remaining < STATS_EXIT_MIN_MS) break
       const snap = await takeStats($, folder.cwd, remaining)
-      if (epoch !== statsEpoch) return
+      if (exit.epoch !== statsEpoch) return
       if (snap === null) continue
-      await applyStats($, table, seen.sessionId, epoch, folder.key, root, snap)
-      if (epoch !== statsEpoch) return
+      await applyStats($, table, exit.sessionId, exit.epoch, folder.key, root, snap)
+      if (exit.epoch !== statsEpoch) return
     }
   } catch {
     // the history keeps the last live figures
   } finally {
-    statsBusy = false
+    if (statsOwner === me) statsOwner = undefined
   }
 }
 
@@ -1436,18 +1507,22 @@ export function registerLifecycle(on: On, table: PriceTable, options: PluginOpti
 
   // One history write; a /clear then starts an empty ledger under the new session id.
   on('session.end', async ($, e, next) => {
+    // before anything awaits: which session ends, and when the stats part of the step must be over
+    const exit = beginStatsExit()
+    const turn = timersTurn
     let old: Ledger | undefined
     // the parent is waiting for the final numbers: they go first, before anything that could take long
     await finishChild($)
     // runs that ended since the last poll get their final figures before the record is written
-    await finalStats($, table, options)
+    await finalStats($, table, options, exit)
     try {
       old = await read($, ledgerAtom)
       await writeHistory($, old, options)
     } catch {
       // the end step must still run
     }
-    if (e.reason !== 'clear') stopTimers()
+    // a session that started while this one was ending keeps its timers
+    if (e.reason !== 'clear' && turn === timersTurn) stopTimers()
     const result = await next(e)
     if (e.reason === 'clear' && old) {
       try {

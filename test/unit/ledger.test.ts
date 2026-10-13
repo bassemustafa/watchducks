@@ -644,11 +644,16 @@ test('a relay cost held without usage beats later stats cost, while stats tokens
 })
 
 test('an exact relay result drops the approximate, shared and rows marks an adapter had set', () => {
+  const rows = [{ implementer: 'opencode' as const, model: OC_MODEL, usage: used(60), cost: 1, costSource: 'reported' as const }]
   const l = apply(emptyLedger('s1', T0), relayStart('r1'), cliStart('r2'),
-    adapter('r1', 'stats', 100, { cost: 3, approx: true, sharedSize: 2 }),
-    adapter('r2', 'stats', 100, { cost: 3, approx: true, sharedSize: 2 }),
-    relayProj('r1', 1, used(40)))
-  const r = l.runs['r1']!
+    adapter('r1', 'stats', 100, { cost: 3, approx: true, sharedSize: 2, rows }),
+    adapter('r2', 'stats', 100, { cost: 3, approx: true, sharedSize: 2 }))
+  // the marks are really there before the exact result
+  expect(l.runs['r1']!.rows).toEqual(rows)
+  expect(l.runs['r1']!.approx).toBe(true)
+  expect(l.runs['r1']!.sharedSize).toBe(2)
+  const exact = apply(l, relayProj('r1', 1, used(40)))
+  const r = exact.runs['r1']!
   expect(r.usage).toEqual(used(40))
   expect(r.cost).toBe(1)
   expect(r.usageSource).toBe('relay')

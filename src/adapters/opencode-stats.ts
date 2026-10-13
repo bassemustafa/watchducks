@@ -54,22 +54,28 @@ function bounded(v: unknown, max: number): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= max ? v : undefined
 }
 
+/** A token counter: a whole number within the bound (cost, by contrast, may be fractional). */
+function counted(v: unknown, max: number): number | undefined {
+  const n = bounded(v, max)
+  return n !== undefined && Number.isInteger(n) ? n : undefined
+}
+
 function tokensOf(v: unknown, cost: unknown): (StatsTokens & { cost: number }) | null {
   if (!isObject(v)) return null
   const cache = v['cache']
   if (!isObject(cache)) return null
-  const input = bounded(v['input'], MAX_COUNT)
-  const output = bounded(v['output'], MAX_COUNT)
-  const reasoning = bounded(v['reasoning'], MAX_COUNT)
-  const cacheRead = bounded(cache['read'], MAX_COUNT)
-  const cacheWrite = bounded(cache['write'], MAX_COUNT)
+  const input = counted(v['input'], MAX_COUNT)
+  const output = counted(v['output'], MAX_COUNT)
+  const reasoning = counted(v['reasoning'], MAX_COUNT)
+  const cacheRead = counted(cache['read'], MAX_COUNT)
+  const cacheWrite = counted(cache['write'], MAX_COUNT)
   const spent = bounded(cost, MAX_COST)
   if (input === undefined || output === undefined || reasoning === undefined) return null
   if (cacheRead === undefined || cacheWrite === undefined || spent === undefined) return null
   return { input, output, reasoning, cacheRead, cacheWrite, cost: spent }
 }
 
-/** Null for oversize, non-JSON, or a missing/invalid `tokens` block. Reads by name only; numbers finite, ≥ 0, ≤ 1e12 (cost ≤ 1e6); ids via the v0.1 ident rule. */
+/** Null for oversize, non-JSON, or a missing/invalid `tokens` block. Reads by name only; numbers finite, ≥ 0, ≤ 1e12 (cost ≤ 1e6), token counters whole; ids via the v0.1 ident rule. */
 export function projectStats(stdout: string, at: number): StatsSnapshot | null {
   if (typeof stdout !== 'string' || exceedsBytes(stdout, MAX_STATS_STDOUT)) return null
   let raw: unknown
@@ -193,18 +199,26 @@ export function allocate(prev: StatsSnapshot, cur: StatsSnapshot, runs: readonly
     })
   }
 
+  const projectDelta = deltaOf(cur.total, prev.total)
   const taken = {} as Record<Counter, number>
   for (const counter of COUNTERS) taken[counter] = 0
   let rowRegressed = false
   for (const [key, group] of members) {
     const delta = deltaOf(cur.models[key]!, Object.hasOwn(prev.models, key) ? prev.models[key]! : ZERO)
+    // a row missing from the earlier snapshot replays its whole history: it cannot have grown more than the project did
+    for (const counter of COUNTERS) {
+      if (delta.values[counter] > projectDelta.values[counter]) {
+        delta.values[counter] = projectDelta.values[counter]
+        delta.regressed = true
+      }
+    }
     for (const counter of COUNTERS) taken[counter] += delta.values[counter]
     rowRegressed = rowRegressed || delta.regressed
     give(delta, group)
   }
 
   if (loose.length > 0) {
-    const total = deltaOf(cur.total, prev.total)
+    const total = projectDelta
     const values = {} as Record<Counter, number>
     let clamped = false
     for (const counter of COUNTERS) {

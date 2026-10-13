@@ -323,3 +323,34 @@ test('allocate: runs whose models resolve to different rows are never split toge
   // 'm' names two rows: it is unresolved and takes the residual, which is nothing here
   expect(grant(out, 'amb').usage).toEqual(used(0))
 })
+
+test('a fractional token counter is rejected like an out-of-bounds one: a total nulls the snapshot, a row is skipped; cost may be fractional', () => {
+  expect(projectStats(stats(row(1.5)), 1)).toBeNull()
+  expect(projectStats(stats(row(1, 2, 3, 4, 5.25)), 1)).toBeNull()
+  expect(projectStats(stats(row(1, 0, 0.5)), 1)).toBeNull()
+  const s = projectStats(
+    stats(row(10), [
+      { id: 'bad', provider: 'p', tokens: row(1.5), cost: 0 },
+      { id: 'good', provider: 'p', tokens: row(2), cost: 0.125 },
+    ], { cost: 0.375 }),
+    1,
+  )
+  expect(Object.keys(s!.models)).toEqual(['p/good'])
+  expect(s!.models['p/good']!.cost).toBe(0.125)
+  expect(s!.total.cost).toBe(0.375)
+})
+
+test('allocate: a row missing from the earlier snapshot cannot grow more than the project did; the clamp is approximate and the run is not over-granted', () => {
+  // the row was cut from the middle snapshot (the 64-row cap), so its whole history shows up in the last one
+  const s0: StatsSnapshot = { at: 100, sessions: 1, total: fig(0), models: { 'p/m': fig(0) } }
+  const s1: StatsSnapshot = { at: 200, sessions: 1, total: fig(150, 1.5), models: {} }
+  const s2: StatsSnapshot = { at: 300, sessions: 1, total: fig(200, 2), models: { 'p/m': fig(200, 2) } }
+  const run = [ofRun('a', 'p/m', 100)]
+  const first = allocate(s0, s1, run)
+  expect(grant(first, 'a').usage).toEqual(used(150)) // the row is gone: the project total is the residual
+  const last = allocate(s1, s2, run)
+  expect(grant(last, 'a').usage).toEqual(used(50)) // not 200
+  expect(money(grant(last, 'a').cost, 0.5)).toBe(true)
+  expect(grant(last, 'a').approx).toBe(true)
+  expect(grant(first, 'a').usage.uncached + grant(last, 'a').usage.uncached).toBe(200)
+})

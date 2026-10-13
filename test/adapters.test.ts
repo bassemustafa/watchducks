@@ -1,6 +1,6 @@
 import type { On } from 'claude-code'
 import type { MockClock, TestBody } from 'claude-code/testing'
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock, test, type Engine } from 'claude-code/testing'
 
 import type { Ledger } from '../types'
 import { STATS_ARGV, STATS_MAX_RUNS, STATS_TIMEOUT_MS } from '../src/adapters/opencode-stats'
@@ -88,13 +88,22 @@ function watchLedger(on: On, seen: string[] = []): () => Ledger {
 
 // The world beneath the plugin: a clock, a store that records what is written, `opencode stats` answering the
 // script in order (the last reply repeats), and a background Bash call that hands out one task id per call.
-function world(on: On, replies: readonly Reply[], holds: ReadonlyMap<number, { arrived: () => void; until: Promise<void> }> = new Map()): { clock: MockClock; calls: Call[]; stored: string[] } {
+function world(
+  on: On,
+  replies: readonly Reply[],
+  holds: ReadonlyMap<number, { arrived: () => void; until: Promise<void> }> = new Map(),
+): { clock: MockClock; calls: Call[]; stored: string[]; ctl: { id: string; root: Promise<void> | undefined } } {
   const calls: Call[] = []
   const stored: string[] = []
+  // a test changes the session id (a new session) or holds the root lookup through this
+  const ctl: { id: string; root: Promise<void> | undefined } = { id: 'S1', root: undefined }
   on('command.register', async () => ({ value: { command: 'flock' } }))
   on('tool.register', async () => ({ value: { tool: 'mcp__watchducks__x' } }))
-  on('session.id', async () => ({ value: 'S1' }))
-  on('session.root', async () => ({ value: '/work' }))
+  on('session.id', async () => ({ value: ctl.id }))
+  on('session.root', async () => {
+    if (ctl.root) await ctl.root
+    return { value: '/work' }
+  })
   on('session.surfaces', async () => ({ value: ['terminal'] }))
   on('session.start', async ($, e) => ({ cwd: e.cwd }))
   on('session.end', async () => ({ sessionId: 'S1' }))
@@ -127,7 +136,7 @@ function world(on: On, replies: readonly Reply[], holds: ReadonlyMap<number, { a
     } as never
   })
   mock.env(on, {})
-  return { clock: mock.clock(on), calls, stored }
+  return { clock: mock.clock(on), calls, stored, ctl }
 }
 
 test('an opencode background run gets live and final numbers from opencode stats', { options: { opencodeStats: 'on' } }, async ($, on) => {
@@ -267,6 +276,9 @@ test('two pairs of same-model runs one after the other each split their own inte
   expect(first.usage).toEqual({ uncached: 200, output: 22, cacheRead: 2000, cacheWrite: 0 })
   near(first.cost, 0.2)
 
+  // a quiet tick drops the folder's snapshot, so the second pair takes a fresh baseline
+  await w.clock.advance(10_000)
+  expect(w.calls.length).toBe(3)
   // wall-clock time passes, so the second pair starts after the first ended
   spin(20)
   await $.tool.call(call('u3', SOL))
@@ -766,17 +778,24 @@ test('a session that ends with a poll in flight applies it, then takes the final
   expect(w.calls.length).toBe(2)
   spin(5) // the run ends after the held poll was asked for
   await $.classic.Stop(stop)
+  const askedAt = Date.now()
   const ending = $.session.end({ reason: 'exit' } as never)
-  spin(40) // time passes while the poll is held
+  await settle($) // the end hook has begun: its deadline is 3000 ms from when it began
+  const heldFrom = Date.now()
+  spin(60) // the poll stays held
+  const waited = Date.now() - heldFrom
   release()
   await ending
+  const endedAt = Date.now()
   await advancing
 
   expect(w.calls.length).toBe(3)
   expect(w.calls[1]!.timeoutMs).toBe(STATS_TIMEOUT_MS)
-  // the exit step's deadline is 3000 ms for everything it waits for: the second call gets at most what the wait left
-  expect(w.calls[2]!.timeoutMs).toBeLessThanOrEqual(3000)
-  expect(w.calls[2]!.timeoutMs).toBeGreaterThan(0)
+  // one deadline of 3000 ms for everything the step waits for: the final call gets what the wait left, never a fresh 3000
+  expect(w.calls[2]!.timeoutMs).toBeLessThanOrEqual(3000 - waited)
+  // and no less than the whole step, measured from before it was asked for, would leave
+  expect(w.calls[2]!.timeoutMs).toBeGreaterThan(3000 - (endedAt - askedAt) - 1)
+  expect(endedAt - askedAt).toBeLessThan(3000) // the step ended within its deadline
   for (const c of w.calls) expect([...c.argv]).toEqual([...STATS_ARGV])
   // the in-flight look was applied (100) before the final one (150)
   expect(seen.some(v => (JSON.parse(v) as Ledger).runs['bash:u1']?.usage?.uncached === 100)).toBe(true)
@@ -785,31 +804,32 @@ test('a session that ends with a poll in flight applies it, then takes the final
   near(history.cost, 1.5)
 })
 
+// changed with the snapshot kept until the next tick prunes it: the folder is left without one by a failed call, not by a final look
 test('a folder called less than 10 s ago is not called again for a new run, whose late baseline makes it approximate', ON, async ($, on) => {
   const ledger = watchLedger(on)
-  const w = world(on, [statsJson(1, 1, 0.1), statsJson(2, 3, 0.3), statsJson(2, 3, 0.3), statsJson(3, 5, 0.5)])
+  const w = world(on, [{ exitCode: 1 }, statsJson(1, 1, 0.1), statsJson(2, 3, 0.3)])
   await $.session.start(START)
   await $.tool.call(call('u1', SOL))
-  await w.clock.advance(500)
+  await w.clock.advance(500) // the first call fails: the folder is called, and has no snapshot
+  expect(w.calls.length).toBe(1)
   await $.classic.Stop(stop)
-  await w.clock.advance(10_000) // the final look at u1: the folder is called, and left without a snapshot
-  expect(w.calls.length).toBe(2)
-  expect(ledger().runs['bash:u1']!.usage).toEqual({ uncached: 200, output: 22, cacheRead: 2000, cacheWrite: 0 })
 
   await $.tool.call(call('u2', SOL))
   spin(1600) // the run is looked at more than 1.5 s after it started
   await w.clock.advance(500)
-  expect(w.calls.length).toBe(2) // 500 ms after the last call: the pace holds, no exception for a new run
+  expect(w.calls.length).toBe(1) // 500 ms after the last call: the pace holds, no exception for a new run
   expect(ledger().runs['bash:u2']!.usage).toBeNull()
-  await w.clock.advance(10_000) // the pace is over: the baseline
-  expect(w.calls.length).toBe(3)
+  await w.clock.advance(10_000) // the pace is over: the baseline, for u2 and for u1, which ended before it
+  expect(w.calls.length).toBe(2)
   expect(ledger().runs['bash:u2']!.usage).toBeNull()
+  expect(ledger().runs['bash:u1']!.usage).toBeNull()
   await w.clock.advance(10_000)
-  expect(w.calls.length).toBe(4)
+  expect(w.calls.length).toBe(3)
   const run = ledger().runs['bash:u2']!
   expect(run.usage).toEqual({ uncached: 200, output: 22, cacheRead: 2000, cacheWrite: 0 })
   expect(run.approx).toBe(true)
   expect(run.sharedSize).toBeUndefined()
+  expect(ledger().runs['bash:u1']!.usage).toBeNull()
 })
 
 test('a restored run of another folder with no working directory of its own gets no stats call and keeps —', ON, async ($, on) => {
@@ -1289,3 +1309,238 @@ for (const folder of ['missing', 'link', 'outside'] as const) {
     expect(fs.reads).toEqual([])
   })
 }
+
+// ---- review fixes: single flight, one session at a time, one deadline, no re-entry
+
+/** Lets the engine's pending hooks run up to their first wait (a few real events go through it). */
+async function settle($: Engine): Promise<void> {
+  for (let i = 0; i < 20; i++) await $.tool.call(call('y' + i, 'echo y'))
+}
+
+const LEDGER_KEY = { plugin: 'watchducks', key: 'ledger' } as const
+
+test('a run whose end a later relay result moves forward is not measured again once it has had its last interval', ON, async ($, on) => {
+  const ledger = watchLedger(on)
+  let moveEnd = 0
+  let moved = false
+  on('state.set', LEDGER_KEY, async ($, e, next) => {
+    const l = e.value as Ledger
+    const a = l.runs['bash:u1']
+    if (moveEnd === 0 || !a) return next(e)
+    const endedAt = moveEnd
+    moveEnd = 0
+    moved = true
+    return next({ ...e, value: { ...l, runs: { ...l.runs, 'bash:u1': { ...a, endedAt } } } } as never)
+  })
+  const sol = (sessions: number, input: number): string => rowsJson(sessions, [{ model: 'openai/gpt-6.1-sol', input, cost: input / 1000 }])
+  const w = world(on, [sol(1, 0), sol(2, 100), sol(2, 160), sol(2, 200)])
+  await $.session.start(START)
+  await $.tool.call(call('u1', SOL))
+  await $.tool.call(call('u2', SOL))
+  await w.clock.advance(500)
+  await w.clock.advance(10_000)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(50))
+  spin(5)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 't-u2', type: 'shell', status: 'running', description: '' }] } as never)
+  expect(ledger().runs['bash:u1']!.status).toBe('ended')
+  await w.clock.advance(10_000) // u1's last interval, shared with u2
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(80))
+  expect(ledger().runs['bash:u2']!.usage).toEqual(flat(80))
+  // a later result moves u1's end past the last look
+  spin(5)
+  moveEnd = Date.now()
+  spin(5)
+  await $.tool.call(call('x9', 'cd /proj && codex exec "x"')) // any ledger write carries it
+  expect(moved).toBe(true)
+  await w.clock.advance(10_000)
+  expect(w.calls.length).toBe(4)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(80)) // unchanged
+  expect(ledger().runs['bash:u2']!.usage).toEqual(flat(120)) // the whole interval
+})
+
+test('a folder snapshot survives a run that starts and ends while another run\'s last dispatch is being written', ON, async ($, on) => {
+  const ledger = watchLedger(on)
+  let injected = false
+  on('state.set', LEDGER_KEY, async ($, e, next) => {
+    const l = e.value as Ledger
+    const a = l.runs['bash:u1']
+    if (injected || a?.usage?.uncached !== 160) return next(e)
+    injected = true
+    spin(3)
+    const t = Date.now()
+    const b = { ...a, id: 'bash:u2', startedAt: t, endedAt: t, durationMs: 0, usage: null, usageSource: null, cost: null, costSource: null }
+    return next({ ...e, value: { ...l, runs: { ...l.runs, 'bash:u2': b }, order: [...l.order, 'bash:u2'] } } as never)
+  })
+  const sol = (sessions: number, input: number): string => rowsJson(sessions, [{ model: 'openai/gpt-6.1-sol', input, cost: input / 1000 }])
+  const w = world(on, [sol(1, 0), sol(2, 100), sol(2, 160), sol(2, 200)])
+  await $.session.start(START)
+  await $.tool.call(call('u1', SOL))
+  await w.clock.advance(500)
+  await w.clock.advance(10_000)
+  spin(5)
+  await $.classic.Stop(stop)
+  await w.clock.advance(10_000) // u1's last dispatch; u2 starts and ends inside that write
+  expect(injected).toBe(true)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(160))
+  spin(5)
+  await w.clock.advance(10_000) // the snapshot was kept: u2 gets the interval
+  expect(w.calls.length).toBe(4)
+  expect(ledger().runs['bash:u2']!.usage).toEqual(flat(40))
+})
+
+test('a run the ledger cleared before its last interval still takes its part of it: its peers do not absorb it', ON, async ($, on) => {
+  const ledger = watchLedger(on)
+  const sol = (sessions: number, input: number): string => rowsJson(sessions, [{ model: 'openai/gpt-6.1-sol', input, cost: input / 1000 }])
+  const w = world(on, [sol(1, 0), sol(2, 100), sol(2, 160), sol(2, 200)])
+  await $.session.start(START)
+  await $.tool.call(call('u1', SOL))
+  await $.tool.call(call('u2', SOL))
+  await w.clock.advance(500)
+  await w.clock.advance(10_000)
+  spin(5)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 't-u1', type: 'shell', status: 'running', description: '' }] } as never)
+  expect(ledger().runs['bash:u2']!.status).toBe('ended')
+  await $.command.run({ command: 'flock', args: 'clear' } as never) // u2 goes before its last interval
+  expect(ledger().runs['bash:u2']).toBeUndefined()
+  await w.clock.advance(10_000) // 60 more: u2's half is nobody's
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(80))
+  await w.clock.advance(10_000) // 40 more: u1 alone
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(120))
+  await $.session.end({ reason: 'exit' } as never)
+  // u2 was retired with the 50 it had; u1 holds 120
+  const history = lastRecordTotals(w.stored)
+  expect(history.uncached).toBe(170)
+})
+
+test('a session that ends while its poll is held, and a new session that starts meanwhile: nothing lands in the new one, whose timers go on', ON, async ($, on) => {
+  const ledger = watchLedger(on)
+  const sol = (sessions: number, input: number): string => rowsJson(sessions, [{ model: 'openai/gpt-6.1-sol', input, cost: input / 1000 }])
+  let release: () => void = () => {}
+  let arrive: () => void = () => {}
+  const until = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const arrived = new Promise<void>(resolve => {
+    arrive = resolve
+  })
+  const w = world(on, [sol(1, 0), sol(2, 100), sol(1, 0), sol(2, 50)], new Map([[2, { arrived: arrive, until }]]))
+  await $.session.start(START)
+  await $.tool.call(call('u1', SOL))
+  await w.clock.advance(500)
+  const advancing = w.clock.advance(10_000) // the poll asks for its process and is held there
+  await arrived
+  spin(5)
+  await $.classic.Stop(stop)
+  const ending = $.session.end({ reason: 'exit' } as never)
+  await settle($)
+  w.ctl.id = 'S2'
+  await $.session.start(START) // the new session begins while the old end step waits
+  await $.tool.call(call('v1', SOL))
+  release()
+  await ending
+  await advancing
+  expect(w.calls.length).toBe(2) // the old step took no final snapshot of its own
+  expect(ledger().sessionId).toBe('S2')
+  expect(ledger().runs['bash:u1']).toBeUndefined()
+  // the new session's timers were not stopped by the old end: its run is measured
+  await w.clock.advance(500)
+  await w.clock.advance(10_000)
+  expect(w.calls.length).toBe(4)
+  expect(ledger().runs['bash:v1']!.usage).toEqual(flat(50))
+  for (const c of w.calls) expect([...c.argv]).toEqual([...STATS_ARGV])
+})
+
+test('a held poll keeps the single-flight lock across a session reset: the new session starts no second process until it returns', ON, async ($, on) => {
+  const ledger = watchLedger(on)
+  const sol = (sessions: number, input: number): string => rowsJson(sessions, [{ model: 'openai/gpt-6.1-sol', input, cost: input / 1000 }])
+  let release: () => void = () => {}
+  let arrive: () => void = () => {}
+  const until = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const arrived = new Promise<void>(resolve => {
+    arrive = resolve
+  })
+  const w = world(on, [sol(1, 0), sol(2, 100), sol(1, 0), sol(2, 50)], new Map([[2, { arrived: arrive, until }]]))
+  await $.session.start(START)
+  await $.tool.call(call('u1', SOL))
+  await w.clock.advance(500)
+  const advancing = w.clock.advance(10_000)
+  await arrived
+  w.ctl.id = 'S2'
+  await $.session.start(START) // a session reset while the call is out
+  await $.tool.call(call('v1', SOL))
+  const more = w.clock.advance(2000) // the new session's watch ticks would ask for a baseline
+  await settle($)
+  expect(w.calls.length).toBe(2)
+  release()
+  await advancing
+  await more
+  await w.clock.advance(500)
+  expect(w.calls.length).toBe(3) // now it may
+  await w.clock.advance(10_000)
+  expect(ledger().runs['bash:v1']!.usage).toEqual(flat(50))
+})
+
+test('a tick that sees the session ending starts no further folder; the exit step takes the ended run\'s folder with what time is left', ON, async ($, on) => {
+  const sol = (sessions: number, input: number): string => rowsJson(sessions, [{ model: 'openai/gpt-6.1-sol', input, cost: input / 1000 }])
+  let release: () => void = () => {}
+  let arrive: () => void = () => {}
+  const until = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const arrived = new Promise<void>(resolve => {
+    arrive = resolve
+  })
+  const w = world(on, [sol(1, 0), sol(1, 0), sol(2, 100), sol(2, 100)], new Map([[3, { arrived: arrive, until }]]))
+  await $.session.start(START)
+  await $.tool.call(call('u1', SOL))
+  await $.tool.call(call('u2', 'cd /proj2 && opencode run -m openai/gpt-6.1-sol "x"'))
+  await w.clock.advance(500)
+  expect(w.calls.length).toBe(2) // one baseline per folder
+  spin(5)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 't-u1', type: 'shell', status: 'running', description: '' }] } as never)
+  const advancing = w.clock.advance(10_000) // the poll takes the first folder and is held there
+  await arrived
+  expect(w.calls[2]!.cwd).toBe('/proj')
+  const ending = $.session.end({ reason: 'exit' } as never)
+  await settle($)
+  release()
+  await ending
+  await advancing
+  // the tick did not go on to the second folder (that call would have had the 10 s poll timeout); the exit step did
+  expect(w.calls.length).toBe(4)
+  expect(w.calls[3]!.cwd).toBe('/proj2')
+  expect(w.calls[3]!.timeoutMs).toBeLessThanOrEqual(3000)
+  expect(w.calls[3]!.timeoutMs).toBeGreaterThan(2000)
+})
+
+test('the whole exit step is bound by one deadline: a root lookup held past it ends the step, and nothing it started dispatches later', ON, async ($, on) => {
+  const ledger = watchLedger(on)
+  const sol = (sessions: number, input: number): string => rowsJson(sessions, [{ model: 'openai/gpt-6.1-sol', input, cost: input / 1000 }])
+  const w = world(on, [sol(1, 0), sol(2, 100), sol(3, 150)])
+  await $.session.start(START)
+  await $.tool.call(call('u1', SOL))
+  await w.clock.advance(500)
+  await w.clock.advance(10_000)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(100))
+  spin(5)
+  await $.classic.Stop(stop)
+  let open: () => void = () => {}
+  w.ctl.root = new Promise<void>(resolve => {
+    open = resolve
+  })
+  let over = false
+  const ending = $.session.end({ reason: 'exit' } as never).then(() => {
+    over = true
+  })
+  for (let i = 0; i < 14 && !over; i++) await w.clock.advance(500) // the deadline (3000 ms) comes due on the mocked clock
+  expect(over).toBe(true)
+  await ending
+  w.ctl.root = undefined
+  open() // the lookup returns after the step gave up
+  await settle($)
+  expect(w.calls.length).toBe(2) // no snapshot was started for the ended run
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(100)) // and none was dispatched
+  expect(lastRecordTotals(w.stored).uncached).toBe(100)
+})
