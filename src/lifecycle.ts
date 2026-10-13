@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, FsStat, On, PluginOptions, Timer } from 'claude-code'
 
 import type { HistoryRecord, Ledger, RelayProjection, Run, Usage } from '../types'
+import { CHILD_ID, REPORT_EVERY_MS, buildReport, reportDir, type ChildReport } from './adapters/child-report'
 import {
   STATS_ARGV,
   STATS_EVERY_MS,
@@ -39,7 +40,7 @@ import { HISTORY_PREFIX, pruneHistory, recordFromLedger } from './history'
 import { emptyLedger, isKnownLoop, normalizeDir, reduce, workdirKey, type Action } from './ledger'
 import { ZERO_USAGE, addUsage, type PriceTable } from './price'
 import { fnv1a } from './codename'
-import { MAX_RESULT_BYTES, isInsideRoots, projectRelayResult, relayIdentity } from './relay-result'
+import { MAX_RESULT_BYTES, ident, isInsideRoots, projectRelayResult, relayIdentity } from './relay-result'
 import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, recordsHeadless } from './state'
 import { ROSTER_SPEC, VERDICT_SPEC } from './tools'
 import { blipsFor, radar } from './ui/animate'
@@ -77,6 +78,7 @@ function stopTimers(): void {
   statsTimer = undefined
   statsBusy = false
   resetStats()
+  resetChild()
   agentTimer?.cancel()
   saveTimer?.cancel()
   relayTimer?.cancel()
@@ -167,18 +169,23 @@ async function pollAgents($: EngineInterface, table: PriceTable): Promise<void> 
   }
 }
 
+/** The temp root the relay roots and the child reports share: TMPDIR, else /tmp. */
+async function tmpRoot($: EngineInterface): Promise<string> {
+  try {
+    const dir = await $.env.get('TMPDIR')
+    if (dir !== undefined && dir !== '') return dir
+  } catch {
+    // the fixed /tmp root still applies
+  }
+  return '/tmp'
+}
+
 /**
  * The relay roots, each resolved to where it really lands (a root that cannot be resolved is skipped), where the
  * session root landed, and how many `$.fs.stat` calls the resolving took (discovery counts them in its budget).
  */
 async function resolvedRoots($: EngineInterface, options: PluginOptions): Promise<{ roots: string[]; session: string; stats: number }> {
-  let tmpDir = '/tmp'
-  try {
-    const dir = await $.env.get('TMPDIR')
-    if (dir !== undefined && dir !== '') tmpDir = dir
-  } catch {
-    // the fixed /tmp root still applies
-  }
+  const tmpDir = await tmpRoot($)
   let sessionRoot = ''
   try {
     sessionRoot = await $.session.root()
@@ -840,6 +847,93 @@ function watchStats($: EngineInterface, table: PriceTable, options: PluginOption
   if (statsAcc.size < STATS_MAX_RUNS && wanted.some(r => r.status === 'running' && !statsAcc.has(r.id))) void statsTick($, table, options)
 }
 
+// Claude child report (spec §4). A session started from another session's agent shell inherits that parent's
+// CLAUDE_CODE_SESSION_ID; it then writes its numbers-only spend into a folder named by a hash of the parent's id, once at
+// start, every REPORT_EVERY_MS while the report changed, and finally at session end. Every write is best effort.
+
+type ChildMode = {
+  path: string
+  startedAt: number
+  workdirKey: string | undefined
+  /** The last report written, `updatedAt` removed: a tick whose text equals it writes nothing. */
+  last: string
+  /** The write in flight, so ticks never overlap and the final write follows it. */
+  flight: Promise<void> | undefined
+  timer: Timer | undefined
+}
+
+let child: ChildMode | undefined
+
+function resetChild(): void {
+  child?.timer?.cancel()
+  child = undefined
+}
+
+function withoutStamp(text: string): string {
+  return text.replace(/"updatedAt":"[^"]*",/, '')
+}
+
+/** One report write; a failed one leaves `last` as it was, so the next tick tries again. */
+async function writeChild($: EngineInterface, c: ChildMode, status: ChildReport['status']): Promise<void> {
+  try {
+    const text = buildReport(await read($, ledgerAtom), c.startedAt, c.workdirKey, status, Date.now())
+    const signature = withoutStamp(text)
+    if (signature === c.last) return
+    await $.fs.write(c.path, text)
+    c.last = signature
+  } catch {
+    // the report is a courtesy to the parent: a failed write never reaches a hook
+  }
+}
+
+function flightOf($: EngineInterface, c: ChildMode): void {
+  c.flight = writeChild($, c, 'running').finally(() => {
+    c.flight = undefined
+  })
+}
+
+async function startChild($: EngineInterface, options: PluginOptions): Promise<void> {
+  resetChild()
+  if (options.reportToParent === 'off') return
+  try {
+    const parentId = ident(await $.env.get('CLAUDE_CODE_SESSION_ID'))
+    const ownId = await $.session.id()
+    if (parentId === undefined || !CHILD_ID.test(ownId) || parentId === ownId) return
+    let key: string | undefined
+    try {
+      const dir = normalizeDir(await $.session.root(), undefined)
+      if (dir !== undefined && dir !== '') key = workdirKey(dir)
+    } catch {
+      // no session root: the report carries no folder key
+    }
+    const c: ChildMode = {
+      path: `${reportDir(await tmpRoot($), parentId)}/${ownId}.json`,
+      startedAt: (await read($, ledgerAtom)).sessionStartedAt,
+      workdirKey: key,
+      last: '',
+      flight: undefined,
+      timer: undefined,
+    }
+    child = c
+    flightOf($, c)
+    await c.flight
+    if (child === c) c.timer = $.clock.every(REPORT_EVERY_MS, () => (child === c && !c.flight ? flightOf($, c) : undefined))
+  } catch {
+    // no child mode: the session works as any other
+  }
+}
+
+/** The end of a child session: stop the timer, let a write in flight land, then the final report. Waits on `$.fs.write` only. */
+async function finishChild($: EngineInterface): Promise<void> {
+  const c = child
+  if (!c) return
+  child = undefined
+  c.timer?.cancel()
+  await c.flight // writeChild never rejects
+  // the end event carries no error reason (clear, resume, logout, prompt_input_exit, other): the status is always done
+  await writeChild($, c, 'done')
+}
+
 async function saveWhileActive($: EngineInterface, options: PluginOptions): Promise<void> {
   try {
     const l = await read($, ledgerAtom)
@@ -1140,12 +1234,15 @@ export function registerLifecycle(on: On, table: PriceTable, options: PluginOpti
     } catch {
       // the collectors still work without the timers
     }
+    await startChild($, options)
     return next(e)
   })
 
   // One history write; a /clear then starts an empty ledger under the new session id.
   on('session.end', async ($, e, next) => {
     let old: Ledger | undefined
+    // the parent is waiting for the final numbers: they go first, before anything that could take long
+    await finishChild($)
     // runs that ended since the last poll get their final figures before the record is written
     await finalStats($, table, options)
     try {

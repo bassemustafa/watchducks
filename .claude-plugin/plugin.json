@@ -83,6 +83,16 @@
         "off"
       ]
     },
+    "reportToParent": {
+      "type": "string",
+      "title": "Report to parent",
+      "description": "When this session was started by another Claude Code session, write numbers-only progress for it",
+      "default": "on",
+      "options": [
+        "on",
+        "off"
+      ]
+    },
     "showEngineOverhead": {
       "type": "string",
       "title": "Show engine overhead",

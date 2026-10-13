@@ -10,6 +10,8 @@ import { exceedsBytes } from './opencode-stats'
 
 export const CHILD_SCHEMA = 'watchducks.child.v1'
 export const CHILD_DIR = 'watchducks-children'
+/** A child id is a file name: letters, digits, `_` and `-` only. */
+export const CHILD_ID = /^[A-Za-z0-9_-]{1,128}$/
 export const MAX_REPORT_BYTES = 65_536
 export const MAX_ROWS = 32
 export const REPORT_EVERY_MS = 5000

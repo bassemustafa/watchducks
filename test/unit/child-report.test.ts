@@ -3,6 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import {
   buildReport,
   CHILD_DIR,
+  CHILD_ID,
   CHILD_SCHEMA,
   mainModel,
   matchReports,
@@ -270,4 +271,10 @@ test('matchReports: claimed files are skipped', () => {
   const reports = [rep('a.json', T0), rep('b.json', T0 + 1000)]
   expect(matchReports(runs, reports, new Set(['a.json']))).toEqual([{ id: 'r1', file: 'b.json' }])
   expect(matchReports(runs, reports, new Set(['a.json', 'b.json']))).toEqual([])
+})
+
+test('CHILD_ID accepts a UUID and rejects anything that is not a plain file name', () => {
+  expect(CHILD_ID.test('3f2b8c1e-9a4d-4e6f-b1c2-0d5e7a8b9c10')).toBe(true)
+  for (const bad of ['..', 'a/b', 'a.b', '', 'a'.repeat(129)]) expect(CHILD_ID.test(bad)).toBe(false)
+  expect(CHILD_ID.test('a'.repeat(128))).toBe(true)
 })

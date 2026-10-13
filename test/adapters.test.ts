@@ -1,9 +1,10 @@
 import type { On } from 'claude-code'
-import type { MockClock } from 'claude-code/testing'
+import type { MockClock, TestBody } from 'claude-code/testing'
 import { expect, mock, test } from 'claude-code/testing'
 
 import type { Ledger } from '../types'
 import { STATS_ARGV, STATS_MAX_RUNS, STATS_TIMEOUT_MS } from '../src/adapters/opencode-stats'
+import { fingerprint } from '../src/collect/relay'
 import { stationRowsFromLedger } from '../src/history'
 import { emptyLedger, totals, workdirKey } from '../src/ledger'
 
@@ -863,4 +864,181 @@ test('a run beyond the cap of pending runs is not admitted and does not evict th
   expect(ledger().runs[last]!.usage).toEqual(flat(20))
   expect(ledger().runs[beyond]!.usage).toBeNull()
   expect(w.calls.length).toBe(3)
+})
+
+// Claude child reports, the child side (spec §4.1–4.4)
+
+const PARENT = 'parent-session-sentinel'
+const STEP = {
+  turnId: 't1',
+  index: 0,
+  answer: '',
+  toolUses: [],
+  stopReason: 'end_turn',
+  usage: { model: 'claude-sonnet-5-5', input_tokens: 1000, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+} as never
+
+type Written = { path: string; text: string }
+type Child = { clock: MockClock; writes: Written[]; order: string[]; ids: { own: string } }
+
+/** The world beneath a child session: its own id, the environment it inherited, a root that may be unreadable, and a file system that records every write. */
+function childWorld(on: On, env: Record<string, string>, opts: { root?: 'throw'; failWrites?: boolean } = {}): Child {
+  const writes: Written[] = []
+  const order: string[] = []
+  const ids = { own: 'S1' }
+  on('command.register', async () => ({ value: { command: 'flock' } }))
+  on('tool.register', async () => ({ value: { tool: 'mcp__watchducks__x' } }))
+  on('session.id', async () => ({ value: ids.own }))
+  on('session.root', async () => {
+    if (opts.root === 'throw') throw new Error('no root')
+    return { value: '/work' }
+  })
+  on('session.surfaces', async () => ({ value: ['terminal'] }))
+  on('session.start', async ($, e) => ({ cwd: e.cwd }))
+  on('session.end', async () => ({ sessionId: ids.own }))
+  on('store.keys', async () => ({ value: [] }))
+  on('store.set', async () => {
+    order.push('history')
+    return { value: undefined }
+  })
+  on('fs.write', async ($, e) => {
+    order.push('write')
+    writes.push({ path: e.path, text: e.text })
+    if (opts.failWrites) throw new Error('disk full')
+    return { value: undefined }
+  })
+  on('turn.step', async function* () {
+    return STEP
+  })
+  mock.env(on, env)
+  return { clock: mock.clock(on), writes, order, ids }
+}
+
+async function modelStep($: Parameters<TestBody>[0], index: number): Promise<void> {
+  for await (const _ of $.turn.step({ turnId: 't1', index, model: 'claude-sonnet-5-5' } as never)) {
+    /* chunks are never read */
+  }
+}
+
+const reportOf = (w: Written): Record<string, unknown> => JSON.parse(w.text) as Record<string, unknown>
+const CHILD_PATH = `/tmp/watchducks-children/${fingerprint(PARENT)}/S1.json`
+const END = { reason: 'other', sessionId: 'S1', resume: { id: 'S1' } } as never
+
+test('a session started with another session id in its environment writes a numbers-only report at once', async ($, on) => {
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT })
+  await $.session.start(START)
+  expect(w.writes.length).toBe(1)
+  expect(w.writes[0]!.path).toBe(CHILD_PATH)
+  const report = reportOf(w.writes[0]!)
+  expect(Object.keys(report).sort()).toEqual(['rows', 'schema', 'startedAt', 'status', 'updatedAt', 'workdirKey'])
+  expect(report['schema']).toBe('watchducks.child.v1')
+  expect(report['status']).toBe('running')
+  expect(report['workdirKey']).toBe(workdirKey('/work'))
+  // the parent is only ever a hash in a folder name; no path or other text leaves
+  expect(w.writes[0]!.text).not.toContain(PARENT)
+  expect(w.writes[0]!.text).not.toContain('/work')
+})
+
+test('a session whose root cannot be read writes a report without a workdirKey', async ($, on) => {
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT }, { root: 'throw' })
+  await $.session.start(START)
+  expect(w.writes.length).toBe(1)
+  expect(Object.keys(reportOf(w.writes[0]!)).sort()).toEqual(['rows', 'schema', 'startedAt', 'status', 'updatedAt'])
+})
+
+test('the report goes under TMPDIR when it is set', async ($, on) => {
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT, TMPDIR: '/scratch/tmp' })
+  await $.session.start(START)
+  expect(w.writes.map(x => x.path)).toEqual([`/scratch/tmp/watchducks-children/${fingerprint(PARENT)}/S1.json`])
+})
+
+for (const [name, env] of [
+  ['equals its own id', { CLAUDE_CODE_SESSION_ID: 'S1' }],
+  ['is empty', { CLAUDE_CODE_SESSION_ID: '' }],
+  ['is not an identifier', { CLAUDE_CODE_SESSION_ID: 'not an id!' }],
+  ['is not set', {}],
+] as const) {
+  test(`no report is written when the inherited session id ${name}`, async ($, on) => {
+    const w = childWorld(on, env)
+    await $.session.start(START)
+    await w.clock.advance(20_000)
+    await $.session.end(END)
+    expect(w.writes.length).toBe(0)
+  })
+}
+
+test('an own session id that is not a plain file name writes no report', async ($, on) => {
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT })
+  w.ids.own = 'a/../b'
+  await $.session.start(START)
+  await w.clock.advance(20_000)
+  await $.session.end(END)
+  expect(w.writes.length).toBe(0)
+})
+
+test('reportToParent off writes no report', { options: { reportToParent: 'off' } }, async ($, on) => {
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT })
+  await $.session.start(START)
+  await w.clock.advance(20_000)
+  await $.session.end(END)
+  expect(w.writes.length).toBe(0)
+})
+
+test('the timer writes again only when the numbers changed, not when only updatedAt would', async ($, on) => {
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT })
+  await $.session.start(START)
+  spin(5) // wall-clock time moves, so a whole-text comparison would see a change
+  await w.clock.advance(5000)
+  expect(w.writes.length).toBe(1)
+  await modelStep($, 0)
+  await w.clock.advance(5000)
+  expect(w.writes.length).toBe(2)
+  const rows = reportOf(w.writes[1]!)['rows'] as Array<Record<string, unknown>>
+  expect(rows.length).toBe(1)
+  expect(rows[0]!['implementer']).toBe('claude-code')
+  expect(rows[0]!['model']).toBe('claude-sonnet-5-5')
+  expect(rows[0]!['usage']).toEqual({ uncached: 1000, output: 100, cacheRead: 0, cacheWrite: 0 })
+  expect(reportOf(w.writes[1]!)['status']).toBe('running')
+  spin(5)
+  await w.clock.advance(5000)
+  expect(w.writes.length).toBe(2)
+})
+
+test('session.end writes the final done report before history, and the timer stops', async ($, on) => {
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT })
+  await $.session.start(START)
+  await modelStep($, 0)
+  await $.session.end(END)
+  const last = reportOf(w.writes[w.writes.length - 1]!)
+  expect(last['status']).toBe('done')
+  expect(w.writes[w.writes.length - 1]!.path).toBe(CHILD_PATH)
+  expect((last['rows'] as unknown[]).length).toBe(1)
+  expect(last['startedAt']).toBe(reportOf(w.writes[0]!)['startedAt'])
+  expect(w.order.lastIndexOf('write')).toBeLessThan(w.order.indexOf('history'))
+  const count = w.writes.length
+  await w.clock.advance(20_000)
+  expect(w.writes.length).toBe(count)
+})
+
+test('a failing write never reaches a hook and the next tick tries again', async ($, on) => {
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT }, { failWrites: true })
+  await $.session.start(START)
+  expect(w.writes.length).toBe(1)
+  await modelStep($, 0)
+  await w.clock.advance(5000)
+  expect(w.writes.length).toBe(2) // one attempt per tick, no storm
+  const ended = await $.session.end(END)
+  expect(ended).toEqual({ sessionId: 'S1' })
+  expect(w.order.indexOf('history')).toBeGreaterThan(-1)
+})
+
+test('a new session in the same process resets child mode', async ($, on) => {
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT })
+  await $.session.start(START)
+  expect(w.writes.length).toBe(1)
+  w.ids.own = PARENT // the next session's own id equals the inherited one: not a child
+  await $.session.start(START)
+  await w.clock.advance(20_000)
+  await $.session.end(END)
+  expect(w.writes.length).toBe(1)
 })
