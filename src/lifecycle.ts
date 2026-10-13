@@ -1,24 +1,19 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, FsStat, On, PluginOptions, Timer } from 'claude-code'
 
-import type { HistoryRecord, Ledger, RelayProjection, Run } from '../types'
+import type { HistoryRecord, Ledger, RelayProjection, Run, Usage } from '../types'
 import {
   STATS_ARGV,
   STATS_EVERY_MS,
   STATS_MAX_FOLDERS,
   STATS_MAX_RUNS,
+  STATS_RACE_MS,
   STATS_TIMEOUT_MS,
-  baselineFrom,
-  capped,
-  chainByOverlap,
-  planShares,
+  allocate,
   projectStats,
-  type StatsExact,
-  type StatsLast,
-  type StatsRun,
-  type StatsShare,
+  type Allocation,
+  type FolderRun,
   type StatsSnapshot,
-  type StatsTaken,
 } from './adapters/opencode-stats'
 import {
   DISCOVERY_BUDGET_MS,
@@ -42,7 +37,7 @@ import {
 } from './collect/relay'
 import { HISTORY_PREFIX, pruneHistory, recordFromLedger } from './history'
 import { emptyLedger, isKnownLoop, normalizeDir, reduce, workdirKey, type Action } from './ledger'
-import type { PriceTable } from './price'
+import { ZERO_USAGE, addUsage, type PriceTable } from './price'
 import { fnv1a } from './codename'
 import { MAX_RESULT_BYTES, isInsideRoots, projectRelayResult, relayIdentity } from './relay-result'
 import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, recordsHeadless } from './state'
@@ -510,49 +505,56 @@ async function pollRelays($: EngineInterface, table: PriceTable, options: Plugin
   }
 }
 
-// opencode stats (spec §3). While `opencodeStats` is on and an opencode run is running (or ended less than the relay
-// grace ago), one timer takes `opencode stats` snapshots per working directory and gives each run its share. The
-// process runs one at a time for the session, at most once per STATS_EVERY_MS per directory; its stdout is projected to
-// numbers by `projectStats` and its stderr is never read. What is kept here is numbers and run ids: the working
-// directory is read from the run for the call and not kept. The pure parts (groups, shares, baselines) are in
-// `adapters/opencode-stats.ts`.
+// opencode stats (spec §3). While `opencodeStats` is on and an opencode run is pending (running, or ended less than the
+// relay grace ago and not yet given its last interval), one timer takes `opencode stats` snapshots per working directory.
+// Two consecutive snapshots of a folder bound an interval; `allocate` splits that interval's growth among the runs active
+// in it, and every run keeps the sum of its shares. The process runs one at a time for the session, at most once per
+// STATS_EVERY_MS per directory; its stdout is projected to numbers by `projectStats` and its stderr is never read. What is
+// kept here is numbers and run ids: the working directory is read from a pending run for the call and not kept. The pure
+// parts (projection, allocation) are in `adapters/opencode-stats.ts`.
 
 const STATS_SLACK_MS = 50 // a timer tick may land a hair before the interval is over
 const STATS_MAX_FAILURES = 3
 const STATS_EXIT_TIMEOUT_MS = 3000
-const STATS_EXIT_FOLDERS = 2
+const STATS_EXIT_MIN_MS = 250 // a snapshot is not started with less than this left of the exit deadline
+
+/** What a pending run has been given so far: the sum of its shares, and the figures last dispatched to the ledger. */
+type StatsAcc = {
+  usage: Usage
+  cost: number
+  approx: boolean
+  shared: number
+  allocated: boolean
+  sent?: { usage: Usage; cost: number; approx: boolean; shared: number }
+}
+type StatsFolder = { key: string; cwd: string; runs: Run[] }
 
 let statsTimer: Timer | undefined
 let statsBusy = false
-// session-wide: the failure breaker and the pace per folder do not reset with /flock clear
+let statsInflight: Promise<void> | undefined
+// session-wide: the failure breaker does not reset with /flock clear
 let statsFailures = 0
 let statsSession = ''
 let statsGeneration = -1
-// per run, at most STATS_MAX_RUNS each: where a run was first looked at (and whether that was late), the runs given their
-// final figures, the figures last given, and the runs that already used a snapshot of their own as baseline
-const statsBase = new Map<string, { snap: StatsSnapshot; approx: boolean }>()
-const statsFinal = new Set<string>()
-let statsFinalBefore = 0 // a run that ended before this was final when its marker was dropped
-const statsLast = new Map<string, StatsLast>()
-const statsTried = new Set<string>()
-// per folder, at most STATS_MAX_FOLDERS each: when the process last started, and the snapshot it gave
-const statsAttempt = new Map<string, number>()
-const statsTaken = new Map<string, StatsTaken>()
+// bumped by a new session: a tick that started under an older one discards what it measured
+let statsEpoch = 0
+// per pending run, at most STATS_MAX_RUNS
+const statsAcc = new Map<string, StatsAcc>()
+// per folder with pending runs, at most STATS_MAX_FOLDERS: the last snapshot, and when the process was last called
+const statsShots = new Map<string, StatsSnapshot>()
+const statsCalled = new Map<string, number>()
 
 function resetStats(): void {
+  statsEpoch += 1
   statsFailures = 0
   statsSession = ''
   statsGeneration = -1
-  statsBase.clear()
-  statsFinal.clear()
-  statsFinalBefore = 0
-  statsLast.clear()
-  statsTried.clear()
-  statsAttempt.clear()
-  statsTaken.clear()
+  statsAcc.clear()
+  statsShots.clear()
+  statsCalled.clear()
 }
 
-/** A new session starts the adapter over; a /flock clear only drops what belongs to runs the ledger no longer has. */
+/** A new session starts the adapter over; a /flock clear only drops the accumulators of runs the ledger no longer has. */
 function syncStatsSession(l: Ledger): void {
   if (l.sessionId !== statsSession) {
     resetStats()
@@ -562,35 +564,16 @@ function syncStatsSession(l: Ledger): void {
   }
   if (l.generation === statsGeneration) return
   statsGeneration = l.generation
-  const gone = (id: string): boolean => !Object.hasOwn(l.runs, id)
-  for (const id of [...statsBase.keys()]) if (gone(id)) statsBase.delete(id)
-  for (const id of [...statsFinal]) if (gone(id)) statsFinal.delete(id)
-  for (const id of [...statsLast.keys()]) if (gone(id)) statsLast.delete(id)
-  for (const id of [...statsTried]) if (gone(id)) statsTried.delete(id)
+  for (const id of [...statsAcc.keys()]) if (!Object.hasOwn(l.runs, id)) statsAcc.delete(id)
 }
 
 const isOpencode = (run: Run): boolean => run.implementer === 'opencode' && (run.kind === 'cli' || run.kind === 'relay')
-/** A relay result gave this run's usage: it is exact, taken away from the runs around it, and never measured here. */
-const isExact = (run: Run): boolean => run.usageSource === 'relay'
-const wantsStats = (run: Run): boolean => isOpencode(run) && !isExact(run) && run.usageSource !== 'child'
 
-/** The folder a run is measured in: the one it ran in, else the session root; one key for either spelling of it. */
-function folderOf(run: Run, root: string | undefined): string {
-  if (run.workdir !== undefined) return workdirKey(run.workdir)
-  if (run.workdirKey !== undefined) return run.workdirKey
-  return root !== undefined ? workdirKey(root) : 'session'
-}
-
-/** Opencode runs that need a snapshot: running, or ended less than the grace ago and not yet given their final figures. */
-function statsLive(l: Ledger, now: number): Run[] {
-  const live: Run[] = []
-  for (const id of l.order) {
-    const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
-    if (!run || !wantsStats(run)) continue
-    if (run.status === 'running') live.push(run)
-    else if (run.endedAt !== undefined && now - run.endedAt < POLL_GRACE_MS && run.endedAt > statsFinalBefore && !statsFinal.has(run.id)) live.push(run)
-  }
-  return live
+/** An opencode run that stats may still measure: not a child report's, and running or ended less than the grace ago. */
+function statsCandidate(run: Run, now: number): boolean {
+  if (!isOpencode(run) || run.usageSource === 'child') return false
+  if (run.status === 'running') return true
+  return run.endedAt !== undefined && now - run.endedAt < POLL_GRACE_MS
 }
 
 async function statsRoot($: EngineInterface): Promise<string | undefined> {
@@ -601,159 +584,132 @@ async function statsRoot($: EngineInterface): Promise<string | undefined> {
   }
 }
 
-async function takeStats($: EngineInterface, cwd: string | undefined, timeoutMs: number): Promise<StatsSnapshot | null> {
+/** `at` is the request time: taken before the process is asked, so everything the snapshot holds was there at or after it. */
+async function takeStats($: EngineInterface, cwd: string, timeoutMs: number): Promise<StatsSnapshot | null> {
   try {
-    const r = await $.process.run(STATS_ARGV, { ...(cwd !== undefined ? { cwd } : {}), timeoutMs })
+    const at = Date.now()
+    const r = await $.process.run(STATS_ARGV, { cwd, timeoutMs })
     if (r.exitCode !== 0 || r.isStdoutTruncated) return null
-    return projectStats(r.stdout, Date.now())
+    return projectStats(r.stdout, at)
   } catch {
     return null
   }
 }
 
-/** Marks a run final; past the cap the oldest marker goes, and its end time becomes the line under which no run is picked up again. */
-function markFinal(l: Ledger, id: string): void {
-  statsFinal.add(id)
-  while (statsFinal.size > STATS_MAX_RUNS) {
-    const first = statsFinal.values().next()
-    if (first.done) return
-    statsFinal.delete(first.value)
-    const endedAt = Object.hasOwn(l.runs, first.value) ? l.runs[first.value]?.endedAt : undefined
-    if (endedAt !== undefined) statsFinalBefore = Math.max(statsFinalBefore, endedAt)
-  }
-}
-
 /**
- * Keeps the adapter's memory to what can still matter: nothing of a run the ledger lost, nothing of a run that is
- * finished and whose neighbours (runs it overlaps, chained) are all finished too, nothing of a folder not looked at for a
- * poll; and no map past its cap.
+ * The pending runs by folder (the directory the process runs in). A run that ended is pending while it has an
+ * accumulator, or while the folder's snapshot is older than its end (the next interval holds its last growth). A run
+ * not yet seen is admitted with an accumulator, up to STATS_MAX_RUNS; one beyond the cap is left out and shows "—".
+ * A run without a working directory whose directory key is another folder's (a restored run) cannot be measured.
  */
-function pruneStats(l: Ledger, now: number, clockNow: number, root: string | undefined): void {
-  const known = (id: string): boolean => Object.hasOwn(l.runs, id)
-  for (const id of [...statsFinal]) {
-    const run = known(id) ? l.runs[id] : undefined
-    if (!run || run.endedAt === undefined || now - run.endedAt >= POLL_GRACE_MS) statsFinal.delete(id)
-  }
-  const live = new Set(statsLive(l, now).map(r => r.id))
-  const byFolder = new Map<string, Run[]>()
+function statsFolders(l: Ledger, root: string | undefined, now: number): Map<string, StatsFolder> {
+  const folders = new Map<string, StatsFolder>()
   for (const id of l.order) {
-    const run = known(id) ? l.runs[id] : undefined
-    if (!run || !isOpencode(run) || (!live.has(id) && !statsBase.has(id))) continue
-    const folder = folderOf(run, root)
-    byFolder.set(folder, [...(byFolder.get(folder) ?? []), run])
-  }
-  const keep = new Set<string>()
-  for (const runs of byFolder.values()) {
-    for (const chain of chainByOverlap(runs, r => [r.startedAt, r.endedAt ?? now] as const)) {
-      if (chain.some(r => live.has(r.id))) for (const r of chain) keep.add(r.id)
+    const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
+    if (!run || !statsCandidate(run, now)) continue
+    const cwd = run.workdir ?? root
+    if (cwd === undefined) continue
+    if (run.workdir === undefined && run.workdirKey !== undefined && run.workdirKey !== workdirKey(cwd)) continue
+    const key = workdirKey(cwd)
+    if (run.status !== 'running' && !statsAcc.has(id)) {
+      const shot = statsShots.get(key)
+      if (shot === undefined || run.endedAt === undefined || shot.at >= run.endedAt) continue
     }
+    if (!statsAcc.has(id)) {
+      if (statsAcc.size >= STATS_MAX_RUNS) continue
+      statsAcc.set(id, { usage: { ...ZERO_USAGE }, cost: 0, approx: false, shared: 1, allocated: false })
+    }
+    const folder = folders.get(key)
+    if (folder) folder.runs.push(run)
+    else folders.set(key, { key, cwd, runs: [run] })
   }
-  for (const id of [...statsBase.keys()]) if (!keep.has(id)) statsBase.delete(id)
-  for (const id of [...statsLast.keys()]) if (!keep.has(id)) statsLast.delete(id)
-  for (const id of [...statsTried]) if (!keep.has(id)) statsTried.delete(id)
-  for (const [folder, at] of [...statsAttempt]) if (clockNow - at >= STATS_EVERY_MS) statsAttempt.delete(folder)
-  for (const [folder, taken] of [...statsTaken]) if (clockNow - taken.clockAt >= STATS_EVERY_MS) statsTaken.delete(folder)
-  capped(statsBase, STATS_MAX_RUNS)
-  capped(statsLast, STATS_MAX_RUNS)
-  capped(statsTried, STATS_MAX_RUNS)
-  capped(statsAttempt, STATS_MAX_FOLDERS)
-  capped(statsTaken, STATS_MAX_FOLDERS)
+  // a folder whose every pending run is settled has nothing to measure: no snapshot could change what its runs show
+  for (const [key, folder] of folders) if (folder.runs.every(isSettled)) folders.delete(key)
+  return folders
 }
 
-/** A run without a baseline takes the folder's last snapshot when that one can serve (taken just before it started, or after). */
-function adoptBaselines(folder: string, runs: readonly Run[]): void {
-  const taken = statsTaken.get(folder)
-  if (!taken) return
-  for (const run of runs) {
-    if (statsBase.has(run.id)) continue
-    const served = baselineFrom(run.startedAt, taken)
-    if (served) statsBase.set(run.id, { snap: taken.snap, approx: served.approx })
-  }
-  capped(statsBase, STATS_MAX_RUNS)
+/** Exact usage and a reported cost came from a relay result: no stats figure replaces either (a neighbour still needs it as a member). */
+const isSettled = (run: Run): boolean => run.usageSource === 'relay' && run.costLocked === 'relay'
+
+/** Folders without a snapshot first, then the oldest snapshot. */
+function statsOrder(folders: ReadonlyMap<string, StatsFolder>): StatsFolder[] {
+  const age = (f: StatsFolder): number => statsShots.get(f.key)?.at ?? -Infinity
+  return [...folders.values()].sort((a, b) => age(a) - age(b))
 }
 
-const sameFigures = (run: Run, share: StatsShare): boolean =>
-  run.usageSource === 'stats' &&
-  run.usage !== null &&
-  run.usage.uncached === share.usage.uncached &&
-  run.usage.output === share.usage.output &&
-  run.usage.cacheRead === share.usage.cacheRead &&
-  run.usage.cacheWrite === share.usage.cacheWrite &&
-  (run.costLocked === 'relay' || (run.cost === share.cost && run.costSource === 'reported')) &&
-  (run.approx === true) === share.approx &&
-  run.sharedKey === share.sharedKey &&
-  run.sharedSize === share.sharedSize
+const sameSent = (a: NonNullable<StatsAcc['sent']>, b: StatsAcc): boolean =>
+  a.usage.uncached === b.usage.uncached &&
+  a.usage.output === b.usage.output &&
+  a.usage.cacheRead === b.usage.cacheRead &&
+  a.usage.cacheWrite === b.usage.cacheWrite &&
+  a.cost === b.cost &&
+  a.approx === b.approx &&
+  a.shared === b.shared
 
 /**
- * Gives every opencode run of one folder its share of a snapshot, in one atomic ledger update. What a run shows is
- * compared with the ledger as it is now, so a relay result that changed the run is not hidden behind figures sent before.
+ * Takes `cur` as the folder's newest snapshot: the interval since the one before it is allocated to the pending runs
+ * active in it, and the runs whose figures changed get them in one atomic ledger update. A run is final once an interval
+ * that ended at or after its end has been allocated: it is dispatched once more and its accumulator is dropped.
  */
 async function applyStats(
   $: EngineInterface,
   table: PriceTable,
   sessionId: string,
-  folder: string,
-  taken: StatsTaken,
+  epoch: number,
+  key: string,
   root: string | undefined,
+  cur: StatsSnapshot,
 ): Promise<void> {
   const l = await read($, ledgerAtom)
-  if (l.sessionId !== sessionId) return
+  if (epoch !== statsEpoch || l.sessionId !== sessionId) return
   const now = Date.now()
-  const mine: Run[] = []
-  const exacts: StatsExact[] = []
-  for (const id of l.order) {
-    const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
-    if (!run || !isOpencode(run) || folderOf(run, root) !== folder) continue
-    if (isExact(run) && run.usage) exacts.push({ id, model: run.model, startedAt: run.startedAt, endedAt: run.endedAt, usage: run.usage, cost: run.cost })
-    else if (wantsStats(run)) mine.push(run)
+  const folder = statsFolders(l, root, now).get(key)
+  const prev = statsShots.get(key)
+  if (!folder) {
+    statsShots.delete(key)
+    return
   }
-  const liveIds = new Set(statsLive(l, now).map(r => r.id))
-  // a live run nothing could serve takes this snapshot as its baseline
-  for (const run of mine) {
-    if (!liveIds.has(run.id) || statsBase.has(run.id)) continue
-    statsBase.set(run.id, { snap: taken.snap, approx: (baselineFrom(run.startedAt, taken) ?? { approx: true }).approx })
+  statsShots.set(key, cur)
+  const given = new Map<string, Allocation>()
+  if (prev !== undefined) {
+    const runs: FolderRun[] = folder.runs.map(r => ({ id: r.id, model: r.model, startedAt: r.startedAt, endedAt: r.endedAt }))
+    for (const a of allocate(prev, cur, runs)) given.set(a.id, a)
   }
-  capped(statsBase, STATS_MAX_RUNS)
-
-  const measured: StatsRun[] = []
-  for (const run of mine) {
-    const base = statsBase.get(run.id)
-    if (!base) continue
-    const last = statsLast.get(run.id)
-    measured.push({
-      id: run.id,
-      model: run.model,
-      startedAt: run.startedAt,
-      endedAt: run.endedAt,
-      base: base.snap,
-      baseApprox: base.approx,
-      live: liveIds.has(run.id),
-      ...(last !== undefined ? { last } : {}),
-    })
-  }
-  const shares = planShares(folder, measured, exacts, taken.snap, now)
 
   const actions: Action[] = []
-  for (const share of shares) {
-    const run = Object.hasOwn(l.runs, share.id) ? l.runs[share.id] : undefined
-    const base = statsBase.get(share.id)
-    if (!run || !base) continue
-    const nothingYet = share.usage.uncached + share.usage.output + share.usage.cacheRead + share.usage.cacheWrite === 0 && share.cost === 0
-    // a running run whose first look is this snapshot has nothing to show yet; a run whose only look came after it ended was never measured
-    if (nothingYet && run.usage === null && run.status === 'running') continue
-    if (share.sharedKey === undefined && run.endedAt !== undefined && base.snap.at > run.endedAt) continue
-    if (sameFigures(run, share)) continue
+  const sending: Array<[StatsAcc, NonNullable<StatsAcc['sent']>]> = []
+  const finished: string[] = []
+  for (const run of folder.runs) {
+    const acc = statsAcc.get(run.id)
+    if (!acc) continue
+    const share = given.get(run.id)
+    if (share) {
+      // the run's first interval opens at a snapshot requested late: what happened before it is not measured
+      const late = !acc.allocated && prev !== undefined && prev.at > run.startedAt + STATS_RACE_MS
+      acc.usage = addUsage(acc.usage, share.usage)
+      acc.cost += share.cost
+      acc.approx = acc.approx || share.approx || late
+      acc.shared = Math.max(acc.shared, share.shared)
+      acc.allocated = true
+    }
+    const over = run.endedAt !== undefined && cur.at >= run.endedAt
+    if (over) finished.push(run.id)
+    if (over && !acc.allocated) continue // ended before the folder's first snapshot: nothing to show
+    const nothing = acc.cost === 0 && totalOf(acc.usage) === 0
+    if (acc.sent && sameSent(acc.sent, acc)) continue
+    if (nothing && !over) continue
     actions.push({
       type: 'adapterUsage',
-      id: share.id,
+      id: run.id,
       source: 'stats',
-      usage: share.usage,
-      cost: share.cost,
+      usage: acc.usage,
+      cost: acc.cost,
       costSource: 'reported',
-      ...(share.approx ? { approx: true } : {}),
-      ...(share.sharedKey !== undefined && share.sharedSize !== undefined ? { sharedKey: share.sharedKey, sharedSize: share.sharedSize } : {}),
+      ...(acc.approx ? { approx: true } : {}),
+      ...(acc.shared > 1 ? { sharedSize: acc.shared } : {}),
       at: now,
     })
+    sending.push([acc, { usage: acc.usage, cost: acc.cost, approx: acc.approx, shared: acc.shared }])
   }
 
   let applied = actions.length === 0
@@ -763,96 +719,99 @@ async function applyStats(
       return applied ? actions.reduce((acc, a) => reduce(acc, a, table), cur) : cur
     })
   }
-  if (!applied) return
-  for (const share of shares) statsLast.set(share.id, { usage: share.usage, cost: share.cost, basis: share.basis })
-  capped(statsLast, STATS_MAX_RUNS)
-  // a run is final once a snapshot that began after it ended has given it its figures
-  const attributed = new Set(shares.map(s => s.id))
-  for (const run of mine) {
-    if (liveIds.has(run.id) && run.status !== 'running' && run.endedAt !== undefined && taken.from >= run.endedAt && attributed.has(run.id)) markFinal(l, run.id)
-  }
+  if (epoch !== statsEpoch) return
+  if (applied) for (const [acc, sent] of sending) acc.sent = sent
+  for (const id of finished) statsAcc.delete(id)
+  if (folder.runs.every(r => finished.includes(r.id))) statsShots.delete(key)
 }
+
+const totalOf = (u: Usage): number => u.uncached + u.output + u.cacheRead + u.cacheWrite
 
 async function statsTick($: EngineInterface, table: PriceTable, options: PluginOptions): Promise<void> {
   if (statsBusy || options.opencodeStats !== 'on') return
   statsBusy = true
-  try {
-    const seen = await read($, ledgerAtom)
-    syncStatsSession(seen)
-    if (statsFailures >= STATS_MAX_FAILURES) return
-    const root = await statsRoot($)
-    const now = Date.now()
-    // the engine's clock paces the snapshots; run times are wall-clock like the rest of the ledger
-    const clockNow = await $.clock.now()
-    pruneStats(seen, now, clockNow, root)
-    const byFolder = new Map<string, Run[]>()
-    for (const run of statsLive(seen, now)) {
-      const folder = folderOf(run, root)
-      byFolder.set(folder, [...(byFolder.get(folder) ?? []), run])
-    }
-    for (const [folder, runs] of byFolder) {
-      adoptBaselines(folder, runs)
-      // a run nothing could serve may take one snapshot of its own past the pace; once
-      const lacking = runs.filter(r => !statsBase.has(r.id))
-      const own = lacking.filter(r => !statsTried.has(r.id))
-      const tickAt = await $.clock.now()
-      const last = statsAttempt.get(folder)
-      const due = last === undefined || tickAt - last >= STATS_EVERY_MS - STATS_SLACK_MS
-      if (!due && own.length === 0) continue
-      for (const run of lacking) statsTried.add(run.id)
-      capped(statsTried, STATS_MAX_RUNS)
-      statsAttempt.set(folder, tickAt)
-      capped(statsAttempt, STATS_MAX_FOLDERS)
-      const from = Date.now()
-      const snap = await takeStats($, runs.find(r => r.workdir !== undefined)?.workdir ?? root, STATS_TIMEOUT_MS)
-      if (snap === null) {
-        statsFailures += 1
-        if (statsFailures >= STATS_MAX_FAILURES) {
-          statsTimer?.cancel()
-          statsTimer = undefined
-          return
+  const work = (async (): Promise<void> => {
+    try {
+      const seen = await read($, ledgerAtom)
+      syncStatsSession(seen)
+      if (statsFailures >= STATS_MAX_FAILURES) return
+      const epoch = statsEpoch
+      const root = await statsRoot($)
+      // the engine's clock paces the snapshots; run times are wall-clock like the rest of the ledger
+      const clockNow = await $.clock.now()
+      if (epoch !== statsEpoch) return
+      const folders = statsFolders(seen, root, Date.now())
+      const pending = new Set<string>()
+      for (const folder of folders.values()) for (const run of folder.runs) pending.add(run.id)
+      for (const id of [...statsAcc.keys()]) if (!pending.has(id)) statsAcc.delete(id)
+      for (const key of [...statsShots.keys()]) if (!folders.has(key)) statsShots.delete(key)
+      for (const [key, at] of [...statsCalled]) if (clockNow - at >= STATS_EVERY_MS - STATS_SLACK_MS) statsCalled.delete(key)
+      for (const folder of statsOrder(folders)) {
+        // one call per folder per pace, never more; a folder past the cap waits for room
+        if (statsCalled.has(folder.key) || statsCalled.size >= STATS_MAX_FOLDERS) continue
+        if (!statsShots.has(folder.key) && statsShots.size >= STATS_MAX_FOLDERS) continue
+        statsCalled.set(folder.key, await $.clock.now())
+        const snap = await takeStats($, folder.cwd, STATS_TIMEOUT_MS)
+        if (epoch !== statsEpoch) return
+        if (snap === null) {
+          statsFailures += 1
+          if (statsFailures >= STATS_MAX_FAILURES) {
+            statsTimer?.cancel()
+            statsTimer = undefined
+            return
+          }
+          continue
         }
-        continue
+        statsFailures = 0
+        await applyStats($, table, seen.sessionId, epoch, folder.key, root, snap)
+        if (epoch !== statsEpoch) return
       }
-      statsFailures = 0
-      const taken: StatsTaken = { snap, from, clockAt: tickAt }
-      statsTaken.set(folder, taken)
-      capped(statsTaken, STATS_MAX_FOLDERS)
-      await applyStats($, table, seen.sessionId, folder, taken, root)
+    } catch {
+      // the next tick tries again
+    } finally {
+      statsBusy = false
     }
-  } catch {
-    // the next tick tries again
-  } finally {
-    statsBusy = false
-  }
+  })()
+  statsInflight = work
+  await work
+  if (statsInflight === work) statsInflight = undefined
 }
 
 /**
- * Before the session ends: one snapshot per folder (at most two, a short timeout, the pace ignored) for the runs that
- * have ended but not yet had their final figures, so the history keeps them. A failure leaves the last live figures.
+ * Before the session ends, within one deadline of STATS_EXIT_TIMEOUT_MS for the whole step: the tick in flight is awaited
+ * and applied, then one snapshot per folder that has an ended pending run (the pace ignored), so the history keeps their
+ * last growth. A failure leaves the last live figures.
  */
 async function finalStats($: EngineInterface, table: PriceTable, options: PluginOptions): Promise<void> {
-  if (statsBusy || options.opencodeStats !== 'on') return
+  if (options.opencodeStats !== 'on') return
+  const deadline = Date.now() + STATS_EXIT_TIMEOUT_MS
+  const inflight = statsInflight
+  if (inflight) {
+    let timer: Timer | undefined
+    const expired = new Promise<void>(resolve => {
+      timer = $.clock.after(STATS_EXIT_TIMEOUT_MS, () => resolve())
+    })
+    await Promise.race([inflight, expired])
+    timer?.cancel()
+  }
+  if (statsBusy) return
   statsBusy = true
   try {
     const seen = await read($, ledgerAtom)
     syncStatsSession(seen)
     if (statsFailures >= STATS_MAX_FAILURES) return
+    const epoch = statsEpoch
     const root = await statsRoot($)
-    const byFolder = new Map<string, Run[]>()
-    for (const run of statsLive(seen, Date.now())) {
-      if (run.status === 'running' || !statsBase.has(run.id)) continue
-      const folder = folderOf(run, root)
-      byFolder.set(folder, [...(byFolder.get(folder) ?? []), run])
-    }
-    for (const [folder, runs] of [...byFolder].slice(0, STATS_EXIT_FOLDERS)) {
-      const tickAt = await $.clock.now()
-      const from = Date.now()
-      const snap = await takeStats($, runs.find(r => r.workdir !== undefined)?.workdir ?? root, STATS_EXIT_TIMEOUT_MS)
+    const folders = statsFolders(seen, root, Date.now())
+    for (const folder of statsOrder(folders)) {
+      if (!statsShots.has(folder.key) || !folder.runs.some(r => r.status !== 'running')) continue
+      const remaining = deadline - Date.now()
+      if (remaining < STATS_EXIT_MIN_MS) break
+      const snap = await takeStats($, folder.cwd, remaining)
+      if (epoch !== statsEpoch) return
       if (snap === null) continue
-      const taken: StatsTaken = { snap, from, clockAt: tickAt }
-      statsTaken.set(folder, taken)
-      await applyStats($, table, seen.sessionId, folder, taken, root)
+      await applyStats($, table, seen.sessionId, epoch, folder.key, root, snap)
+      if (epoch !== statsEpoch) return
     }
   } catch {
     // the history keeps the last live figures
@@ -861,17 +820,24 @@ async function finalStats($: EngineInterface, table: PriceTable, options: Plugin
   }
 }
 
-/** Called by the watch tick: the stats timer exists while the setting is on and an opencode run needs a snapshot; a run not seen yet is looked at at once. */
+/** Called by the watch tick: the stats timer exists while the setting is on and an opencode run may need a snapshot; a run not seen yet is looked at at once. */
 function watchStats($: EngineInterface, table: PriceTable, options: PluginOptions, l: Ledger, now: number): void {
   syncStatsSession(l)
-  const live = options.opencodeStats === 'on' && statsFailures < STATS_MAX_FAILURES ? statsLive(l, now) : []
-  if (live.length === 0) {
+  const wanted: Run[] = []
+  if (options.opencodeStats === 'on' && statsFailures < STATS_MAX_FAILURES) {
+    for (const id of l.order) {
+      const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
+      if (!run || !statsCandidate(run, now)) continue
+      if (run.status === 'running' || statsAcc.has(id) || statsShots.size > 0) wanted.push(run)
+    }
+  }
+  if (wanted.length === 0) {
     statsTimer?.cancel()
     statsTimer = undefined
     return
   }
   if (!statsTimer) statsTimer = $.clock.every(STATS_EVERY_MS, () => void statsTick($, table, options))
-  if (live.some(r => !statsBase.has(r.id))) void statsTick($, table, options)
+  if (statsAcc.size < STATS_MAX_RUNS && wanted.some(r => r.status === 'running' && !statsAcc.has(r.id))) void statsTick($, table, options)
 }
 
 async function saveWhileActive($: EngineInterface, options: PluginOptions): Promise<void> {

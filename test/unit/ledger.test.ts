@@ -420,10 +420,30 @@ test('relay-reported usage and cost beat a child report and stats', () => {
   expect(r.cost).toBe(0.9)
 })
 
-test('a relay result without a reported cost does not block an adapter', () => {
-  const l = apply(emptyLedger('s1', T0), relayStart('r1'), relayDone('r1', null), adapter('r1', 'stats', 5))
-  expect(l.runs['r1']!.usageSource).toBe('stats')
-  expect(l.runs['r1']!.usage).toEqual(used(5))
+// changed with the interval allocation: a relay's exact usage no longer gives way to a stats figure (only its cost does)
+test('a relay result without a reported cost keeps its exact tokens against stats and takes the stats cost, unlocked', () => {
+  const l = apply(emptyLedger('s1', T0), relayStart('r1'), relayDone('r1', null), adapter('r1', 'stats', 5, { cost: 0.2 }),
+    adapter('r1', 'stats', 9, { cost: 0.8, approx: true, sharedSize: 2 }))
+  const r = l.runs['r1']!
+  expect(r.usageSource).toBe('relay')
+  expect(r.usage).toEqual(used(777))
+  expect(r.cost).toBe(0.8)
+  expect(r.costSource).toBe('reported')
+  expect(r.costLocked).toBeUndefined()
+  // the exact figures carry no approximation or share mark, whatever the adapter says
+  expect(r.approx).toBeUndefined()
+  expect(r.sharedSize).toBeUndefined()
+})
+
+test('a relay result with a reported cost and no usage lets stats update the tokens and holds the cost', () => {
+  const l = apply(emptyLedger('s1', T0), relayStart('r1'), relayProj('r1', 2, null), adapter('r1', 'stats', 40, { cost: 5 }),
+    adapter('r1', 'stats', 90, { cost: 6 }))
+  const r = l.runs['r1']!
+  expect(r.usage).toEqual(used(90))
+  expect(r.usageSource).toBe('stats')
+  expect(r.cost).toBe(2)
+  expect(r.costSource).toBe('reported')
+  expect(r.costLocked).toBe('relay')
 })
 
 test('a child report beats stats whichever arrives first', () => {
@@ -442,10 +462,9 @@ test('an adapter report for an unknown run changes nothing', () => {
 
 test('a newer adapter report without the approximate and shared fields clears them', () => {
   const l = apply(emptyLedger('s1', T0), cliStart('r1'),
-    adapter('r1', 'stats', 10, { approx: true, sharedKey: 'k', sharedSize: 2 }), adapter('r1', 'stats', 20))
+    adapter('r1', 'stats', 10, { approx: true, sharedSize: 2 }), adapter('r1', 'stats', 20))
   const r = l.runs['r1']!
   expect(r.approx).toBeUndefined()
-  expect(r.sharedKey).toBeUndefined()
   expect(r.sharedSize).toBeUndefined()
 })
 
@@ -461,38 +480,33 @@ test('a child report ends a running run once, and never one the Bash side alread
   expect(failedBySide.runs['r1']!.endedAt).toBe(T0 + 2000)
 })
 
-const group = (extra: Partial<Extract<Action, { type: 'adapterUsage' }>> = {}): Action[] =>
-  ['r1', 'r2', 'r3'].map(id => adapter(id, 'stats', 300, { sharedKey: 'oc|/w', sharedSize: 3, cost: 1.5, ...extra }))
+const share = (extra: Partial<Extract<Action, { type: 'adapterUsage' }>> = {}): Action[] =>
+  ['r1', 'r2', 'r3'].map(id => adapter(id, 'stats', 100, { sharedSize: 3, cost: 0.5, ...extra }))
 
-test('a shared group of three counts once in totals and the station rows, also after one member ends', () => {
-  const started = apply(emptyLedger('s1', T0), cliStart('r1'), cliStart('r2'), cliStart('r3'), ...group())
+// replaces the count-once test of a shared group: every run now holds its own share and the sums are plain
+test('three runs that each hold a share of a split are summed plainly in totals and the station rows, also after one ends', () => {
+  const started = apply(emptyLedger('s1', T0), cliStart('r1'), cliStart('r2'), cliStart('r3'), ...share())
   const check = (l: Ledger) => {
     const t = totals(l)
-    expect(t.usage).toEqual(used(300))
+    expect(t.usage).toEqual({ uncached: 300, output: 30, cacheRead: 0, cacheWrite: 0 })
     near(t.cost, 1.5)
     near(t.byImplementer['opencode'], 1.5)
     const rows = stationRowsFromLedger(l)
     expect(rows.length).toBe(1)
     expect(rows[0]!.uncached).toBe(300)
     near(rows[0]!.costReported, 1.5)
-    // three runs are three ops; only the spend is taken once
     expect(rows[0]!.ops).toBe(3)
-    expect(rows[0]!.usageOps).toBe(1)
+    expect(rows[0]!.usageOps).toBe(3)
     for (const id of ['r1', 'r2', 'r3']) expect(l.runs[id]!.sharedSize).toBe(3)
   }
   check(started)
-  // a later member ends: nothing moves
   const lateEnd = apply(started, { type: 'bashResult', id: 'r3', isError: false, interrupted: false, at: T0 + 6000 })
   check(lateEnd)
   expect(totals(lateEnd).done).toBe(1)
   expect(totals(lateEnd).running).toBe(2)
-  // the first member ends early and the others catch up to the same total: still once
-  const earlyEnd = apply(started, { type: 'bashResult', id: 'r1', isError: false, interrupted: false, at: T0 + 6000 },
-    ...group({ at: T0 + 7000 }))
-  check(earlyEnd)
 })
 
-test('runs with the same model but no shared key still count separately', () => {
+test('runs with the same model count separately', () => {
   const l = apply(emptyLedger('s1', T0), cliStart('r1'), cliStart('r2'), adapter('r1', 'stats', 100), adapter('r2', 'stats', 100))
   expect(totals(l).usage).toEqual({ uncached: 200, output: 20, cacheRead: 0, cacheWrite: 0 })
   expect(stationRowsFromLedger(l)[0]!.uncached).toBe(200)
@@ -521,17 +535,17 @@ test('a child run puts its rows on their implementer × model station rows and n
   expect(totals(l).usage).toEqual(used(1400))
 })
 
-test('a stored record keeps its shape with shared groups and child rows, and hqByModel is not in it', () => {
+test('a stored record keeps its shape with shared runs and child rows, and hqByModel is not in it', () => {
   const rows = [{ implementer: 'opencode' as const, model: OC_MODEL, usage: used(400), cost: 0.5, costSource: 'reported' as const }]
   const l = apply(emptyLedger('s1', T0), cliStart('c1', 'claude', OPUS), cliStart('r2'), cliStart('r3'),
     adapter('c1', 'child', 400, { rows }),
-    adapter('r2', 'stats', 300, { sharedKey: 'k', sharedSize: 2 }), adapter('r3', 'stats', 300, { sharedKey: 'k', sharedSize: 2 }),
+    adapter('r2', 'stats', 300, { sharedSize: 2 }), adapter('r3', 'stats', 300, { sharedSize: 2 }),
     { type: 'step', turnId: 't1', index: 0, model: OPUS, usage: stepUsage(OPUS), at: T0 })
   const record = recordFromLedger(l)
   expect(Object.keys(record).sort()).toEqual(['days', 'sessionStartedAt', 'v'])
   expect(JSON.stringify(record)).not.toContain('hqByModel')
   const day = Object.values(record.days)[0]!
-  expect(day[`opencode|${OC_MODEL}`]!.uncached).toBe(700)
+  expect(day[`opencode|${OC_MODEL}`]!.uncached).toBe(1000)
 })
 
 const flat = (tokens: number) => ({ uncached: tokens, output: 0, cacheRead: 0, cacheWrite: 0 })
@@ -546,15 +560,18 @@ test('adapter usage adds only its rise to the tokens-per-minute series', () => {
   expect(nowSeries(apply(l, reported('r1', 20_000)))).toBe(25_000)
 })
 
-test('a shared group adds its rise to the series once, whichever member reports first', () => {
-  const shared = { sharedKey: 'k', sharedSize: 2 }
+// replaces the group-max series test: each run's own rise counts, with no group maximum
+test('two runs each reported 50 then 80 tokens add up to 160 in the series and in the totals', () => {
+  const shared = { sharedSize: 2 }
   const start = [cliStart('r1'), cliStart('r2')]
-  const inOrder = apply(emptyLedger('s1', T0), ...start,
-    reported('r1', 10_000, shared), reported('r2', 10_000, shared), reported('r1', 25_000, shared), reported('r2', 25_000, shared))
-  expect(nowSeries(inOrder)).toBe(25_000)
+  const l = apply(emptyLedger('s1', T0), ...start,
+    reported('r1', 50, shared), reported('r2', 50, shared), reported('r1', 80, shared), reported('r2', 80, shared))
+  expect(nowSeries(l)).toBe(160)
+  expect(totals(l).usage.uncached).toBe(160)
+  // the other order gives the same sum
   const crossed = apply(emptyLedger('s1', T0), ...start,
-    reported('r1', 10_000, shared), reported('r2', 10_000, shared), reported('r2', 25_000, shared), reported('r1', 25_000, shared))
-  expect(nowSeries(crossed)).toBe(25_000)
+    reported('r2', 50, shared), reported('r1', 50, shared), reported('r2', 80, shared), reported('r1', 80, shared))
+  expect(nowSeries(crossed)).toBe(160)
 })
 
 test('an adapter report a higher source ignores adds nothing to the series', () => {
@@ -628,19 +645,18 @@ test('a relay cost held without usage beats later stats cost, while stats tokens
 
 test('an exact relay result drops the approximate, shared and rows marks an adapter had set', () => {
   const l = apply(emptyLedger('s1', T0), relayStart('r1'), cliStart('r2'),
-    adapter('r1', 'stats', 100, { cost: 3, approx: true, sharedKey: 'k', sharedSize: 2 }),
-    adapter('r2', 'stats', 100, { cost: 3, approx: true, sharedKey: 'k', sharedSize: 2 }),
+    adapter('r1', 'stats', 100, { cost: 3, approx: true, sharedSize: 2 }),
+    adapter('r2', 'stats', 100, { cost: 3, approx: true, sharedSize: 2 }),
     relayProj('r1', 1, used(40)))
   const r = l.runs['r1']!
   expect(r.usage).toEqual(used(40))
   expect(r.cost).toBe(1)
   expect(r.usageSource).toBe('relay')
-  expect(r.sharedKey).toBeUndefined()
   expect(r.sharedSize).toBeUndefined()
   expect(r.approx).toBeUndefined()
   expect(r.rows).toBeUndefined()
-  // the other member is untouched by the reducer: the stats glue re-measures it
-  expect(l.runs['r2']!.sharedKey).toBe('k')
+  // the other run is untouched by the reducer
+  expect(l.runs['r2']!.sharedSize).toBe(2)
 })
 
 test('a relay result with usage but no cost keeps the adapter cost; one with neither keeps usage, source and cost', () => {
@@ -678,20 +694,24 @@ test('relay usage joins the series only by its rise over what stats already show
   expect(nowSeries(apply(emptyLedger('s1', T0), relayStart('r1'), flatRelay(100)))).toBe(100)
 })
 
-test('clearing one member of a shared group while another runs retires its ops, not the spend; the last member retires it once', () => {
-  const shared = { sharedKey: 'k', sharedSize: 2, cost: 1 }
-  const started = apply(emptyLedger('s1', T0), cliStart('r1'), cliStart('r2'), adapter('r1', 'stats', 100, shared), adapter('r2', 'stats', 100, shared))
-  expect(sumRecord(started)).toEqual({ ops: 2, uncached: 100, costReported: 1 })
+// replaces the retire-once test of a shared group: a cleared run retires its own figures, a kept peer keeps its own
+test('clearing a run that held a share while its peer is kept retires the removed run own figures; the history total is both cards', () => {
+  const shared = { sharedSize: 2, cost: 1 }
+  const started = apply(emptyLedger('s1', T0), cliStart('r1'), cliStart('r2'), adapter('r1', 'stats', 60, shared), adapter('r2', 'stats', 40, shared))
+  expect(sumRecord(started)).toEqual({ ops: 2, uncached: 100, costReported: 2 })
   const firstGone = apply(started, { type: 'bashResult', id: 'r1', isError: false, interrupted: false, at: T0 + 6000 }, { type: 'clear', at: T0 + 7000 })
   expect(Object.keys(firstGone.runs)).toEqual(['r2'])
-  expect(sumRecord(firstGone)).toEqual({ ops: 2, uncached: 100, costReported: 1 })
+  expect(firstGone.runs['r2']!.usage).toEqual(used(40))
+  // retired: only r1's own 60 tokens and $1; the record is retired plus the kept card
+  expect(sumRecord({ ...firstGone, runs: {}, order: [] })).toEqual({ ops: 1, uncached: 60, costReported: 1 })
+  expect(sumRecord(firstGone)).toEqual({ ops: 2, uncached: 100, costReported: 2 })
   const bothGone = apply(firstGone, { type: 'bashResult', id: 'r2', isError: false, interrupted: false, at: T0 + 8000 }, { type: 'clear', at: T0 + 9000 })
   expect(Object.keys(bothGone.runs)).toEqual([])
-  expect(sumRecord(bothGone)).toEqual({ ops: 2, uncached: 100, costReported: 1 })
-  // a group cleared whole in one go is retired once as well
+  expect(sumRecord(bothGone)).toEqual({ ops: 2, uncached: 100, costReported: 2 })
+  // cleared whole in one go: the same sums
   const together = apply(started, { type: 'bashResult', id: 'r1', isError: false, interrupted: false, at: T0 + 6000 },
     { type: 'bashResult', id: 'r2', isError: false, interrupted: false, at: T0 + 6000 }, { type: 'clear', at: T0 + 7000 })
-  expect(sumRecord(together)).toEqual({ ops: 2, uncached: 100, costReported: 1 })
+  expect(sumRecord(together)).toEqual({ ops: 2, uncached: 100, costReported: 2 })
 })
 
 test('hqByModel is read as empty on a ledger saved without it', () => {

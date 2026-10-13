@@ -135,6 +135,7 @@ export function dossierView(
       {row('duration', fmtDuration(runElapsed(run, now)))}
       <Text> </Text>
       {run.usageSource !== null && row('source', runSource(run))}
+      {run.sharedSize !== undefined && run.sharedSize > 1 && row('shared', `even share of ${run.sharedSize} runs`)}
       {row('input', u ? fmtTokens(u.uncached + u.cacheRead + u.cacheWrite) : runTokens(run))}
       {row('  uncached', u ? fmtTokens(u.uncached) : runTokens(run))}
       {row('  cache read', u ? fmtTokens(u.cacheRead) : runTokens(run))}

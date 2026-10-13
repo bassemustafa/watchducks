@@ -142,28 +142,37 @@ test('addRunsToDays adds to a copy: the input days are not changed', () => {
   expect(more['2026-10-10']!['claude|m']!.ops).toBe(1)
 })
 
-const SHARED = { ...OPENCODE, usageSource: 'stats' as const, cost: 1.5, sharedKey: 'oc|/w', sharedSize: 3 }
+// replaces the count-once tests of a shared group: a run that holds a share adds its own spend and its own op
+const SHARED = { ...OPENCODE, usageSource: 'stats' as const, cost: 1.5, sharedSize: 3 }
 
-test('a shared group adds every member as an op on its own end day, and its spend once on the first member\'s day', () => {
+test('runs that hold a share each add their own spend and op on their own end day', () => {
   const next = Date.UTC(2026, 9, 10, 1)
   const days = addRunsToDays({}, [run('s1', SHARED), run('s2', { ...SHARED, endedAt: next }), run('s3', SHARED)])
   const first = days['2026-10-09']!['opencode|openai/gpt-6.1-sol']!
   expect(first.ops).toBe(2)
-  expect(first.uncached).toBe(100)
-  expect(first.costReported).toBe(1.5)
-  expect(first.usageOps).toBe(1)
-  expect(first.costOps).toBe(1)
+  expect(first.uncached).toBe(200)
+  expect(first.costReported).toBe(3)
+  expect(first.usageOps).toBe(2)
+  expect(first.costOps).toBe(2)
   const later = days['2026-10-10']!['opencode|openai/gpt-6.1-sol']!
   expect(later.ops).toBe(1)
   expect(later.done).toBe(1)
-  expect(later.uncached).toBe(0)
-  expect(later.costReported).toBe(0)
-  expect(later.usageOps).toBe(0)
-  expect(later.costOps).toBe(0)
+  expect(later.uncached).toBe(100)
+  expect(later.costReported).toBe(1.5)
+  expect(later.usageOps).toBe(1)
+  expect(later.costOps).toBe(1)
 })
 
-test('each member of a shared group keeps its own status, review and bugs; only spend and unknown-cost marks are taken once', () => {
-  const group = { kind: 'agent' as const, implementer: 'claude' as const, model: 'm', sharedKey: 'k', sharedSize: 3 }
+test('two runs with sharedSize 2 add both spends to the day, not one', () => {
+  const pair = (id: string) => run(id, { ...SHARED, sharedSize: 2 })
+  const day = Object.values(addRunsToDays({}, [pair('a'), pair('b')]))[0]!['opencode|openai/gpt-6.1-sol']!
+  expect(day.ops).toBe(2)
+  expect(day.uncached).toBe(200)
+  expect(day.costReported).toBe(3)
+})
+
+test('each run that holds a share keeps its own status, review, bugs and unknown-cost mark', () => {
+  const group = { kind: 'agent' as const, implementer: 'claude' as const, model: 'm', sharedSize: 3 }
   const review = { reviewerId: 'hq', bugs: 2, edits: 1, source: 'verdict' as const, at: 1 }
   const days = addRunsToDays({}, [
     run('g1', { ...group, status: 'done' }),
@@ -173,16 +182,16 @@ test('each member of a shared group keeps its own status, review and bugs; only 
   const c = days['2026-10-09']!['claude|m']!
   expect([c.ops, c.done, c.failed, c.killed]).toEqual([3, 1, 1, 1])
   expect([c.vetted, c.bugs]).toEqual([1, 5])
-  expect(c.unknownCostOps).toBe(1)
+  expect(c.unknownCostOps).toBe(3)
 })
 
-test('shared groups count their spend once and every member as an op on the live station rows, with the record shape unchanged', () => {
+test('runs that hold a share each count their spend and op on the live station rows, with the record shape unchanged', () => {
   const ledger = ledgerOf([run('s1', SHARED), run('s2', SHARED), run('o1', OPENCODE)])
   const rows = stationRowsFromLedger(ledger)
   expect(rows.length).toBe(1)
   expect(rows[0]!.ops).toBe(3)
-  expect(rows[0]!.uncached).toBe(200)
-  expect(rows[0]!.usageOps).toBe(2)
+  expect(rows[0]!.uncached).toBe(300)
+  expect(rows[0]!.usageOps).toBe(3)
   expect(Object.keys(recordFromLedger(ledger)).sort()).toEqual(['days', 'sessionStartedAt', 'v'])
 })
 
@@ -204,18 +213,4 @@ test('a run with child rows adds its spend to the rows implementer × model and 
   expect(bucket['opencode|openai/gpt-6.1-sol']!.uncached).toBe(50)
   expect(bucket['opencode|openai/gpt-6.1-sol']!.costReported).toBe(0.5)
   expect(stationRowsFromLedger(ledgerOf([child])).length).toBe(2)
-})
-
-test('a shared group still held elsewhere adds its members ops to the days but not its spend', () => {
-  const member = (id: string) => run(id, { ...SHARED, sharedKey: 'k' })
-  const held = addRunsToDays({}, [member('a'), member('b')], new Set(['k']))
-  const day = Object.values(held)[0]!['opencode|openai/gpt-6.1-sol']!
-  expect(day.ops).toBe(2)
-  expect(day.uncached).toBe(0)
-  expect(day.costReported).toBe(0)
-  // without the hold the group's spend counts once
-  const whole = Object.values(addRunsToDays({}, [member('a'), member('b')]))[0]!['opencode|openai/gpt-6.1-sol']!
-  expect(whole.ops).toBe(2)
-  expect(whole.uncached).toBe(100)
-  expect(whole.costReported).toBe(1.5)
 })

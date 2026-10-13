@@ -33,7 +33,6 @@ export type Action =
       cost: number | null
       costSource: 'reported' | 'estimated' | null
       approx?: boolean
-      sharedKey?: string
       sharedSize?: number
       model?: string
       rows?: Run['rows']
@@ -455,8 +454,8 @@ function reduceRelayResult(ledger: Ledger, a: Extract<Action, { type: 'relayResu
       costSource = 'estimated'
     }
   }
-  // exact usage leaves any group, approximation and breakdown an adapter had given the run
-  const { approx: _approx, sharedKey: _sharedKey, sharedSize: _sharedSize, rows: _rows, ...bare } = run
+  // exact usage leaves any share, approximation and breakdown an adapter had given the run
+  const { approx: _approx, sharedSize: _sharedSize, rows: _rows, ...bare } = run
   const updated: Run = {
     ...(p.usage ? bare : run),
     implementer,
@@ -476,66 +475,48 @@ function reduceRelayResult(ledger: Ledger, a: Extract<Action, { type: 'relayResu
   }
   const settled = p.status === 'running' ? updated : finish(updated, p.status, p.finishedAt ?? a.at)
   const next = withHandlers(putRun(ledger, settled))
-  // relay usage joins the tokens-per-minute series by its rise over what the run already showed (stats may have counted it)
+  // relay usage joins the tokens-per-minute series by its rise over what this run already showed (stats may have counted it)
   if (!p.usage) return next
-  const rise = totalTokens(p.usage) - shownTokens(ledger, run)
+  const rise = totalTokens(p.usage) - totalTokens(run.usage)
   return rise > 0 ? bumpSeries(next, a.at, rise) : next
 }
 
 const totalTokens = (u: Usage | null): number => (u ? u.uncached + u.output + u.cacheRead + u.cacheWrite : 0)
 
-/** The most tokens the run, or any member of its shared group, already showed: a group's rise is counted once. */
-function shownTokens(ledger: Ledger, run: Run): number {
-  let shown = totalTokens(run.usage)
-  if (run.sharedKey !== undefined) {
-    for (const other of Object.values(ledger.runs)) if (other.sharedKey === run.sharedKey) shown = Math.max(shown, totalTokens(other.usage))
-  }
-  return shown
-}
-
-/** A relay result that reported a cost holds it against every adapter (also when it carried no usage). */
-function costIsLocked(run: Run): boolean {
-  return run.costLocked === 'relay' || (run.usageSource === 'relay' && run.costSource === 'reported')
-}
-
 /**
  * Usage an adapter measured for a run (spec §3, §4, §4.7): the values are totals and replace the run's.
- * A relay's reported result wins over everything; a child report wins over stats.
+ * A relay's exact usage stays whatever an adapter says (its cost is replaced unless the relay reported one); a relay's
+ * reported cost holds against every adapter; a child report wins over stats.
  */
 function reduceAdapterUsage(ledger: Ledger, a: Extract<Action, { type: 'adapterUsage' }>): Ledger {
   const run = getRun(ledger, a.id)
   if (!run) return ledger
-  const locked = costIsLocked(run)
+  const exact = run.usageSource === 'relay'
+  const locked = run.costLocked === 'relay'
   // a relay result that gave both usage and a cost is exact: nothing replaces it
-  if (locked && run.usageSource === 'relay') return ledger
+  if (locked && exact) return ledger
   if (run.usageSource === 'child' && a.source === 'stats') return ledger
-  const rows = a.rows?.slice(0, MAX_ROWS)
-  const { approx: _approx, sharedKey: _sharedKey, sharedSize: _sharedSize, rows: _rows, ...rest } = run
+  const rows = exact ? undefined : a.rows?.slice(0, MAX_ROWS)
+  const { approx: _approx, sharedSize: _sharedSize, rows: _rows, ...rest } = run
   // a report that carries no cost leaves the cost the run had; a cost a relay reported stays whatever the adapter says
   const keepCost = locked || (a.cost === null && a.costSource === null)
   const updated: Run = {
     ...rest,
-    usage: a.usage,
-    usageSource: a.source,
+    usage: exact ? run.usage : a.usage,
+    usageSource: exact ? 'relay' : a.source,
     cost: keepCost ? run.cost : a.cost,
     costSource: keepCost ? run.costSource : a.costSource,
     costPartial: locked ? run.costPartial : (rows?.some(r => r.cost === null) ?? false) || (keepCost && run.costPartial),
     ...(a.model !== undefined ? { model: a.model } : {}),
-    ...(a.approx ? { approx: true } : {}),
-    ...(a.sharedKey !== undefined ? { sharedKey: a.sharedKey } : {}),
-    ...(a.sharedKey !== undefined && a.sharedSize !== undefined ? { sharedSize: a.sharedSize } : {}),
+    ...(!exact && a.approx ? { approx: true } : {}),
+    ...(!exact && a.sharedSize !== undefined ? { sharedSize: a.sharedSize } : {}),
     ...(rows !== undefined ? { rows } : {}),
   }
   // a report's end only counts while the Bash side has not ended the run
   const settled = a.status !== undefined && a.status !== 'running' && run.status === 'running'
   const next = settled ? withHandlers(putRun(ledger, finish(updated, a.status!, a.at))) : putRun(ledger, updated)
-  // the rise joins the tokens-per-minute series; a shared group's members all show the group's total, so the
-  // rise is measured against the highest total any member already showed and the group adds it once
-  let before = totalTokens(run.usage)
-  if (a.sharedKey !== undefined) {
-    for (const other of Object.values(ledger.runs)) if (other.sharedKey === a.sharedKey) before = Math.max(before, totalTokens(other.usage))
-  }
-  const rise = totalTokens(a.usage) - before
+  // the rise joins the tokens-per-minute series: this run's total after less its total before
+  const rise = totalTokens(updated.usage) - totalTokens(run.usage)
   return rise > 0 ? bumpSeries(next, a.at, rise) : next
 }
 
@@ -565,12 +546,6 @@ function reduceVerdict(ledger: Ledger, a: Extract<Action, { type: 'verdict' }>):
   return putRun(ledger, { ...target, reviews })
 }
 
-function sharedKeysOf(runs: readonly Run[]): Set<string> {
-  const keys = new Set<string>()
-  for (const run of runs) if (run.sharedKey !== undefined) keys.add(run.sharedKey)
-  return keys
-}
-
 function reduceClear(ledger: Ledger, at: number): Ledger {
   const kept: Record<string, Run> = {}
   const removed: Run[] = []
@@ -593,8 +568,7 @@ function reduceClear(ledger: Ledger, at: number): Ledger {
     findings,
     bgSeen,
     // days past the 30-day window can never reach the board, so they are not kept
-    // a group that still has members here keeps its spend with them: it is retired once, with the last member
-    retired: dropOldDays(addRunsToDays(ledger.retired ?? {}, removed, sharedKeysOf(Object.values(kept))), at),
+    retired: dropOldDays(addRunsToDays(ledger.retired ?? {}, removed), at),
   })
 }
 
@@ -688,15 +662,8 @@ export function totals(ledger: Ledger): Totals {
     costPartial: false,
     byImplementer: {},
   }
-  // runs of a shared group each show the group's total: it is counted once, through the first in order
-  const firstOf = new Map<string, string>()
-  for (const id of ledger.order) {
-    const key = getRun(ledger, id)?.sharedKey
-    if (key !== undefined && !firstOf.has(key)) firstOf.set(key, id)
-  }
   for (const run of Object.values(ledger.runs)) {
     t[run.status] += 1
-    if (run.sharedKey !== undefined && firstOf.has(run.sharedKey) && firstOf.get(run.sharedKey) !== run.id) continue
     if (run.usage) t.usage = addUsage(t.usage, run.usage)
     if (run.cost !== null) t.cost = (t.cost ?? 0) + run.cost
     if ((run.kind === 'agent' || run.kind === 'relay') && (run.cost === null || run.costPartial)) t.costPartial = true

@@ -55,11 +55,9 @@ export type Run = {
   outDir?: string
   /** True once a relay result.json was applied; live only, so a reload never reads a reused out-dir again. */
   resultRead?: boolean
-  /** True when the figures are a best estimate (a stats counter fell, or opencode was used elsewhere in the folder). */
+  /** True when the figures are a best estimate (an even share, a late baseline, a stats counter that fell, or opencode used elsewhere in the folder). */
   approx?: boolean
-  /** Same-model, same-folder opencode runs share one key; their combined total is counted once. */
-  sharedKey?: string
-  /** How many runs share `sharedKey`. */
+  /** How many runs the figures were split among, when more than one (an even share of the same stats row). */
   sharedSize?: number
   /** Set when a relay result reported the cost: no adapter replaces that cost, whether or not the result carried usage. */
   costLocked?: 'relay'

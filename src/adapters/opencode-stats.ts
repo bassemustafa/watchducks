@@ -1,9 +1,8 @@
 import type { Usage } from '../../types'
-import { fingerprint } from '../collect/relay'
 import { ident } from '../relay-result'
 
-// Pure projection of `opencode stats --json` stdout (spec §3.3) and the attribution of a
-// run's share of it (spec §3.5). Values are read by name only: the parsed object is never
+// Pure projection of `opencode stats --json` stdout (spec §3.3) and the allocation of the
+// growth between two snapshots to the runs active in it (spec §3.5). Values are read by name only: the parsed object is never
 // iterated, stringified or kept, so no field outside the allow-list can leave this module.
 
 export type StatsTokens = { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
@@ -124,230 +123,95 @@ export function rowKey(snapshot: StatsSnapshot, model: string | undefined): stri
   return hits.length === 1 ? hits[0]! : null
 }
 
-/** `model` matches a key exactly or by its part after the last '/' (a run's `-m openai/gpt-6.1-sol` or `gpt-6.1-sol`). */
-export function attribute(base: StatsSnapshot, latest: StatsSnapshot, model: string | undefined): { usage: Usage; cost: number; approx: boolean; byModel: boolean } {
-  const key = rowKey(latest, model)
-  const to = key === null ? latest.total : latest.models[key]!
-  const from = key === null ? base.total : (Object.hasOwn(base.models, key) ? base.models[key]! : ZERO)
 
-  let approx = false
-  const delta = (now: number, before: number): number => {
-    if (now < before) {
-      approx = true
-      return 0
-    }
-    return now - before
-  }
+/** An opencode run as the allocation sees it: who, which model, and when it ran (wall-clock ms). */
+export type FolderRun = { id: string; model: string | undefined; startedAt: number; endedAt: number | undefined }
+/** What one run was given from the growth between two snapshots of its folder. */
+export type Allocation = { id: string; usage: Usage; cost: number; shared: number; approx: boolean }
 
-  const usage: Usage = {
-    uncached: delta(to.input, from.input),
-    output: delta(to.output, from.output) + delta(to.reasoning, from.reasoning),
-    cacheRead: delta(to.cacheRead, from.cacheRead),
-    cacheWrite: delta(to.cacheWrite, from.cacheWrite),
+const COUNTERS = ['input', 'output', 'reasoning', 'cacheRead', 'cacheWrite', 'cost'] as const
+type Counter = (typeof COUNTERS)[number]
+type Delta = { values: Record<Counter, number>; regressed: boolean }
+
+/** Growth per counter; a counter that went down counts as 0 and marks the delta `regressed`. */
+function deltaOf(to: StatsTokens & { cost: number }, from: StatsTokens & { cost: number }): Delta {
+  const values = {} as Record<Counter, number>
+  let regressed = false
+  for (const counter of COUNTERS) {
+    if (to[counter] < from[counter]) regressed = true
+    values[counter] = to[counter] < from[counter] ? 0 : to[counter] - from[counter]
   }
-  const cost = delta(to.cost, from.cost)
-  return { usage, cost, approx, byModel: key !== null }
+  return { values, regressed }
 }
 
-/** `usage` and `cost` less `other`, each field clamped at 0; `clamped` says whether any field would have gone below. */
-function takeAway(usage: Usage, cost: number, other: Usage, otherCost: number): { usage: Usage; cost: number; clamped: boolean } {
-  let clamped = false
-  const less = (a: number, b: number): number => {
-    if (b > a) {
-      clamped = true
-      return 0
-    }
-    return a - b
-  }
-  return {
-    usage: {
-      uncached: less(usage.uncached, other.uncached),
-      output: less(usage.output, other.output),
-      cacheRead: less(usage.cacheRead, other.cacheRead),
-      cacheWrite: less(usage.cacheWrite, other.cacheWrite),
-    },
-    cost: less(cost, otherCost),
-    clamped,
-  }
+/** `whole` split into `parts` integers that sum to it; the remainder goes one each to the first parts. */
+function splitWhole(whole: number, parts: number): number[] {
+  const total = Math.floor(whole)
+  const base = Math.floor(total / parts)
+  const rest = total - base * parts
+  return Array.from({ length: parts }, (_, i) => base + (i < rest ? 1 : 0))
 }
 
 /**
- * What the project total grew by, less what the named model rows grew by over the same window (each field clamped at 0):
- * the share of a run whose model names no row, once other runs have been given their rows. Always approximate.
+ * What each run active between two snapshots of one folder was given (spec §3.5, amended): every model row's growth is split
+ * evenly among the active runs of that model, and the growth no such row accounts for among the active runs whose model is
+ * unknown or has no row. Interval (prev.at, cur.at]; a run not active in it gets nothing. Tokens are whole numbers that sum
+ * exactly to the growth; cost is divided evenly.
  */
-export function attributeResidual(base: StatsSnapshot, latest: StatsSnapshot, rowKeys: readonly string[]): { usage: Usage; cost: number; approx: true } {
-  const total = attribute(base, latest, undefined)
-  let usage = total.usage
-  let cost = total.cost
-  for (const key of rowKeys) {
-    if (!Object.hasOwn(latest.models, key)) continue
-    const row = attribute(base, latest, key)
-    const left = takeAway(usage, cost, row.usage, row.cost)
-    usage = left.usage
-    cost = left.cost
-  }
-  return { usage, cost, approx: true }
-}
+export function allocate(prev: StatsSnapshot, cur: StatsSnapshot, runs: readonly FolderRun[]): Allocation[] {
+  const active = runs
+    .filter(r => r.startedAt <= cur.at && (r.endedAt === undefined || r.endedAt >= prev.at))
+    .sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  if (active.length === 0) return []
 
-/** The figures a run was last given, and what they were measured against (a group, the exact runs and rows taken away). */
-export type StatsLast = { usage: Usage; cost: number; basis: string }
-
-/** A counter that fell since the run's last figures keeps its last value (and the figure is approximate); a changed basis starts over. */
-export function holdUp(last: StatsLast | undefined, usage: Usage, cost: number, basis: string): { usage: Usage; cost: number; held: boolean } {
-  if (!last || last.basis !== basis) return { usage, cost, held: false }
-  let held = false
-  const keep = (now: number, before: number): number => {
-    if (now < before) {
-      held = true
-      return before
-    }
-    return now
-  }
-  const kept: Usage = {
-    uncached: keep(usage.uncached, last.usage.uncached),
-    output: keep(usage.output, last.usage.output),
-    cacheRead: keep(usage.cacheRead, last.usage.cacheRead),
-    cacheWrite: keep(usage.cacheWrite, last.usage.cacheWrite),
-  }
-  return { usage: kept, cost: keep(cost, last.cost), held }
-}
-
-/** Drops the oldest keys (insertion order) of a Map or Set until it holds at most `cap`. */
-export function capped<K>(collection: { readonly size: number; keys(): IterableIterator<K>; delete(key: K): boolean }, cap: number): void {
-  while (collection.size > cap) {
-    const first = collection.keys().next()
-    if (first.done) return
-    collection.delete(first.value)
-  }
-}
-
-/** Items whose [start, end] ranges overlap, chained (A meets B, B meets C: one set), in start order. */
-export function chainByOverlap<T>(items: readonly T[], range: (item: T) => readonly [number, number]): T[][] {
-  const sorted = [...items].sort((a, b) => range(a)[0] - range(b)[0])
-  const sets: T[][] = []
-  let current: T[] = []
-  let reach = 0
-  for (const item of sorted) {
-    const [start, end] = range(item)
-    if (current.length > 0 && start <= reach) {
-      current.push(item)
-      reach = Math.max(reach, end)
-    } else {
-      if (current.length > 0) sets.push(current)
-      current = [item]
-      reach = end
-    }
-  }
-  if (current.length > 0) sets.push(current)
-  return sets
-}
-
-/** A snapshot of a folder: the data, when its process began (`from`) and when the engine clock said it was taken. */
-export type StatsTaken = { snap: StatsSnapshot; from: number; clockAt: number }
-
-/**
- * Whether a folder's snapshot can be a run's baseline: one taken at or before the run started and no older than a
- * poll serves exactly; one taken after serves as the run's first look, approximate unless its process began within
- * the race window after the start. Null when the snapshot is too old to serve.
- */
-export function baselineFrom(startedAt: number, taken: { from: number; snap: { at: number } }): { approx: boolean } | null {
-  if (taken.snap.at <= startedAt) return startedAt - taken.snap.at <= STATS_EVERY_MS ? { approx: false } : null
-  return { approx: taken.from < startedAt || taken.from - startedAt > STATS_RACE_MS }
-}
-
-/** An opencode run being measured: its baseline and whether it still needs snapshots (`live`). */
-export type StatsRun = {
-  id: string
-  model: string | undefined
-  startedAt: number
-  endedAt: number | undefined
-  base: StatsSnapshot
-  baseApprox: boolean
-  live: boolean
-  last?: StatsLast
-}
-/** A run whose relay result gave its exact usage: not measured, but taken away from the group it overlaps. */
-export type StatsExact = { id: string; model: string | undefined; startedAt: number; endedAt: number | undefined; usage: Usage; cost: number | null }
-export type StatsShare = { id: string; usage: Usage; cost: number; approx: boolean; basis: string; sharedKey?: string; sharedSize?: number }
-
-type Span = readonly [number, number]
-const overlaps = (a: Span, b: Span): boolean => a[0] <= b[1] && b[0] <= a[1]
-
-/**
- * The figures every measured run of one folder gets from one snapshot (groups that have a live member only).
- * Runs group by the stats row their model resolves to (provider included); runs whose model resolves to no row group
- * together and are given the project total less the rows the other runs are given. A group's sharedKey names its folder,
- * row and earliest start, so a later group of the same folder and row has its own.
- */
-export function planShares(folder: string, runs: readonly StatsRun[], exacts: readonly StatsExact[], snap: StatsSnapshot, now: number): StatsShare[] {
-  const keyOf = (model: string | undefined): string => rowKey(snap, model) ?? ''
-  const span = (r: { startedAt: number; endedAt: number | undefined }): Span => [r.startedAt, r.endedAt ?? now]
-
-  const byKey = new Map<string, StatsRun[]>()
-  for (const run of runs) {
-    const key = keyOf(run.model)
-    byKey.set(key, [...(byKey.get(key) ?? []), run])
-  }
-  const groups: Array<{ key: string; members: StatsRun[]; range: Span }> = []
-  for (const [key, members] of byKey) {
-    for (const chain of chainByOverlap(members, span)) {
-      groups.push({ key, members: chain, range: [Math.min(...chain.map(m => m.startedAt)), Math.max(...chain.map(m => m.endedAt ?? now))] })
-    }
+  const members = new Map<string, FolderRun[]>()
+  const loose: FolderRun[] = []
+  for (const run of active) {
+    const key = rowKey(cur, run.model)
+    if (key === null) loose.push(run)
+    else members.set(key, [...(members.get(key) ?? []), run])
   }
 
-  const shares: StatsShare[] = []
-  for (const group of groups) {
-    if (!group.members.some(m => m.live)) continue
-    const earliest = group.members.reduce((a, b) => (b.base.at < a.base.at ? b : a))
-    const base = earliest.base
-    const mine = exacts.filter(e => keyOf(e.model) === group.key && overlaps(span(e), group.range))
-
-    let usage: Usage
-    let cost: number
-    let approx: boolean
-    let subtracted: string[] = []
-    if (group.key !== '') {
-      const row = attribute(base, snap, group.key)
-      usage = row.usage
-      cost = row.cost
-      approx = row.approx
-    } else {
-      const rows = new Set<string>()
-      for (const other of groups) if (other !== group && other.key !== '' && overlaps(other.range, group.range)) rows.add(other.key)
-      for (const e of exacts) {
-        const key = keyOf(e.model)
-        if (key !== '' && overlaps(span(e), group.range)) rows.add(key)
-      }
-      subtracted = [...rows].sort()
-      const rest = attributeResidual(base, snap, subtracted)
-      usage = rest.usage
-      cost = rest.cost
-      approx = true
-    }
-    // an exact member of this group is taken out of what the group shows
-    for (const e of mine) {
-      const left = takeAway(usage, cost, e.usage, e.cost ?? 0)
-      usage = left.usage
-      cost = left.cost
-      approx = true
-    }
-    const window: Span = [base.at, snap.at]
-    const tracked = [...runs, ...exacts].filter(r => overlaps(span(r), window)).length
-    approx = approx || earliest.baseApprox || snap.sessions - base.sessions > tracked
-
-    const sharedKey = group.members.length > 1 ? fingerprint(`${folder}|${group.key}|${Math.min(...group.members.map(m => m.startedAt))}`) : undefined
-    const basis = `${sharedKey ?? ''}|${mine.map(e => e.id).sort().join(',')}|${subtracted.join(',')}`
-    for (const member of group.members) {
-      const held = holdUp(member.last, usage, cost, basis)
-      shares.push({
-        id: member.id,
-        usage: held.usage,
-        cost: held.cost,
-        approx: approx || held.held,
-        basis,
-        ...(sharedKey !== undefined ? { sharedKey, sharedSize: group.members.length } : {}),
+  const outside = cur.sessions - prev.sessions > active.length
+  const out: Allocation[] = []
+  const give = (delta: Delta, group: readonly FolderRun[]): void => {
+    const shares = {} as Record<Counter, number[]>
+    for (const counter of COUNTERS) shares[counter] = counter === 'cost' ? [] : splitWhole(delta.values[counter], group.length)
+    group.forEach((run, i) => {
+      out.push({
+        id: run.id,
+        usage: {
+          uncached: shares.input[i]!,
+          output: shares.output[i]! + shares.reasoning[i]!,
+          cacheRead: shares.cacheRead[i]!,
+          cacheWrite: shares.cacheWrite[i]!,
+        },
+        cost: delta.values.cost / group.length,
+        shared: group.length,
+        approx: group.length > 1 || delta.regressed || outside,
       })
-    }
+    })
   }
-  return shares
+
+  const taken = {} as Record<Counter, number>
+  for (const counter of COUNTERS) taken[counter] = 0
+  let rowRegressed = false
+  for (const [key, group] of members) {
+    const delta = deltaOf(cur.models[key]!, Object.hasOwn(prev.models, key) ? prev.models[key]! : ZERO)
+    for (const counter of COUNTERS) taken[counter] += delta.values[counter]
+    rowRegressed = rowRegressed || delta.regressed
+    give(delta, group)
+  }
+
+  if (loose.length > 0) {
+    const total = deltaOf(cur.total, prev.total)
+    const values = {} as Record<Counter, number>
+    let clamped = false
+    for (const counter of COUNTERS) {
+      clamped = clamped || taken[counter] > total.values[counter]
+      values[counter] = Math.max(0, total.values[counter] - taken[counter])
+    }
+    give({ values, regressed: total.regressed || rowRegressed || clamped }, loose)
+  }
+  return out
 }

@@ -30,11 +30,10 @@ export function utcDay(ms: number): string {
 }
 
 /**
- * `own` false: the run's tokens and cost are not added here (they land on its rows' buckets, a Claude child, or
- * were counted through the first member of its shared group). `unknown` false: its unknown-cost mark is not added either.
+ * `own` false: the run's tokens and cost are not added here (they land on its rows' buckets, a Claude child).
  * Its op, status, reviews and bugs always are.
  */
-function addRun(c: Counters, run: Run, own = true, unknown = true): void {
+function addRun(c: Counters, run: Run, own = true): void {
   c.ops += 1
   if (run.status === 'done') c.done += 1
   else if (run.status === 'failed') c.failed += 1
@@ -50,7 +49,7 @@ function addRun(c: Counters, run: Run, own = true, unknown = true): void {
   if (own && run.cost !== null) c.costOps += 1
   if (own && run.cost !== null && run.costSource === 'reported') c.costReported += run.cost
   else if (own && run.cost !== null && run.costSource === 'estimated') c.costEstimated += run.cost
-  else if (unknown && run.cost === null && (run.kind === 'agent' || (run.kind === 'relay' && run.implementer !== 'codex' && run.outDir !== undefined))) {
+  else if (run.cost === null && (run.kind === 'agent' || (run.kind === 'relay' && run.implementer !== 'codex' && run.outDir !== undefined))) {
     // a codex relay, or one without an out dir, can never report a cost (as in runCost)
     c.unknownCostOps += 1
   }
@@ -77,27 +76,14 @@ function addRow(c: Counters, row: NonNullable<Run['rows']>[number]): void {
 
 /**
  * Adds one run to its bucket, or a run with child rows to the buckets of its rows: the run's own op stays
- * on its own implementer × model. `spend` false (a shared group's later members): only the op and its marks.
+ * on its own implementer × model.
  */
-function addToBuckets(bucketOf: (key: string) => Counters, run: Run, spend: boolean): void {
+function addToBuckets(bucketOf: (key: string) => Counters, run: Run): void {
   const rows = run.rows
-  if (!spend) addRun(bucketOf(bucketKey(run)), run, false, false)
-  else if (rows === undefined || rows.length === 0) addRun(bucketOf(bucketKey(run)), run)
+  if (rows === undefined || rows.length === 0) addRun(bucketOf(bucketKey(run)), run)
   else {
     addRun(bucketOf(bucketKey(run)), run, false)
     for (const row of rows) addRow(bucketOf(`${row.implementer}|${row.model}`), row)
-  }
-}
-
-/** Says per run whether its spend counts: a shared group's tokens and cost count once, through the first member given. */
-function spendOnce(deferred?: ReadonlySet<string>): (run: Run) => boolean {
-  const seen = new Set<string>()
-  return run => {
-    if (run.sharedKey === undefined) return true
-    if (deferred?.has(run.sharedKey)) return false
-    if (seen.has(run.sharedKey)) return false
-    seen.add(run.sharedKey)
-    return true
   }
 }
 
@@ -138,20 +124,17 @@ export function dropOldDays(days: HistoryRecord['days'], nowMs: number): History
 
 /**
  * A copy of `days` with every run added by its UTC end day and implementer × model bucket; the input is not changed.
- * A shared group in `deferred` still has members elsewhere (the ledger): its members here add their ops, not the spend.
  */
-export function addRunsToDays(days: HistoryRecord['days'], runs: readonly Run[], deferred?: ReadonlySet<string>): HistoryRecord['days'] {
+export function addRunsToDays(days: HistoryRecord['days'], runs: readonly Run[]): HistoryRecord['days'] {
   const out: HistoryRecord['days'] = {}
   for (const [day, byKey] of Object.entries(days)) {
     const bucket: HistoryRecord['days'][string] = {}
     for (const [key, counters] of Object.entries(byKey)) bucket[key] = { ...emptyCounters(), ...counters }
     out[day] = bucket
   }
-  // every member is an op on its own end day; a group's spend counts once, on the day of its first member
-  const spends = spendOnce(deferred)
   for (const run of runs) {
     const bucket = (out[utcDay(run.endedAt ?? run.startedAt)] ??= {})
-    addToBuckets(key => (bucket[key] ??= emptyCounters()) as Counters, run, spends(run))
+    addToBuckets(key => (bucket[key] ??= emptyCounters()) as Counters, run)
   }
   return out
 }
@@ -169,8 +152,7 @@ export function stationRowsFromLedger(ledger: Ledger): StationRow[] {
     if (!c) buckets.set(key, (c = emptyCounters()))
     return c
   }
-  const spends = spendOnce()
-  for (const run of orderedRuns(ledger)) addToBuckets(bucketOf, run, spends(run))
+  for (const run of orderedRuns(ledger)) addToBuckets(bucketOf, run)
   return rowsFromBuckets(buckets)
 }
 

@@ -104,8 +104,9 @@ test('rows merge the same implementer × model: HQ and agents of one model are o
   expect(oc.costSource).toBe('reported')
 })
 
-test('a shared group is one row amount, and a run with child rows contributes its rows (not itself)', () => {
-  const shared = { sharedKey: 'oc|/w', sharedSize: 3, cost: 1.5 }
+// changed with the interval allocation: runs that hold a share each contribute their own amounts, summed plainly
+test('runs that hold a share each add their own amounts, and a run with child rows contributes its rows (not itself)', () => {
+  const shared = { sharedSize: 3, cost: 1.5 }
   const l = apply(emptyLedger('s1', T0), cliStart('r1'), cliStart('r2'), cliStart('r3'),
     adapter('r1', 300, shared), adapter('r2', 300, shared), adapter('r3', 300, shared),
     cliStart('c1', 'claude', OPUS),
@@ -113,9 +114,9 @@ test('a shared group is one row amount, and a run with child rows contributes it
   const out = projectReport(buildReport(l, T0, undefined, 'running', NOW), NOW)!
   const byKey = new Map(out.rows.map(r => [`${r.implementer}|${r.model}`, r]))
   expect([...byKey.keys()].sort()).toEqual([`claude-code|${OPUS}`, `opencode|${OC_MODEL}`])
-  // the group's 300 once, plus the child's 7 from its rows
-  expect(byKey.get(`opencode|${OC_MODEL}`)!.usage.uncached).toBe(307)
-  near(byKey.get(`opencode|${OC_MODEL}`)!.cost, 1.5)
+  // the three shares of 300, plus the child's 7 from its rows
+  expect(byKey.get(`opencode|${OC_MODEL}`)!.usage.uncached).toBe(907)
+  near(byKey.get(`opencode|${OC_MODEL}`)!.cost, 4.5)
   // the child's own 999 is not counted: its rows are
   expect(byKey.get(`claude-code|${OPUS}`)!.usage.uncached).toBe(40)
   expect(byKey.has(`claude|${OPUS}`)).toBe(false)
