@@ -1,8 +1,22 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, FsStat, On, PluginOptions, Timer } from 'claude-code'
+import type { EngineInterface, FsEntry, FsStat, On, PluginOptions, Timer } from 'claude-code'
 
 import type { HistoryRecord, Ledger, RelayProjection, Run, Usage } from '../types'
-import { CHILD_ID, REPORT_EVERY_MS, buildReport, reportDir, type ChildReport } from './adapters/child-report'
+import {
+  CHILD_ID,
+  MAX_REPORTS_LISTED,
+  MAX_REPORT_BYTES,
+  READ_EVERY_MS,
+  REPORT_EVERY_MS,
+  STALE_MS,
+  buildReport,
+  mainModel,
+  matchReports,
+  projectReport,
+  reportDir,
+  reportUsage,
+  type ChildReport,
+} from './adapters/child-report'
 import {
   STATS_ARGV,
   STATS_EVERY_MS,
@@ -79,6 +93,10 @@ function stopTimers(): void {
   statsBusy = false
   resetStats()
   resetChild()
+  reportsTimer?.cancel()
+  reportsTimer = undefined
+  reportsBusy = false
+  resetReports()
   agentTimer?.cancel()
   saveTimer?.cancel()
   relayTimer?.cancel()
@@ -934,6 +952,183 @@ async function finishChild($: EngineInterface): Promise<void> {
   await writeChild($, c, 'done')
 }
 
+// Claude child reports, parent side (spec §4.5–4.9). While a `cli` or `relay` run of a Claude (or of an unattributed tool)
+// is running or ended less than the relay grace ago, one timer lists the parent's own report folder every READ_EVERY_MS.
+// Each file is checked like a relay result (regular, not a link, within the size cap, real path inside the temp root),
+// read only when its mtime or size changed, projected through the allow-list, and matched to a run once; from then on the
+// file belongs to that run and every change of it updates the run. All of a poll's updates go in one atomic ledger write.
+// What is kept here: file names (child session ids) bound to run ids, and fingerprints of the files already handled.
+
+const REPORT_SUFFIX = '.json'
+
+let reportsTimer: Timer | undefined
+let reportsBusy = false
+let reportsSession = ''
+// bumped by a new session and by stopTimers: a poll that started under an older one discards what it read
+let reportsEpoch = 0
+// report file name -> the run it belongs to, at most MAX_REPORTS_LISTED: a full map refuses a new binding
+const reportBound = new Map<string, string>()
+// the files already handled, by fingerprint of the name, valid while their mtime and size stay the same
+const reportMemory = new DiscoveryMemory()
+
+function resetReports(): void {
+  reportsEpoch += 1
+  reportsSession = ''
+  reportBound.clear()
+  reportMemory.clear()
+}
+
+/** A new session starts over; a run that left the ledger frees its file's binding. */
+function syncReportsSession(l: Ledger): void {
+  if (l.sessionId !== reportsSession) {
+    resetReports()
+    reportsSession = l.sessionId
+    return
+  }
+  for (const [file, id] of [...reportBound]) if (!Object.hasOwn(l.runs, id)) reportBound.delete(file)
+}
+
+/** A run whose child may write a report: a Claude (or not yet attributed) `cli` or `relay`, running or ended less than the grace ago. */
+function reportCandidate(run: Run, now: number): boolean {
+  if (run.kind !== 'cli' && run.kind !== 'relay') return false
+  if (run.implementer !== 'claude' && run.implementer !== 'unknown') return false
+  if (run.status === 'running') return true
+  return run.endedAt !== undefined && now - run.endedAt < POLL_GRACE_MS
+}
+
+function reportCandidates(l: Ledger, now: number): Run[] {
+  const out: Run[] = []
+  for (const id of l.order) {
+    const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
+    if (run && reportCandidate(run, now)) out.push(run)
+  }
+  return out
+}
+
+/** The name of a listed entry that may be a report: a plain file `<child id>.json`. */
+function reportFile(entry: FsEntry): string | null {
+  if (entry.kind !== 'file' || entry.isLink || !entry.name.endsWith(REPORT_SUFFIX)) return null
+  return CHILD_ID.test(entry.name.slice(0, -REPORT_SUFFIX.length)) ? entry.name : null
+}
+
+/** What a report gives its run: the sum of its rows, the child's main model, its rows, and its end when it has one. */
+function childAction(id: string, report: ChildReport, at: number): Action {
+  const { usage, cost, costSource } = reportUsage(report)
+  const model = mainModel(report)
+  return {
+    type: 'adapterUsage',
+    id,
+    source: 'child',
+    usage,
+    cost,
+    costSource,
+    ...(model !== undefined ? { model } : {}),
+    rows: report.rows,
+    ...(report.status !== 'running' ? { status: report.status } : {}),
+    at,
+  }
+}
+
+type ReportRead = { file: string; report: ChildReport; mtimeMs: number; size: number }
+
+async function pollReports($: EngineInterface, table: PriceTable): Promise<void> {
+  if (reportsBusy) return
+  reportsBusy = true
+  try {
+    const seen = await read($, ledgerAtom)
+    syncReportsSession(seen)
+    const epoch = reportsEpoch
+    const live = reportCandidates(seen, Date.now())
+    if (live.length === 0) return
+    const tmpDir = await tmpRoot($)
+    const dir = reportDir(tmpDir, await $.session.id())
+    // the folder is looked at before it is listed: most sessions have no child that reports, and a folder that is
+    // missing, a link, or lands outside the temp root is not listed
+    const files: string[] = []
+    let roots: string[]
+    try {
+      const folder = await $.fs.stat(dir, { resolve: true })
+      if (folder.kind !== 'dir' || folder.isLink || folder.realPath === undefined) return
+      const landed = (await $.fs.stat(tmpDir, { resolve: true })).realPath
+      roots = allowedRoots(landed === undefined ? [] : [landed])
+      if (!isInsideRoots(folder.realPath, roots)) return
+      for (const entry of (await $.fs.list(dir)).slice(0, MAX_REPORTS_LISTED)) {
+        const file = reportFile(entry)
+        if (file !== null) files.push(file)
+      }
+    } catch {
+      return // no folder yet, or it cannot be listed: the next poll tries again
+    }
+    if (files.length === 0) return
+
+    const changed: ReportRead[] = []
+    const invalid: Array<[string, number, number]> = []
+    for (const file of files) {
+      try {
+        const stat = await $.fs.stat(`${dir}/${file}`, { resolve: true })
+        const realPath = readablePath(stat, Date.now() - STALE_MS, roots, false)
+        if (realPath === null || stat.size > MAX_REPORT_BYTES) continue
+        if (reportMemory.identity(file, stat.mtimeMs, stat.size) !== undefined) continue
+        // the text lives only for this projection: nothing but the allow-listed fields leaves it
+        const report = projectReport(await $.fs.read(realPath), Date.now())
+        if (report === null) invalid.push([file, stat.mtimeMs, stat.size])
+        else changed.push({ file, report, mtimeMs: stat.mtimeMs, size: stat.size })
+      } catch {
+        // unreadable: the next poll tries again
+      }
+    }
+    if (epoch !== reportsEpoch) return
+
+    // bound files keep updating their run; the others are matched to the runs that have no file yet
+    const claimed = new Set(reportBound.keys())
+    const taken = new Set(reportBound.values())
+    const fresh = changed.filter(r => !claimed.has(r.file))
+    const room = Math.max(0, MAX_REPORTS_LISTED - reportBound.size)
+    const binding = matchReports(
+      live.filter(run => !taken.has(run.id)),
+      fresh,
+      claimed,
+    ).slice(0, room)
+    const owner = new Map<string, string>([...reportBound, ...binding.map(m => [m.file, m.id] as const)])
+    const at = Date.now()
+    const actions: Action[] = []
+    const sent: ReportRead[] = []
+    for (const r of changed) {
+      const id = owner.get(r.file)
+      if (id === undefined) continue
+      actions.push(childAction(id, r.report, at))
+      sent.push(r)
+    }
+
+    let applied = actions.length === 0
+    if (actions.length > 0) {
+      await update($, ledgerAtom, cur => {
+        applied = cur.sessionId === seen.sessionId
+        return applied ? actions.reduce((acc, a) => reduce(acc, a, table), cur) : cur
+      })
+    }
+    if (epoch !== reportsEpoch || !applied) return
+    for (const m of binding) reportBound.set(m.file, m.id)
+    for (const [file, mtimeMs, size] of invalid) reportMemory.rememberIdentity(file, mtimeMs, size, null)
+    for (const r of sent) reportMemory.rememberIdentity(r.file, r.mtimeMs, r.size, null)
+  } catch {
+    // the next poll tries again
+  } finally {
+    reportsBusy = false
+  }
+}
+
+/** Called by the watch tick: the timer exists only while a run may still get a report. */
+function watchReports($: EngineInterface, table: PriceTable, l: Ledger, now: number): void {
+  syncReportsSession(l)
+  if (reportCandidates(l, now).length === 0) {
+    reportsTimer?.cancel()
+    reportsTimer = undefined
+    return
+  }
+  if (!reportsTimer) reportsTimer = $.clock.every(READ_EVERY_MS, () => void pollReports($, table))
+}
+
 async function saveWhileActive($: EngineInterface, options: PluginOptions): Promise<void> {
   try {
     const l = await read($, ledgerAtom)
@@ -1142,6 +1337,7 @@ async function watchTick($: EngineInterface, options: PluginOptions, table: Pric
     }
 
     watchStats($, table, options, l, now)
+    watchReports($, table, l, now)
 
     if (options.motion !== 'off') {
       let ticking = false

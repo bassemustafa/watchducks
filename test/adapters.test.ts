@@ -1042,3 +1042,250 @@ test('a new session in the same process resets child mode', async ($, on) => {
   await $.session.end(END)
   expect(w.writes.length).toBe(1)
 })
+
+// ---- Claude child reports, parent side (spec §4.5-4.9)
+
+const OWN_DIR = `/tmp/watchducks-children/${fingerprint('S1')}`
+const OTHER_DIR = `/tmp/watchducks-children/${fingerprint('S2')}`
+const SONNET = 'claude-sonnet-5-5'
+const CLAUDE_P = `claude -p --model ${SONNET} "x"`
+const SOL_MODEL = 'openai/gpt-6.1-sol'
+
+/** `statLink`: a file that is a link only to the stat of its path (the listing says it is a plain file). */
+type ChildFile = { text: string; mtimeMs: number; size?: number; isLink?: boolean; statLink?: boolean }
+type ChildFs = { files: Map<string, ChildFile>; lists: string[]; reads: string[] }
+
+/** A file mtime that moves with `n` and is recent enough to be read. */
+const mt = (n: number): number => Date.now() + n
+
+/**
+ * A temp dir with report files: stat, list and read answer from `files` (by full path), every list and read is logged.
+ * `folder` is how the parent's own report folder looks to a stat (a plain directory by default).
+ */
+function childFs(on: On, folder: 'dir' | 'missing' | 'link' | 'outside' = 'dir'): ChildFs {
+  const fs: ChildFs = { files: new Map(), lists: [], reads: [] }
+  on('fs.stat', async ($, e) => {
+    if (e.path === '/tmp') return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false, realPath: '/tmp' } }
+    if (e.path === OWN_DIR || e.path === OTHER_DIR) {
+      if (folder === 'missing') return { value: { kind: 'other' as const, size: 0, mtimeMs: 0, isLink: false } }
+      return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: folder === 'link', realPath: folder === 'outside' ? '/elsewhere/x' : e.path } }
+    }
+    const f = fs.files.get(e.path)
+    if (!f) return { value: { kind: 'other' as const, size: 0, mtimeMs: 0, isLink: false } }
+    return { value: { kind: 'file' as const, size: f.size ?? f.text.length, mtimeMs: f.mtimeMs, isLink: f.isLink === true || f.statLink === true, realPath: e.path } }
+  })
+  on('fs.list', async ($, e) => {
+    fs.lists.push(e.path)
+    const entries = [...fs.files]
+      .filter(([path]) => path.slice(0, path.lastIndexOf('/')) === e.path)
+      .map(([path, f]) => ({ name: path.slice(path.lastIndexOf('/') + 1), kind: 'file' as const, size: f.size ?? f.text.length, mtimeMs: f.mtimeMs, isLink: f.isLink === true }))
+    return { value: entries }
+  })
+  on('fs.read', async ($, e) => {
+    fs.reads.push(e.path)
+    return { value: fs.files.get(e.path)?.text ?? '' }
+  })
+  return fs
+}
+
+const crow = (implementer: string, model: string, uncached: number) => ({
+  implementer,
+  model,
+  usage: { uncached, output: 0, cacheRead: 0, cacheWrite: 0 },
+  cost: uncached / 1000,
+  costSource: 'estimated',
+})
+
+function report(rows: readonly unknown[], over: Record<string, unknown> = {}): string {
+  const now = new Date(Date.now()).toISOString()
+  return JSON.stringify({ schema: 'watchducks.child.v1', startedAt: now, updatedAt: now, status: 'running', rows, ...over })
+}
+
+/** Starts the session and the given background runs, then lets the watch tick see them (it starts the report timer). */
+async function withRuns($: Parameters<TestBody>[0], w: { clock: MockClock }, commands: readonly string[]): Promise<void> {
+  await $.session.start(START)
+  for (const [i, command] of commands.entries()) await $.tool.call(call(`u${i + 1}`, command))
+  await w.clock.advance(500)
+}
+
+test('a Claude child report gives its run live numbers, then more, then the final ones and its end', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P])
+  expect(fs.lists.length).toBe(0)
+
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 100)]), mtimeMs: mt(1) })
+  await w.clock.advance(3000)
+  const live = ledger().runs['bash:u1']!
+  expect(live.usage).toEqual(flat(100))
+  expect(live.usageSource).toBe('child')
+  expect(live.model).toBe(SONNET)
+  expect(live.status).toBe('running')
+  near(live.cost, 0.1)
+
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 250)]), mtimeMs: mt(2) })
+  await w.clock.advance(3000)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(250))
+
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 400)], { status: 'done' }), mtimeMs: mt(3) })
+  await w.clock.advance(3000)
+  const done = ledger().runs['bash:u1']!
+  expect(done.usage).toEqual(flat(400))
+  near(done.cost, 0.4)
+  expect(done.status).toBe('done')
+})
+
+test('a report in another session folder is never listed or read', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  fs.files.set(`${OTHER_DIR}/c9.json`, { text: report([crow('claude-code', SONNET, 900)]), mtimeMs: mt(1) })
+  await withRuns($, w, [CLAUDE_P])
+  await w.clock.advance(9000)
+  expect(fs.lists.length).toBeGreaterThan(0)
+  for (const dir of fs.lists) expect(dir).toBe(OWN_DIR)
+  expect(fs.reads).toEqual([])
+  expect(ledger().runs['bash:u1']!.usage).toBeNull()
+})
+
+test('a report row of another implementer lands on its station row and never on the parent HQ', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P])
+  const hq = JSON.stringify(ledger().hqByModel ?? {})
+  fs.files.set(`${OWN_DIR}/c1.json`, {
+    text: report([crow('claude-code', SONNET, 100), crow('opencode', SOL_MODEL, 300)]),
+    mtimeMs: mt(1),
+  })
+  await w.clock.advance(3000)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(400))
+  const station = stationRowsFromLedger(ledger()).find(r => r.implementer === 'opencode' && r.model === SOL_MODEL)
+  expect(station?.uncached).toBe(300)
+  expect(JSON.stringify(ledger().hqByModel ?? {})).toBe(hq)
+})
+
+test('a nested child is counted once, through the child that reported it', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P])
+  // the child's rows already hold its grandchild's spend (50 on a claude row); the grandchild's own file is in the child's folder
+  fs.files.set(`/tmp/watchducks-children/${fingerprint('c1')}/g1.json`, { text: report([crow('claude-code', SONNET, 50)]), mtimeMs: mt(1) })
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 100), crow('claude', 'claude-haiku-5-5', 50)]), mtimeMs: mt(1) })
+  await w.clock.advance(9000)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(150))
+  expect(totals(ledger()).usage).toEqual(flat(150))
+  for (const dir of fs.lists) expect(dir).toBe(OWN_DIR)
+})
+
+test('a stale report is ignored', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P])
+  const old = new Date(Date.now() - 25 * 3_600_000).toISOString()
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 100)], { updatedAt: old }), mtimeMs: mt(1) })
+  await w.clock.advance(6000)
+  expect(fs.reads.length).toBe(1) // read once; an unchanged file that gave nothing is not read again
+  expect(ledger().runs['bash:u1']!.usage).toBeNull()
+})
+
+test('a name that is not a child id, a link and a file over 64 KiB are never read', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P])
+  const text = report([crow('claude-code', SONNET, 100)])
+  fs.files.set(`${OWN_DIR}/bad name.json`, { text, mtimeMs: mt(1) })
+  fs.files.set(`${OWN_DIR}/c1.txt`, { text, mtimeMs: mt(1) })
+  fs.files.set(`${OWN_DIR}/${'a'.repeat(129)}.json`, { text, mtimeMs: mt(1) })
+  fs.files.set(`${OWN_DIR}/listed-link.json`, { text, mtimeMs: mt(1), isLink: true })
+  fs.files.set(`${OWN_DIR}/stat-link.json`, { text, mtimeMs: mt(1), statLink: true })
+  fs.files.set(`${OWN_DIR}/big.json`, { text, mtimeMs: mt(1), size: 65_537 })
+  await w.clock.advance(3000)
+  expect(fs.lists.length).toBe(1)
+  expect(fs.reads).toEqual([])
+  expect(ledger().runs['bash:u1']!.usage).toBeNull()
+
+  fs.files.set(`${OWN_DIR}/ok_1-b.json`, { text, mtimeMs: mt(1) })
+  await w.clock.advance(3000)
+  expect(fs.reads).toEqual([`${OWN_DIR}/ok_1-b.json`])
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(100))
+})
+
+test('an unchanged report file is not read again, a changed one is', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P])
+  const first = mt(7)
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 100)]), mtimeMs: first })
+  for (let i = 0; i < 4; i++) await w.clock.advance(3000)
+  expect(fs.lists.length).toBeGreaterThan(2)
+  expect(fs.reads.length).toBe(1)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(100))
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 120)]), mtimeMs: first + 1 })
+  await w.clock.advance(3000)
+  expect(fs.reads.length).toBe(2)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(120))
+})
+
+test('a run keeps the one report it was given: a second report is not taken, the first keeps updating it', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P])
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 100)]), mtimeMs: mt(1) })
+  await w.clock.advance(3000)
+  fs.files.set(`${OWN_DIR}/c2.json`, { text: report([crow('claude-code', SONNET, 700)]), mtimeMs: mt(1) })
+  await w.clock.advance(3000)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(100))
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 130)]), mtimeMs: mt(2) })
+  await w.clock.advance(3000)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(130))
+})
+
+test('two parallel identical children each go to one run, and the totals are the sum of both', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P, CLAUDE_P])
+  fs.files.set(`${OWN_DIR}/a1.json`, { text: report([crow('claude-code', SONNET, 100)]), mtimeMs: mt(1) })
+  fs.files.set(`${OWN_DIR}/a2.json`, { text: report([crow('claude-code', SONNET, 200)]), mtimeMs: mt(1) })
+  await w.clock.advance(3000)
+  const shown = (): number[] => [ledger().runs['bash:u1']!.usage?.uncached ?? -1, ledger().runs['bash:u2']!.usage?.uncached ?? -1].sort((a, b) => a - b)
+  expect(shown()).toEqual([100, 200])
+  expect(totals(ledger()).usage).toEqual(flat(300))
+  // each file keeps updating the run it went to
+  fs.files.set(`${OWN_DIR}/a2.json`, { text: report([crow('claude-code', SONNET, 250)]), mtimeMs: mt(2) })
+  await w.clock.advance(3000)
+  expect(shown()).toEqual([100, 250])
+  expect(totals(ledger()).usage).toEqual(flat(350))
+})
+
+test('without a run that could have a report the folder is never listed', async ($, on) => {
+  const w = world(on, [])
+  const fs = childFs(on)
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 100)]), mtimeMs: mt(1) })
+  await $.session.start(START)
+  await w.clock.advance(20_000)
+  await $.tool.call(call('u1', 'cd /proj && codex exec "x"'))
+  await $.tool.call(call('u2', SOL))
+  await w.clock.advance(20_000)
+  expect(fs.lists).toEqual([])
+  expect(fs.reads).toEqual([])
+})
+
+for (const folder of ['missing', 'link', 'outside'] as const) {
+  test(`a report folder that is ${folder === 'outside' ? 'outside the temp root' : folder === 'link' ? 'a link' : 'not there'} is not listed`, async ($, on) => {
+    const w = world(on, [])
+    const fs = childFs(on, folder)
+    fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 100)]), mtimeMs: mt(1) })
+    await withRuns($, w, [CLAUDE_P])
+    await w.clock.advance(9000)
+    expect(fs.lists).toEqual([])
+    expect(fs.reads).toEqual([])
+  })
+}

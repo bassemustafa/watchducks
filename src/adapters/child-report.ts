@@ -242,3 +242,26 @@ export function matchReports(
   }
   return out
 }
+
+/**
+ * What a report gives its run (spec §4.6): usage is the sum of the rows. The cost is the sum of the rows that have one (a
+ * report with some rows unpriced still shows what is known; the ledger marks the run partial from the rows themselves); null
+ * and a null source when no row has one. The source is `reported` only while every costed row's is, else `estimated`.
+ */
+export function reportUsage(r: ChildReport): { usage: Usage; cost: number | null; costSource: 'reported' | 'estimated' | null } {
+  let usage: Usage = { uncached: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  let cost: number | null = null
+  let costSource: 'reported' | 'estimated' | null = null
+  for (const row of r.rows) {
+    usage = {
+      uncached: usage.uncached + row.usage.uncached,
+      output: usage.output + row.usage.output,
+      cacheRead: usage.cacheRead + row.usage.cacheRead,
+      cacheWrite: usage.cacheWrite + row.usage.cacheWrite,
+    }
+    if (row.cost === null) continue
+    cost = (cost ?? 0) + row.cost
+    costSource = costSource === null ? row.costSource : costSource === 'reported' && row.costSource === 'reported' ? 'reported' : 'estimated'
+  }
+  return { usage, cost, costSource }
+}

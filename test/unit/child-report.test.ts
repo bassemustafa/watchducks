@@ -10,6 +10,7 @@ import {
   MAX_REPORT_BYTES,
   projectReport,
   reportDir,
+  reportUsage,
   STALE_MS,
   type ChildReport,
 } from '../../src/adapters/child-report'
@@ -271,6 +272,49 @@ test('matchReports: claimed files are skipped', () => {
   const reports = [rep('a.json', T0), rep('b.json', T0 + 1000)]
   expect(matchReports(runs, reports, new Set(['a.json']))).toEqual([{ id: 'r1', file: 'b.json' }])
   expect(matchReports(runs, reports, new Set(['a.json', 'b.json']))).toEqual([])
+})
+
+test('reportUsage sums the usage and the costs of every row', () => {
+  const r = parsed({
+    rows: [
+      row(OPUS, 100, { cost: 0.25, costSource: 'reported' }),
+      row('claude-haiku-5-5', 50, { cost: 0.5, costSource: 'reported' }),
+      { ...row(OC_MODEL, 7), implementer: 'opencode', usage: { uncached: 7, output: 3, cacheRead: 2, cacheWrite: 1 }, cost: 0.25, costSource: 'reported' },
+    ],
+  })
+  const u = reportUsage(r)
+  expect(u.usage).toEqual({ uncached: 157, output: 23, cacheRead: 2, cacheWrite: 1 })
+  near(u.cost, 1)
+  expect(u.costSource).toBe('reported')
+})
+
+test('reportUsage: the cost is estimated as soon as one costed row is', () => {
+  const u = reportUsage(parsed({ rows: [row(OPUS, 1, { cost: 0.5, costSource: 'reported' }), row('claude-haiku-5-5', 1, { cost: 0.25, costSource: 'estimated' })] }))
+  near(u.cost, 0.75)
+  expect(u.costSource).toBe('estimated')
+})
+
+test('reportUsage: rows without a cost add nothing to it, and no cost at all stays null', () => {
+  const unpriced = { cost: null, costSource: null } as const
+  const some = reportUsage(parsed({ rows: [row(OPUS, 10, { cost: 0.5, costSource: 'estimated' }), row('x-model', 5, unpriced)] }))
+  expect(some.usage.uncached).toBe(15)
+  near(some.cost, 0.5)
+  expect(some.costSource).toBe('estimated')
+  const none = reportUsage(parsed({ rows: [row('x-model', 5, unpriced), row('y-model', 6, unpriced)] }))
+  expect(none.usage.uncached).toBe(11)
+  expect(none.cost).toBeNull()
+  expect(none.costSource).toBeNull()
+})
+
+test('reportUsage: no rows is zero usage and no cost', () => {
+  expect(reportUsage(parsed({ rows: [] }))).toEqual({ usage: { uncached: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: null, costSource: null })
+})
+
+test('reportUsage leaves the report as it was', () => {
+  const r = parsed({ rows: [row(OPUS, 100), row('claude-haiku-5-5', 50)] })
+  const before = JSON.stringify(r)
+  reportUsage(r)
+  expect(JSON.stringify(r)).toBe(before)
 })
 
 test('CHILD_ID accepts a UUID and rejects anything that is not a plain file name', () => {
