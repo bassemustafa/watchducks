@@ -1,4 +1,5 @@
 import type { Usage } from '../types'
+import { exceedsBytes } from './adapters/opencode-stats'
 import { LITELLM } from './prices-litellm'
 
 export type Rates = { input: number; output: number; cacheRead: number; cacheWrite: number }
@@ -53,7 +54,8 @@ export function ratesFor(model: string, totalInput: number, table: PriceTable): 
 }
 
 /** A LiteLLM snapshot: USD per million tokens `[input, output, cacheRead, cacheWrite]` by lower-cased LiteLLM key. */
-export type LitellmTable = Readonly<Record<string, readonly [number, number, number, number]>>
+export type Rates4 = readonly [number, number, number, number]
+export type LitellmTable = Readonly<Record<string, Rates4>>
 
 /** Providers tried, in this order, for a model id that carries none. */
 const PROVIDER_ORDER = [
@@ -78,22 +80,150 @@ export function litellmRates(model: string, provider?: string, table: LitellmTab
   return null
 }
 
-/** Effective rates: price overrides, then the Claude table (both are `table`), then the LiteLLM snapshot. */
-export function ratesForAny(model: string, totalInput: number, table: PriceTable, litellm: LitellmTable = LITELLM): Rates | null {
-  return ratesFor(model, totalInput, table) ?? litellmRates(model, undefined, litellm)
+/** Where a price came from: overrides or the Claude table, the refreshed LiteLLM list, or the list bundled with this version. */
+export type PricedBy = 'table' | 'fetched' | 'bundled'
+
+/**
+ * Effective rates and where they came from: price overrides, then the Claude table (both are `table`), then the refreshed
+ * LiteLLM list (`fetched`, when there is one), then the bundled snapshot.
+ */
+export function pricedBy(
+  model: string,
+  totalInput: number,
+  table: PriceTable,
+  litellm: LitellmTable = LITELLM,
+  fetched?: LitellmTable,
+): { rates: Rates; from: PricedBy } | null {
+  const own = ratesFor(model, totalInput, table)
+  if (own) return { rates: own, from: 'table' }
+  const fresh = fetched ? litellmRates(model, undefined, fetched) : null
+  if (fresh) return { rates: fresh, from: 'fetched' }
+  const bundled = litellmRates(model, undefined, litellm)
+  return bundled ? { rates: bundled, from: 'bundled' } : null
 }
 
-export function estimateCost(usage: Usage, model: string, table: PriceTable, litellm: LitellmTable = LITELLM): number | null {
+export function ratesForAny(model: string, totalInput: number, table: PriceTable, litellm: LitellmTable = LITELLM, fetched?: LitellmTable): Rates | null {
+  return pricedBy(model, totalInput, table, litellm, fetched)?.rates ?? null
+}
+
+/** The estimate and the price list it came from, or null when no rate is known. */
+export function estimateDetail(
+  usage: Usage,
+  model: string,
+  table: PriceTable,
+  litellm: LitellmTable = LITELLM,
+  fetched?: LitellmTable,
+): { cost: number; from: PricedBy } | null {
   const totalInput = usage.uncached + usage.cacheRead + usage.cacheWrite
-  const rates = ratesForAny(model, totalInput, table, litellm)
-  if (!rates) return null
-  return (
-    (usage.uncached * rates.input +
-      usage.output * rates.output +
-      usage.cacheRead * rates.cacheRead +
-      usage.cacheWrite * rates.cacheWrite) /
-    1e6
-  )
+  const priced = pricedBy(model, totalInput, table, litellm, fetched)
+  if (!priced) return null
+  const { rates, from } = priced
+  const cost =
+    (usage.uncached * rates.input + usage.output * rates.output + usage.cacheRead * rates.cacheRead + usage.cacheWrite * rates.cacheWrite) / 1e6
+  return { cost, from }
+}
+
+export function estimateCost(usage: Usage, model: string, table: PriceTable, litellm: LitellmTable = LITELLM, fetched?: LitellmTable): number | null {
+  return estimateDetail(usage, model, table, litellm, fetched)?.cost ?? null
+}
+
+// ---- the refreshed LiteLLM list (spec §3.9)
+
+/** The one URL the plugin fetches: LiteLLM's public price list. */
+export const LITELLM_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json' as const
+/** The store record the refreshed list is kept in. */
+export const PRICES_KEY = 'prices/litellm/v1'
+
+const MAX_LIST_BYTES = 8 * 1024 * 1024
+const MAX_LIST_ENTRIES = 6000
+const MIN_LIST_ENTRIES = 100
+const MAX_PER_MILLION = 10_000
+const LIST_KEY = /^[a-z0-9._:/@+-]{1,160}$/
+
+/** USD per million tokens from a per-token price: undefined when absent, null when present but not a sane price. */
+function perMillion(v: unknown): number | null | undefined {
+  if (v === undefined || v === null) return undefined
+  if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return null
+  const m = Math.round(v * 1e6 * 1e6) / 1e6
+  return m <= MAX_PER_MILLION ? m : null
+}
+
+/**
+ * LiteLLM's price list reduced to numbers: chat models with a numeric input price, base tier, USD per million tokens
+ * `[input, output, cacheRead, cacheWrite]` (a missing cache rate is 0), keys lower-cased. The same rules as
+ * scripts/update-prices.mjs. Null for text over 8 MiB, text that is not JSON, or fewer than 100 surviving entries.
+ */
+export function projectLitellm(text: string): Record<string, Rates4> | null {
+  if (typeof text !== 'string' || exceedsBytes(text, MAX_LIST_BYTES)) return null
+  let list: unknown
+  try {
+    list = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (typeof list !== 'object' || list === null || Array.isArray(list)) return null
+  const out: Record<string, Rates4> = {}
+  let count = 0
+  for (const [rawKey, entry] of Object.entries(list)) {
+    if (count >= MAX_LIST_ENTRIES) break
+    if (typeof entry !== 'object' || entry === null) continue
+    const e = entry as Record<string, unknown>
+    if (e['mode'] !== 'chat') continue
+    const key = rawKey.toLowerCase()
+    if (!LIST_KEY.test(key) || key === '__proto__' || key === 'sample_spec' || Object.hasOwn(out, key)) continue
+    const input = perMillion(e['input_cost_per_token'])
+    const output = perMillion(e['output_cost_per_token'])
+    const cacheRead = perMillion(e['cache_read_input_token_cost'])
+    const cacheWrite = perMillion(e['cache_creation_input_token_cost'])
+    if (input === undefined || input === null || output === null || cacheRead === null || cacheWrite === null) continue
+    out[key] = [input, output ?? 0, cacheRead ?? 0, cacheWrite ?? 0]
+    count += 1
+  }
+  return count < MIN_LIST_ENTRIES ? null : out
+}
+
+/** What `PRICES_KEY` holds. `fetchedAt` is 0 until a list was fetched; `rates` is then empty. */
+export type PriceRecord = { v: 1; fetchedAt: number; attemptedAt: number; rates: Record<string, Rates4> }
+
+const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0
+
+/** The record as stored, checked field by field (shape, caps, every number); anything else reads as no record. */
+export function parsePriceRecord(value: unknown): PriceRecord | null {
+  if (typeof value !== 'object' || value === null) return null
+  const r = value as Record<string, unknown>
+  if (r['v'] !== 1 || !isTime(r['fetchedAt']) || !isTime(r['attemptedAt'])) return null
+  const raw = r['rates']
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
+  const keys = Object.keys(raw)
+  if (keys.length > MAX_LIST_ENTRIES) return null
+  const rates: Record<string, Rates4> = {}
+  for (const key of keys) {
+    if (!LIST_KEY.test(key) || key === '__proto__') return null
+    const row = (raw as Record<string, unknown>)[key]
+    if (!Array.isArray(row) || row.length !== 4) return null
+    const [a, b, c, d] = row as unknown[]
+    for (const n of [a, b, c, d]) if (typeof n !== 'number' || !Number.isFinite(n) || n < 0 || n > MAX_PER_MILLION) return null
+    rates[key] = [a as number, b as number, c as number, d as number]
+  }
+  return { v: 1, fetchedAt: r['fetchedAt'], attemptedAt: r['attemptedAt'], rates }
+}
+
+/** The refreshed list and the time it was fetched. */
+export type FetchedPrices = { rates: LitellmTable; fetchedAt: number }
+
+/**
+ * A reader of the stored record that checks the rates once per `fetchedAt` and answers from memory after: each file that
+ * prices tokens holds its own (the engine takes no value across files). Undefined when there is no usable list.
+ */
+export function fetchedPrices(): (value: unknown) => FetchedPrices | undefined {
+  let held: FetchedPrices | undefined
+  return value => {
+    const at = typeof value === 'object' && value !== null ? (value as Record<string, unknown>)['fetchedAt'] : undefined
+    if (held !== undefined && at === held.fetchedAt) return held
+    const record = parsePriceRecord(value)
+    held = record !== null && record.fetchedAt > 0 && Object.keys(record.rates).length > 0 ? { rates: record.rates, fetchedAt: record.fetchedAt } : undefined
+    return held
+  }
 }
 
 function validRate(v: unknown): v is number {

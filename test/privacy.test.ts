@@ -90,7 +90,7 @@ function observe(on: On, onLedger?: (ledger: Ledger) => void): Seen {
   return seen
 }
 
-test('privacy canary: planted sentinels never reach state, store, toasts, status or trees', { options: { notify: 'on' } }, async ($, on) => {
+test('privacy canary: planted sentinels never reach state, store, toasts, status or trees', { options: { notify: 'on', priceUpdates: 'off' } }, async ($, on) => {
   // register every test hook before the first call to `$`: the kit refuses later registrations
   const seen = observe(on)
   on('command.register', async () => ({ value: { command: 'flock' } }))

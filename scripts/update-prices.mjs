@@ -1,5 +1,5 @@
 // Regenerates src/prices-litellm.ts from LiteLLM's model price list. Run at release time, never by the plugin:
-//   node scripts/update-prices.mjs [--from <file>] [--date YYYY-MM-DD]
+//   node scripts/update-prices.mjs [--from <file>] [--date YYYY-MM-DD] [--allow-small]
 // Without --from it fetches the list from GitHub. Keeps chat models with a numeric input price, base tier only, as
 // USD per million tokens [input, output, cacheRead, cacheWrite] (a missing cache rate is 0), rounded to 6 decimals.
 import { readFileSync, writeFileSync } from 'node:fs'
@@ -8,6 +8,8 @@ const LIST_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_p
 const OUT = new URL('../src/prices-litellm.ts', import.meta.url)
 const KEY = /^[a-z0-9._:/@+-]{1,160}$/
 const MAX_PER_MILLION = 10_000
+const MAX_ENTRIES = 6000
+const MIN_ENTRIES = 100
 
 const args = process.argv.slice(2)
 const flag = name => {
@@ -26,8 +28,9 @@ async function fetchList() {
 
 const text = from !== undefined ? readFileSync(from, 'utf8') : await fetchList()
 const list = JSON.parse(text)
+if (typeof list !== 'object' || list === null || Array.isArray(list)) throw new Error('the price list is not an object')
 
-/** USD per million tokens, or undefined when the value is missing or not a sane price. */
+/** USD per million tokens, or undefined when the value is missing, null when it is present but not a sane price. */
 function perMillion(v) {
   if (v === undefined || v === null) return undefined
   if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return null
@@ -35,28 +38,28 @@ function perMillion(v) {
   return m <= MAX_PER_MILLION ? m : null
 }
 
-const rows = []
+// The same projection as projectLitellm in src/price.ts (the plugin's daily refresh): keep the two in step.
+// Input order, first spelling of a lower-cased key wins, at most MAX_ENTRIES kept.
+const kept = new Map()
 for (const [rawKey, entry] of Object.entries(list)) {
+  if (kept.size >= MAX_ENTRIES) break
   if (typeof entry !== 'object' || entry === null || entry.mode !== 'chat') continue
   const key = rawKey.toLowerCase()
-  if (!KEY.test(key) || key === '__proto__' || key === 'sample_spec') continue
+  if (!KEY.test(key) || key === '__proto__' || key === 'sample_spec' || kept.has(key)) continue
   const input = perMillion(entry.input_cost_per_token)
   const output = perMillion(entry.output_cost_per_token)
   const cacheRead = perMillion(entry.cache_read_input_token_cost)
   const cacheWrite = perMillion(entry.cache_creation_input_token_cost)
   // a rate that is present but invalid skips the entry; a missing input rate is not a chat price
   if (input === undefined || input === null || output === null || cacheRead === null || cacheWrite === null) continue
-  rows.push([key, [input, output ?? 0, cacheRead ?? 0, cacheWrite ?? 0]])
+  kept.set(key, [input, output ?? 0, cacheRead ?? 0, cacheWrite ?? 0])
 }
-rows.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-
-const seen = new Set()
-const lines = []
-for (const [key, rates] of rows) {
-  if (seen.has(key)) continue // two spellings of one lower-cased key: the first wins
-  seen.add(key)
-  lines.push(`  '${key}': [${rates.join(', ')}],`)
+if (kept.size < MIN_ENTRIES && !args.includes('--allow-small')) {
+  throw new Error(`only ${kept.size} models survived (fewer than ${MIN_ENTRIES}); pass --allow-small for a fixture`)
 }
+const lines = [...kept.entries()]
+  .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))
+  .map(([key, rates]) => `  '${key}': [${rates.join(', ')}],`)
 
 writeFileSync(
   OUT,

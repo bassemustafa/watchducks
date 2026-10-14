@@ -3,7 +3,7 @@ import type { PluginOptions } from 'claude-code'
 import type { HistoryRecord, UiState } from '../types'
 import { parseCostMode, type CostMode, type Pricing } from './cost'
 import { emptyLedger } from './ledger'
-import { PRICES, withOverrides, type PriceTable } from './price'
+import { PRICES, withOverrides, type FetchedPrices, type PriceTable } from './price'
 
 // The mod's two shared values and pure helpers around them (spec §5, §10).
 // Nothing here takes `$` or declares an atom: the engine follows `$` only into functions declared
@@ -28,6 +28,14 @@ export function costMode(options: PluginOptions): CostMode {
 /** The price table and the cost mode every sink prices with. */
 export function pricing(options: PluginOptions): Pricing {
   return { table: prices(options), mode: costMode(options) }
+}
+
+/**
+ * `base` priced with the refreshed LiteLLM list (the reader is the file's own `fetchedPrices()`, fed the stored record);
+ * `base` itself when there is none. Every file that prices tokens reads the record with its own `$.store.get`.
+ */
+export function withFetched(base: Pricing, fetched: FetchedPrices | undefined): Pricing {
+  return fetched ? { ...base, fetched: fetched.rates, fetchedAt: fetched.fetchedAt } : base
 }
 
 export function recordsHeadless(options: PluginOptions): boolean {

@@ -2,6 +2,8 @@ import type { Elements } from 'claude-code'
 
 import type { Ledger, Run, UiState, Usage } from '../../types'
 import { shownCost, storedCost, type Pricing } from '../cost'
+import { utcDay } from '../history'
+import { LITELLM_DATE } from '../prices-litellm'
 import { cachePct, fmtCost, fmtDuration, fmtTokens } from './format'
 import { PALETTE, glyphs, statusColor, statusWords } from './theme'
 
@@ -34,16 +36,31 @@ export function runTokens(run: Run): string {
   return '?'
 }
 
-/** The run's cost text under `pricing` (the stored figures when none is given); `detail` adds what a card leaves out. */
-export function runCost(run: Run, pricing?: Pricing, detail = false): string {
-  const shown = pricing ? shownCost(run, pricing.mode, pricing.table) : storedCost(run)
+/**
+ * The run's cost text under `pricing` (the stored figures when none is given). `detail` adds what a card leaves out, in
+ * brackets after the figure: that a reported $0 was replaced, and the date of the LiteLLM prices an estimate used. The
+ * brackets are the longest wording that fits `width` (cells); the figure is never cut.
+ */
+export function runCost(run: Run, pricing?: Pricing, detail = false, width = Number.POSITIVE_INFINITY): string {
+  const shown = pricing ? shownCost(run, pricing.mode, pricing.table, pricing.fetched) : storedCost(run)
   if (shown.cost === null && shown.source === null) {
     if (run.kind === 'cli' || run.kind === 'shell') return '—'
     // a relay without an out dir has no result file to read, so its cost can never arrive
     if (run.kind === 'relay' && (run.implementer === 'codex' || run.outDir === undefined)) return '—'
   }
   const text = fmtCost(shown.cost, shown.source, shown.partial === true)
-  return detail && shown.reportedZero ? `${text} (reported $0)` : text
+  if (!detail) return text
+  const zero = shown.reportedZero ? 'reported $0' : undefined
+  const date =
+    shown.list === undefined ? undefined : shown.list === 'fetched' && pricing?.fetchedAt !== undefined ? utcDay(pricing.fetchedAt) : LITELLM_DATE
+  const notes = [
+    [zero, date && `LiteLLM prices of ${date}`],
+    [zero, date && `LiteLLM ${date}`],
+    [zero],
+    [date && `LiteLLM ${date}`],
+  ].map(parts => parts.filter(Boolean).join('; '))
+  const note = notes.find(n => n !== '' && Array.from(text).length + 3 + Array.from(n).length <= width)
+  return note === undefined ? text : `${text} (${note})`
 }
 
 const SOURCE_WORDS = { relay: 'result.json', child: 'child report', stats: 'opencode stats', steps: 'per request', complete: 'per request' } as const
@@ -105,7 +122,7 @@ export function dossierView(
     </Text>
   )
 
-  const costShown = pricing ? shownCost(run, pricing.mode, pricing.table) : storedCost(run)
+  const costShown = pricing ? shownCost(run, pricing.mode, pricing.table, pricing.fetched) : storedCost(run)
   const u = run.usage
   const models = run.models && run.models.length > 0 ? run.models.join(', ') : (run.model ?? '—')
   const effort =
@@ -149,7 +166,7 @@ export function dossierView(
       {row('output', u ? fmtTokens(u.output) : runTokens(run))}
       {row('total', runTokens(run))}
       {row('cache hit', cachePct(u))}
-      {row('cost', runCost(run, pricing, true), PALETTE.accent)}
+      {row('cost', runCost(run, pricing, true, inner - LABEL), PALETTE.accent)}
       {costShown.partial === true && <Text dimColor>{'  some requests had no price'}</Text>}
       <Text> </Text>
       {row('patches', String(run.editCalls))}

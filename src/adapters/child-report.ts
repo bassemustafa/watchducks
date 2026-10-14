@@ -157,7 +157,7 @@ export function buildReport(
     const usage = usageOf(spend.usage)
     // what the child shows: the cost under its own cost mode (the parent adds the rows up as they come)
     const row = { cost: spend.cost, costSource: spend.cost === null ? null : ('estimated' as const), usage: spend.usage, model }
-    const shown = pricing ? shownCost(row, pricing.mode, pricing.table) : storedCost(row)
+    const shown = pricing ? shownCost(row, pricing.mode, pricing.table, pricing.fetched) : storedCost(row)
     const cost = shown.cost !== null && Number.isFinite(shown.cost) ? Math.min(Math.max(shown.cost, 0), MAX_COST) : null
     mergeRow(merged, { implementer: 'claude-code', model: modelName(model), usage, cost, costSource: cost === null ? null : (shown.source ?? 'estimated') })
   }

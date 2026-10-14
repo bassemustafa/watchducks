@@ -2,7 +2,7 @@ import type { Classification, Implementer, Ledger, RelayProjection, Review, Run,
 import { fnv1a, codenameFor } from './codename'
 import { shownCost, type CostMode, type Pricing } from './cost'
 import { addRunsToDays, dropOldDays } from './history'
-import { ZERO_USAGE, addUsage, estimateCost, usageFromApi, type PriceTable } from './price'
+import { ZERO_USAGE, addUsage, estimateCost, usageFromApi, type LitellmTable, type PriceTable } from './price'
 
 // Pure ledger reducer (spec §5-§7): every action returns a new ledger and the
 // input is never mutated. Only numbers, identifiers and enums pass through.
@@ -46,8 +46,8 @@ export type Action =
   | { type: 'editCall'; loop?: string; at: number }
   | { type: 'findings'; loop?: string; toolUseId: string; count: number; at: number }
   | { type: 'verdict'; targetId: string; reviewerId?: string; bugs?: number; edits?: number; at: number }
-  /** `mode`: the cost mode the retired days are priced under (default `auto`). */
-  | { type: 'clear'; at: number; mode?: CostMode }
+  /** `mode`: the cost mode the retired days are priced under (default `auto`); `fetched`: the refreshed LiteLLM list, when there is one. */
+  | { type: 'clear'; at: number; mode?: CostMode; fetched?: LitellmTable }
 
 export type Totals = {
   running: number
@@ -658,7 +658,7 @@ export function reduce(ledger: Ledger, action: Action, prices: PriceTable): Ledg
     case 'verdict':
       return reduceVerdict(ledger, action)
     case 'clear':
-      return reduceClear(ledger, action.at, { table: prices, mode: action.mode ?? 'auto' })
+      return reduceClear(ledger, action.at, { table: prices, mode: action.mode ?? 'auto', ...(action.fetched ? { fetched: action.fetched } : {}) })
   }
 }
 
@@ -679,12 +679,12 @@ export function totals(ledger: Ledger, pricing?: Pricing): Totals {
   for (const run of Object.values(ledger.runs)) {
     t[run.status] += 1
     if (run.usage) t.usage = addUsage(t.usage, run.usage)
-    const shown = pricing ? shownCost(run, pricing.mode, pricing.table) : { cost: run.cost, partial: run.costPartial || undefined }
+    const shown = pricing ? shownCost(run, pricing.mode, pricing.table, pricing.fetched) : { cost: run.cost, partial: run.costPartial || undefined }
     if (shown.cost !== null) t.cost = (t.cost ?? 0) + shown.cost
     if ((run.kind === 'agent' || run.kind === 'relay') && (shown.cost === null || shown.partial)) t.costPartial = true
     if (run.rows !== undefined && run.rows.length > 0) {
       for (const row of run.rows) {
-        const spent = pricing ? shownCost(row, pricing.mode, pricing.table).cost : row.cost
+        const spent = pricing ? shownCost(row, pricing.mode, pricing.table, pricing.fetched).cost : row.cost
         t.byImplementer[row.implementer] = (t.byImplementer[row.implementer] ?? 0) + (spent ?? 0)
       }
     } else {

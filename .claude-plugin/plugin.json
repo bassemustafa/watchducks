@@ -66,12 +66,22 @@
     "costMode": {
       "type": "string",
       "title": "Cost mode",
-      "description": "auto: a reported cost, else an estimate from tokens (a reported $0 with tokens is estimated); calculate: always estimate from tokens; display: only costs a source reported",
+      "description": "auto: a reported cost, else an estimate from tokens (a reported $0 with tokens is estimated); estimate: always price from tokens; reported: only costs a source reported",
       "default": "auto",
       "options": [
         "auto",
-        "calculate",
-        "display"
+        "estimate",
+        "reported"
+      ]
+    },
+    "priceUpdates": {
+      "type": "string",
+      "title": "Price updates",
+      "description": "Refresh model prices from LiteLLM's public price list at most once a day (one GET to GitHub, carrying no data); off uses the prices bundled with this version",
+      "default": "on",
+      "options": [
+        "on",
+        "off"
       ]
     },
     "recordHeadless": {

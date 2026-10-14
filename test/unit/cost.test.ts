@@ -17,33 +17,33 @@ const TOKENS: Usage = { uncached: 1_000_000, output: 1_000_000, cacheRead: 0, ca
 const NONE: Usage = { uncached: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
 
 const c = (over: Partial<Costed>): Costed => ({ cost: null, costSource: null, usage: TOKENS, model: 'x/m', ...over })
-const shown = (item: Costed, mode: 'auto' | 'calculate' | 'display') => shownCost(item, mode, TABLE)
+const shown = (item: Costed, mode: 'auto' | 'estimate' | 'reported') => shownCost(item, mode, TABLE)
 
-test('parseCostMode: only calculate and display change the default', () => {
-  expect(parseCostMode('calculate')).toBe('calculate')
-  expect(parseCostMode('display')).toBe('display')
+test('parseCostMode: only estimate and reported change the default', () => {
+  expect(parseCostMode('estimate')).toBe('estimate')
+  expect(parseCostMode('reported')).toBe('reported')
   expect(parseCostMode('auto')).toBe('auto')
   expect(parseCostMode('nonsense')).toBe('auto')
   expect(parseCostMode(undefined)).toBe('auto')
 })
 
-test('display: only a reported cost is shown, never an estimate', () => {
-  expect(shown(c({ cost: 0.4, costSource: 'reported' }), 'display')).toEqual({ cost: 0.4, source: 'reported' })
-  expect(shown(c({ cost: 0, costSource: 'reported' }), 'display')).toEqual({ cost: 0, source: 'reported' })
-  expect(shown(c({ cost: 0.4, costSource: 'estimated' }), 'display')).toEqual({ cost: null, source: null })
-  expect(shown(c({}), 'display')).toEqual({ cost: null, source: null })
+test('reported: only a reported cost is shown, never an estimate', () => {
+  expect(shown(c({ cost: 0.4, costSource: 'reported' }), 'reported')).toEqual({ cost: 0.4, source: 'reported' })
+  expect(shown(c({ cost: 0, costSource: 'reported' }), 'reported')).toEqual({ cost: 0, source: 'reported' })
+  expect(shown(c({ cost: 0.4, costSource: 'estimated' }), 'reported')).toEqual({ cost: null, source: null })
+  expect(shown(c({}), 'reported')).toEqual({ cost: null, source: null })
 })
 
-test('calculate: always an estimate from the tokens when a rate is known, else the stored cost', () => {
-  expect(shown(c({ cost: 0.4, costSource: 'reported' }), 'calculate')).toEqual({ cost: 3, source: 'estimated' })
-  expect(shown(c({ cost: 0, costSource: 'reported' }), 'calculate')).toEqual({ cost: 3, source: 'estimated' })
-  expect(shown(c({}), 'calculate')).toEqual({ cost: 3, source: 'estimated' })
+test('estimate: always an estimate from the tokens when a rate is known, else the stored cost', () => {
+  expect(shown(c({ cost: 0.4, costSource: 'reported' }), 'estimate')).toEqual({ cost: 3, source: 'estimated' })
+  expect(shown(c({ cost: 0, costSource: 'reported' }), 'estimate')).toEqual({ cost: 3, source: 'estimated' })
+  expect(shown(c({}), 'estimate')).toEqual({ cost: 3, source: 'estimated' })
   // no rate: the stored cost as stored
-  expect(shown(c({ model: 'zz-unknown', cost: 0.4, costSource: 'reported' }), 'calculate')).toEqual({ cost: 0.4, source: 'reported' })
-  expect(shown(c({ model: 'zz-unknown' }), 'calculate')).toEqual({ cost: null, source: null })
-  expect(shown(c({ model: undefined, cost: 0.4, costSource: 'reported' }), 'calculate')).toEqual({ cost: 0.4, source: 'reported' })
+  expect(shown(c({ model: 'zz-unknown', cost: 0.4, costSource: 'reported' }), 'estimate')).toEqual({ cost: 0.4, source: 'reported' })
+  expect(shown(c({ model: 'zz-unknown' }), 'estimate')).toEqual({ cost: null, source: null })
+  expect(shown(c({ model: undefined, cost: 0.4, costSource: 'reported' }), 'estimate')).toEqual({ cost: 0.4, source: 'reported' })
   // a stored estimate was priced from the tokens request by request: it stays
-  expect(shown(c({ cost: 1.5, costSource: 'estimated' }), 'calculate')).toEqual({ cost: 1.5, source: 'estimated' })
+  expect(shown(c({ cost: 1.5, costSource: 'estimated' }), 'estimate')).toEqual({ cost: 1.5, source: 'estimated' })
 })
 
 test('auto: a reported cost above $0 is reported; a reported $0 is estimated when tokens flowed', () => {
@@ -77,10 +77,10 @@ test('a run with child rows applies the rule to each row and sums them', () => {
   const run = c({ cost: 0.4, costSource: 'reported', model: 'claude-x', rows: rows({ cost: 0.1, costSource: 'reported' }, { cost: 0, costSource: 'reported' }, { model: 'zz-unknown' }) })
   // auto: 0.1 reported + (reported $0 -> $3 estimated) + an unpriced row left out, and the run is partial
   expect(shown(run, 'auto')).toEqual({ cost: 3.1, source: 'estimated', reportedZero: true, partial: true })
-  // display: only the reported rows
-  expect(shown(run, 'display')).toEqual({ cost: 0.1, source: 'reported', partial: true })
-  // calculate: x/m rows are priced again, the unpriced row has nothing to show
-  expect(shown(run, 'calculate')).toEqual({ cost: 6, source: 'estimated', partial: true })
+  // reported: only the reported rows
+  expect(shown(run, 'reported')).toEqual({ cost: 0.1, source: 'reported', partial: true })
+  // estimate: x/m rows are priced again, the unpriced row has nothing to show
+  expect(shown(run, 'estimate')).toEqual({ cost: 6, source: 'estimated', partial: true })
   // every row reported above $0 -> reported, and complete
   expect(shown(c({ rows: rows({ cost: 1, costSource: 'reported' }, { cost: 2, costSource: 'reported' }) }), 'auto')).toEqual({ cost: 3, source: 'reported' })
   // no row has a cost
@@ -91,7 +91,7 @@ test('the main loop spend is a row per model, every figure an estimate', () => {
   const spend = (cost: number | null, over: Partial<Ledger['hq']> = {}) => ({ usage: TOKENS, cost, costPartial: false, ...over })
   const l = { hq: spend(3), hqByModel: { 'x/m': spend(3), 'zz-unknown': spend(null, { costPartial: true }) } }
   expect(shownHq(l, 'auto', TABLE)).toEqual({ cost: 3, source: 'estimated', partial: true })
-  expect(shownHq(l, 'display', TABLE)).toEqual({ cost: null, source: null, partial: true })
+  expect(shownHq(l, 'reported', TABLE)).toEqual({ cost: null, source: null, partial: true })
   // a ledger without the split is one row
   expect(shownHq({ hq: spend(null) }, 'auto', TABLE)).toEqual({ cost: null, source: null })
 })
@@ -119,8 +119,8 @@ test('totals: without pricing the stored cost, with pricing the shown one, by im
   near(totals(l).cost, 0.5)
   near(totals(l, pricing('auto')).cost, 3.5)
   near(totals(l, pricing('auto')).byImplementer['opencode'], 3.5)
-  near(totals(l, pricing('display')).cost, 0.5)
-  near(totals(l, pricing('calculate')).cost, 6)
+  near(totals(l, pricing('reported')).cost, 0.5)
+  near(totals(l, pricing('estimate')).cost, 6)
   const none = ledgerOf(run('c', { cost: null, costSource: null, model: 'zz-unknown' }))
   expect(totals(none, pricing('auto')).cost).toBeNull()
   expect(totals(none, pricing('auto')).costPartial).toBe(true)
@@ -133,11 +133,11 @@ test('history: a bucket takes the shown cost with its source; no pricing keeps t
   expect([stored.costReported, stored.costEstimated, stored.costOps]).toEqual([0, 0, 1])
   const auto = recordFromLedger(l, pricing('auto')).days['2026-10-09']![key]!
   expect([auto.costReported, auto.costEstimated, auto.costOps]).toEqual([0, 3, 1])
-  const display = recordFromLedger(l, pricing('display')).days['2026-10-09']![key]!
-  expect([display.costReported, display.costEstimated, display.costOps]).toEqual([0, 0, 1])
+  const reportedOnly = recordFromLedger(l, pricing('reported')).days['2026-10-09']![key]!
+  expect([reportedOnly.costReported, reportedOnly.costEstimated, reportedOnly.costOps]).toEqual([0, 0, 1])
   // the live board reads the same
   near(stationRowsFromLedger(l, pricing('auto'))[0]!.costEstimated, 3)
-  expect(addRunsToDays({}, [run('a', {})], pricing('calculate'))['2026-10-09']![key]!.costEstimated).toBe(3)
+  expect(addRunsToDays({}, [run('a', {})], pricing('estimate'))['2026-10-09']![key]!.costEstimated).toBe(3)
 })
 
 test('history: child rows are priced row by row', () => {
@@ -152,8 +152,8 @@ test('/flock clear retires the days under the cost mode the clear carries', () =
   const key = 'opencode|x/m'
   const auto = reduce(l, { type: 'clear', at: T0 + 5000, mode: 'auto' }, TABLE).retired['2026-10-09']![key]!
   expect(auto.costEstimated).toBe(3)
-  const display = reduce(l, { type: 'clear', at: T0 + 5000, mode: 'display' }, TABLE).retired['2026-10-09']![key]!
-  expect(display.costEstimated).toBe(0)
+  const reportedOnly = reduce(l, { type: 'clear', at: T0 + 5000, mode: 'reported' }, TABLE).retired['2026-10-09']![key]!
+  expect(reportedOnly.costEstimated).toBe(0)
   const bare = reduce(l, { type: 'clear', at: T0 + 5000 }, TABLE).retired['2026-10-09']![key]!
   expect(bare.costEstimated).toBe(3)
 })
@@ -168,7 +168,7 @@ test('the child report carries the costs the child shows', () => {
   const auto = rowOf(buildReport(l, T0, undefined, 'running', now, pricing('auto')))
   near(auto.cost, 3)
   expect(auto.costSource).toBe('estimated')
-  const display = rowOf(buildReport(l, T0, undefined, 'running', now, pricing('display')))
-  expect(display.cost).toBe(0)
-  expect(display.costSource).toBe('reported')
+  const reportedOnly = rowOf(buildReport(l, T0, undefined, 'running', now, pricing('reported')))
+  expect(reportedOnly.cost).toBe(0)
+  expect(reportedOnly.costSource).toBe('reported')
 })

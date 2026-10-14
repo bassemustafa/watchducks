@@ -1,12 +1,27 @@
 import { atom, read } from 'claude-code'
-import type { On, PluginOptions } from 'claude-code'
+import type { EngineInterface, On, PluginOptions } from 'claude-code'
 
 import { totals } from '../ledger'
-import { INITIAL_LEDGER, pricing } from '../state'
+import type { Pricing } from '../cost'
+import { PRICES_KEY, fetchedPrices } from '../price'
+import { INITIAL_LEDGER, pricing, withFetched } from '../state'
 import { radar } from './animate'
 import { totalTokens } from './dossier'
 import { cachePct, fmtCost, fmtTokens } from './format'
 import { PALETTE, glyphs } from './theme'
+
+const priceReader = fetchedPrices()
+
+/** The prices a draw uses: the options', with the refreshed LiteLLM list from the store when there is one. */
+async function pricingNow($: EngineInterface, options: PluginOptions): Promise<Pricing> {
+  let record: unknown
+  try {
+    record = await $.store.get(PRICES_KEY)
+  } catch {
+    // the prices bundled with this version
+  }
+  return withFetched(pricing(options), priceReader(record))
+}
 
 const ledgerAtom = atom({ plugin: 'watchducks', key: 'ledger' } as const, INITIAL_LEDGER)
 
@@ -17,7 +32,6 @@ const RECENT_MS = 5 * 60_000
 
 export function registerBand(on: On, options: PluginOptions): void {
   const g = glyphs(options.glyphs === 'ascii' ? 'ascii' : 'emoji')
-  const pr = pricing(options)
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (typeof e.viewport?.isFullscreen === 'boolean') radar.fullscreen = e.viewport.isFullscreen
@@ -40,7 +54,7 @@ export function registerBand(on: On, options: PluginOptions): void {
     if (placed) return next(e)
 
     const { Box, Text } = $.ui.resolve(e)
-    const tot = totals(ledger, pr)
+    const tot = totals(ledger, await pricingNow($, options))
     const tokens = totalTokens(tot.usage) ?? 0
     return (
       <Box>

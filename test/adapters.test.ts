@@ -1855,7 +1855,7 @@ test('auto: stats that report $0 with real tokens show an estimate on the card, 
   expect(buckets.reduce((n, c) => n + c.costReported, 0)).toBe(0)
 })
 
-test('display: stats that report $0 show $0 reported and no estimate anywhere', pricedOn('display'), async ($, on) => {
+test('reported: stats that report $0 show $0 reported and no estimate anywhere', pricedOn('reported'), async ($, on) => {
   const { w } = await costedRun($, on, [statsJson(1, 1, 0), statsJson(2, 3, 0)])
   const ui = await solPane($)
   const card = JSON.stringify(await ui.drawn())
@@ -1867,7 +1867,7 @@ test('display: stats that report $0 show $0 reported and no estimate anywhere', 
   expect(lastBuckets(w.stored).reduce((n, c) => n + c.costEstimated, 0)).toBe(0)
 })
 
-test('calculate: a reported cost is priced again from the tokens', pricedOn('calculate'), async ($, on) => {
+test('estimate: a reported cost is priced again from the tokens', pricedOn('estimate'), async ($, on) => {
   const { ledger } = await costedRun($, on, [statsJson(1, 1, 0.1), statsJson(2, 3, 0.4)])
   const run = ledger().runs['bash:u1']!
   near(run.cost, 0.3)

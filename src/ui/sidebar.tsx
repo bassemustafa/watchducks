@@ -1,11 +1,12 @@
 import { atom, read, update } from 'claude-code'
-import type { Elements, On, PluginOptions } from 'claude-code'
+import type { Elements, EngineInterface, On, PluginOptions } from 'claude-code'
 
 import type { HistoryRecord, Implementer, Ledger, Run, StationRow, UiState } from '../../types'
 import { shownCost, shownHq, type Pricing } from '../cost'
 import { HISTORY_PREFIX, aggregateHistory, stationRowsFromLedger } from '../history'
 import { seriesWindow, totals, type Totals } from '../ledger'
-import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, pricing } from '../state'
+import { PRICES_KEY, fetchedPrices } from '../price'
+import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, pricing, withFetched } from '../state'
 import { RADAR_FULL, RADAR_SMALL, blipsFor, radar, svgBlipsFor } from './animate'
 import { codenameOf, dossierView, fit, runCost, runElapsed, runTokens, totalTokens, type Glyphs, type Press, type Table } from './dossier'
 import { cachePct, fmtCost, fmtDuration, fmtElapsedCoarse, fmtTokens, sparkline } from './format'
@@ -14,6 +15,19 @@ import { duckLogo, gradientBar, hex, radarFrame, type RasterSpec } from './raste
 import { stationView } from './station'
 import { BAR_HEIGHT, barSvg, barWidth, headerHeight, headerSvg, headerWidth } from './svg'
 import { PALETTE, glyphs, statusColor, statusWords } from './theme'
+
+const priceReader = fetchedPrices()
+
+/** The prices a draw uses: the options', with the refreshed LiteLLM list from the store when there is one. */
+async function pricingNow($: EngineInterface, options: PluginOptions): Promise<Pricing> {
+  let record: unknown
+  try {
+    record = await $.store.get(PRICES_KEY)
+  } catch {
+    // the prices bundled with this version
+  }
+  return withFetched(pricing(options), priceReader(record))
+}
 
 const ledgerAtom = atom({ plugin: 'watchducks', key: 'ledger' } as const, INITIAL_LEDGER)
 const uiAtom = atom({ plugin: 'watchducks', key: 'ui' } as const, INITIAL_UI)
@@ -350,7 +364,7 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
     const tick = stampTable && run.status === 'running' && Object.hasOwn(motionState.tickers, run.id) ? motionState.tickers[run.id] : undefined
     const live = tick && now - tick.startedAt < TICK_MS ? tickerValue(tick, now) : undefined
     const tokens = live ? fmtTokens(live.tokens) : runTokens(run)
-    const shown = shownCost(run, pr.mode, pr.table)
+    const shown = shownCost(run, pr.mode, pr.table, pr.fetched)
     const cost = live && shown.cost !== null ? fmtCost(live.cost, shown.source, shown.partial === true) : runCost(run, pr)
     const figures = [(coarse && run.status === 'running' ? fmtElapsedCoarse : fmtDuration)(runElapsed(run, now)), `${run.approx ? '≈' : ''}${tokens} tok`, cost]
     if (run.sharedSize !== undefined && run.sharedSize > 1) figures.push(`shared ×${run.sharedSize}`)
@@ -405,7 +419,7 @@ function fieldView(
   )
   const hq = ledger.hq
   const hqTokens = totalTokens(hq.usage) ?? 0
-  const hqShown = shownHq(ledger, lay.pricing.mode, lay.pricing.table)
+  const hqShown = shownHq(ledger, lay.pricing.mode, lay.pricing.table, lay.pricing.fetched)
   const hqLine = `HQ  ${hqTokens > 0 ? fmtTokens(hqTokens) + ' tok' : '—'} · ${hqTokens > 0 ? fmtCost(hqShown.cost, hqShown.source, hqShown.partial === true) : '—'}`
   const ohTokens = totalTokens(ledger.overhead.usage) ?? 0
 
@@ -478,7 +492,6 @@ export function registerSidebar(on: On, options: PluginOptions): void {
   const g: Glyphs = glyphs(options.glyphs === 'ascii' ? 'ascii' : 'emoji')
   const motion = options.motion !== 'off'
   const showOverhead = options.showEngineOverhead === 'on'
-  const pr = pricing(options)
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     // mobile and the editor get the band only
@@ -488,6 +501,7 @@ export function registerSidebar(on: On, options: PluginOptions): void {
     const ledger = await read($, ledgerAtom)
     const ui = await read($, uiAtom)
     const now = Date.now()
+    const pr = await pricingNow($, options)
     const columns = e.props.bodyColumns > 0 ? e.props.bodyColumns : e.viewport?.columns && e.viewport.columns > 0 ? e.viewport.columns : DEFAULT_COLUMNS
     const tier = columns >= 48 ? 'full' : columns >= 36 ? 'mid' : 'compact'
     const lay: Layout = { columns, inner: Math.max(16, columns - PAD * 2), tier, g, showOverhead, coarse: e.surface === 'desktop', stampTable: e.surface === 'terminal' && motion ? $.ui.resolve(e) : null, pricing: pr }

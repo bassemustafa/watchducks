@@ -4,9 +4,11 @@ import type { EngineInterface, On, PluginOptions } from 'claude-code'
 import type { UiState } from '../types'
 import { HISTORY_PREFIX } from './history'
 import { reduce } from './ledger'
-import type { PriceTable } from './price'
+import { PRICES_KEY, fetchedPrices, type PriceTable } from './price'
 import { INITIAL_LEDGER, INITIAL_UI, costMode } from './state'
 import { glyphs } from './ui/theme'
+
+const priceReader = fetchedPrices()
 
 const ledgerAtom = atom({ plugin: 'watchducks', key: 'ledger' } as const, INITIAL_LEDGER)
 const uiAtom = atom({ plugin: 'watchducks', key: 'ui' } as const, INITIAL_UI)
@@ -42,6 +44,15 @@ async function purgeHistory($: EngineInterface): Promise<number> {
   return removed
 }
 
+/** The refreshed LiteLLM list from the store record; undefined when there is none or the store cannot be read. */
+async function fetchedNow($: EngineInterface) {
+  try {
+    return priceReader(await $.store.get(PRICES_KEY))
+  } catch {
+    return undefined
+  }
+}
+
 export function registerCommands(on: On, table: PriceTable, options: PluginOptions): void {
   const title = `${glyphs(options.glyphs === 'ascii' ? 'ascii' : 'emoji').duck} The Flock`
 
@@ -50,7 +61,8 @@ export function registerCommands(on: On, table: PriceTable, options: PluginOptio
 
     if (arg === 'clear') {
       try {
-        await update($, ledgerAtom, l => reduce(l, { type: 'clear', at: Date.now(), mode: costMode(options) }, table))
+        const fetched = await fetchedNow($)
+        await update($, ledgerAtom, l => reduce(l, { type: 'clear', at: Date.now(), mode: costMode(options), ...(fetched ? { fetched: fetched.rates } : {}) }, table))
       } catch {
         // the board keeps what it had
       }

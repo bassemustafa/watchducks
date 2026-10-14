@@ -33,7 +33,7 @@ export function utcDay(ms: number): string {
 
 /** What a run or row counts as spending: the cost a sink shows under `pricing` (src/cost.ts), else the stored one. */
 function shownOf(c: Parameters<typeof shownCost>[0], pricing: Pricing | undefined): Shown {
-  return pricing ? shownCost(c, pricing.mode, pricing.table) : storedCost(c)
+  return pricing ? shownCost(c, pricing.mode, pricing.table, pricing.fetched) : storedCost(c)
 }
 
 /**

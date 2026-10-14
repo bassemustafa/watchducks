@@ -53,10 +53,10 @@ import {
 import { HISTORY_PREFIX, pruneHistory, recordFromLedger } from './history'
 import { emptyLedger, isKnownLoop, normalizeDir, reduce, workdirKey, type Action } from './ledger'
 import { shownCost, type Pricing } from './cost'
-import { ZERO_USAGE, addUsage, type PriceTable } from './price'
+import { LITELLM_URL, PRICES_KEY, ZERO_USAGE, addUsage, fetchedPrices, parsePriceRecord, projectLitellm, type PriceTable } from './price'
 import { fnv1a } from './codename'
 import { MAX_RESULT_BYTES, ident, isInsideRoots, projectRelayResult, relayIdentity } from './relay-result'
-import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, pricing, recordsHeadless } from './state'
+import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, pricing, recordsHeadless, withFetched } from './state'
 import { ROSTER_SPEC, VERDICT_SPEC } from './tools'
 import { blipsFor, radar } from './ui/animate'
 import { fmtCost } from './ui/format'
@@ -134,11 +134,84 @@ async function isHeadless($: EngineInterface): Promise<boolean> {
 }
 
 /** True when the record is stored, or when policy says there is nothing to store; false when the write failed. */
+// ---- the daily price refresh (spec §3.9)
+
+const PRICE_DAY_MS = 86_400_000
+/** After a failed attempt, and between two looks while a session runs. */
+const PRICE_HOUR_MS = 3_600_000
+const PRICE_TIMEOUT_MS = 20_000
+const PRICE_LOOK_MS = 30_000
+
+const priceReader = fetchedPrices()
+let priceLookedAt = Number.NEGATIVE_INFINITY
+let priceFlight: Promise<void> | undefined
+/** The prices the watch tick works with: re-read from the store at most every PRICE_LOOK_MS. */
+let tickPrices: { at: number; pricing: Pricing } | undefined
+
+/** The prices a sink works with: the options', with the refreshed LiteLLM list from the store when there is one. */
+async function pricingNow($: EngineInterface, options: PluginOptions): Promise<Pricing> {
+  let record: unknown
+  try {
+    record = await $.store.get(PRICES_KEY)
+  } catch {
+    // the prices bundled with this version
+  }
+  return withFetched(pricing(options), priceReader(record))
+}
+
+async function pricingTick($: EngineInterface, options: PluginOptions, now: number): Promise<Pricing> {
+  if (tickPrices !== undefined && now >= tickPrices.at && now - tickPrices.at < PRICE_LOOK_MS) return tickPrices.pricing
+  const fresh = await pricingNow($, options)
+  tickPrices = { at: now, pricing: fresh }
+  return fresh
+}
+
+/**
+ * Refreshes the stored LiteLLM price list when it is due: at most once a day, at most one attempt an hour after a failure,
+ * never when `priceUpdates` is off or the host asks for no non-essential traffic. One GET with no init; nothing about the
+ * user or the session is sent. The answer is projected to numbers and stored; a late or broken one is dropped. Never
+ * awaited by a hook; every failure ends quietly with the prices as they were.
+ */
+function refreshPrices($: EngineInterface, options: PluginOptions): void {
+  if (options.priceUpdates === 'off' || priceFlight !== undefined) return
+  const flight = (async (): Promise<void> => {
+    try {
+      const now = await $.clock.now()
+      priceLookedAt = now
+      if (await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')) return
+      const had = parsePriceRecord(await $.store.get(PRICES_KEY))
+      const fresh = had !== null && had.fetchedAt > 0 && had.fetchedAt <= now && now - had.fetchedAt < PRICE_DAY_MS
+      const recent = had !== null && had.attemptedAt <= now && now - had.attemptedAt < PRICE_HOUR_MS
+      if (fresh || recent) return
+      // the attempt is recorded before the request: a crash or a hang still counts, and a store that cannot be written asks nothing
+      await $.store.set(PRICES_KEY, { v: 1, fetchedAt: had?.fetchedAt ?? 0, attemptedAt: now, rates: had?.rates ?? {} })
+      const got: { text?: string } = {}
+      const asking = (async (): Promise<void> => {
+        try {
+          const answer = await $.http.fetch(LITELLM_URL)
+          if (answer.ok && typeof answer.text === 'string') got.text = answer.text
+        } catch {
+          // refused or failed: the next attempt is an hour away
+        }
+      })()
+      if (!(await within($, asking, PRICE_TIMEOUT_MS)) || got.text === undefined) return
+      const rates = projectLitellm(got.text)
+      if (rates === null) return
+      await $.store.set(PRICES_KEY, { v: 1, fetchedAt: await $.clock.now(), attemptedAt: now, rates })
+    } catch {
+      // the bundled prices stay
+    }
+  })().finally(() => {
+    if (priceFlight === flight) priceFlight = undefined
+  })
+  priceFlight = flight
+}
+
 async function writeHistory($: EngineInterface, ledger: Ledger, options: PluginOptions): Promise<boolean> {
   if (ledger.sessionId === '') return true
   try {
     if ((await isHeadless($)) && !recordsHeadless(options)) return true
-    await $.store.set(HISTORY_PREFIX + ledger.sessionId, recordFromLedger(ledger, pricing(options)))
+    await $.store.set(HISTORY_PREFIX + ledger.sessionId, recordFromLedger(ledger, await pricingNow($, options)))
     return true
   } catch {
     // history is best effort: a failed write must never reach a hook
@@ -986,8 +1059,8 @@ type ChildMode = {
   sessionId: string
   startedAt: number
   workdirKey: string | undefined
-  /** The cost mode and prices the report's costs are shown under. */
-  pricing: Pricing
+  /** The settings the report's costs are shown under (read again at each write, with the refreshed prices). */
+  options: PluginOptions
   /** The last report written, `updatedAt` removed: a tick whose text equals it writes nothing. */
   last: string
   /** The write in flight, so ticks never overlap and the final write follows it. */
@@ -1027,7 +1100,7 @@ async function writeChild($: EngineInterface, c: ChildMode, status: ChildReport[
   try {
     const ledger = await read($, ledgerAtom)
     if (ledger.sessionId !== c.sessionId) return // a pending write of an older session builds nothing from the new one
-    const text = buildReport(ledger, c.startedAt, c.workdirKey, status, Date.now(), c.pricing)
+    const text = buildReport(ledger, c.startedAt, c.workdirKey, status, Date.now(), await pricingNow($, c.options))
     const signature = withoutStamp(text)
     if (signature === c.last) return
     if (!(await childFolderUsable($, c))) return
@@ -1069,7 +1142,7 @@ async function startChild($: EngineInterface, options: PluginOptions): Promise<v
       sessionId: ownId,
       startedAt: (await read($, ledgerAtom)).sessionStartedAt,
       workdirKey: key,
-      pricing: pricing(options),
+      options,
       last: '',
       flight: undefined,
       timer: undefined,
@@ -1313,6 +1386,8 @@ function watchReports($: EngineInterface, table: PriceTable, l: Ledger, now: num
 
 async function saveWhileActive($: EngineInterface, options: PluginOptions): Promise<void> {
   try {
+    // a session left open for days looks again about once an hour (the refresh itself decides whether it is due)
+    if (options.priceUpdates !== 'off' && (await $.clock.now()) - priceLookedAt >= PRICE_HOUR_MS) refreshPrices($, options)
     const l = await read($, ledgerAtom)
     if (!l.order.some(id => l.runs[id]?.status === 'running')) return
     await saveHistory($, options, true)
@@ -1362,7 +1437,7 @@ function stopBurst(): void {
 function trackTotals(run: Run, now: number, pr: Pricing): boolean {
   const tokens = run.usage ? run.usage.uncached + run.usage.output + run.usage.cacheRead + run.usage.cacheWrite : 0
   // the count-up runs on the cost the card shows
-  const cost = shownCost(run, pr.mode, pr.table).cost
+  const cost = shownCost(run, pr.mode, pr.table, pr.fetched).cost
   const prev = seenTotals.get(run.id)
   seenTotals.set(run.id, { tokens, cost })
   if (!prev || (prev.tokens === tokens && prev.cost === cost)) return false
@@ -1418,7 +1493,7 @@ async function saveHistory($: EngineInterface, options: PluginOptions, force: bo
   saving = true
   try {
     const ledger = await read($, ledgerAtom)
-    const { signature } = historySignature(ledger, pricing(options))
+    const { signature } = historySignature(ledger, await pricingNow($, options))
     if (force || signature !== savedSignature) {
       if (await writeHistory($, ledger, options)) savedSignature = signature
     }
@@ -1495,7 +1570,7 @@ async function watchTick($: EngineInterface, options: PluginOptions, table: Pric
     const l = await read($, ledgerAtom)
     const now = Date.now()
     const g = glyphs(options.glyphs === 'ascii' ? 'ascii' : 'emoji')
-    const pr = pricing(options)
+    const pr = await pricingTick($, options, now)
 
     if (l.generation !== seenGeneration || l.sessionId !== seenSession) {
       seed(l)
@@ -1516,7 +1591,7 @@ async function watchTick($: EngineInterface, options: PluginOptions, table: Pric
           $.clock.after(STAMP_MS, () => void clearStamp($, id))
         }
         if (run.status !== 'running' && (before === undefined || before === 'running') && options.notify === 'on') {
-          const shown = shownCost(run, pr.mode, pr.table)
+          const shown = shownCost(run, pr.mode, pr.table, pr.fetched)
           $.ui.toast(`${g.duck} ${run.codename} ${statusWords(run.status).spy.toLowerCase()} · ${fmtCost(shown.cost, shown.source, shown.partial === true)}`)
         }
       }
@@ -1617,6 +1692,12 @@ export function registerLifecycle(on: On, table: PriceTable, options: PluginOpti
       // the collectors still work without the timers
     }
     await startChild($, options)
+    // in the background, after the rest: the start hook never waits for the network
+    try {
+      $.clock.after(0, () => refreshPrices($, options))
+    } catch {
+      // the bundled prices
+    }
     return next(e)
   })
 
