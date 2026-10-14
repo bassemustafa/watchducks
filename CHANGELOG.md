@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- opencode stats adapter, opt-in with the `opencodeStats` setting (default off): opencode runs get live token and cost numbers from `opencode stats`. Runs of the same model in one folder that are active together share their numbers evenly, and are marked approximate.
+- Claude child reports, on by default with `reportToParent`: a Claude Code session started by another Claude Code session writes numbers-only progress for its parent, and the parent shows it live on the matching card. Live numbers arrive about every 5 s for Claude children and about every 10 s for opencode runs (with `opencodeStats` on).
+- Terminal motion, with the `motion` setting: pulsing status dots on running cards, a stamp when a run ends (DEBRIEFED, WENT DARK or BURNED), a token and cost ticker, and a blinking duck while runs are in field. The desktop app and the band do not animate.
+
+### Changed
+
+- The privacy rules now allow one fixed process, `opencode stats`, only when `opencodeStats` is on, and writes of child report files, on by default with `reportToParent`. Both are described in the README's Privacy section and in SECURITY.md.
+
 ## [0.1.0] - 2026-10-12
 
 ### Added

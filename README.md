@@ -57,6 +57,8 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
 |---|---|
 | <img src=".github/media/terminal.png" alt="The flock sidebar in the terminal: duck and radar, counters, signal, and two relay cards, a claude relay and an opencode relay, both debriefed with reported costs" width="380"> | <img src=".github/media/desktop.png" alt="The flock sidebar in the desktop app: vector header with radar, counters, signal bars, a background shell in field and a debriefed subagent" width="380"> |
 
+**Motion** runs only in the terminal sidebar. The status dot of each running card pulses. When a run ends, its card shows a stamp: `✦ DEBRIEFED ✦`, `✕ WENT DARK ✕` or `✕ BURNED ✕`. Token and cost figures count up to their new value over about 0.6 s. The header duck blinks while anything is in field. The desktop app and the band do not animate. The `motion` setting turns all of it off.
+
 ## Per run
 
 | Field | Meaning |
@@ -67,10 +69,10 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
 | Effort | observed, reported by the relay, or taken from a flag |
 | Tokens | uncached input, output, cache read, cache write |
 | Cache % | cache read ÷ total input (uncached + cache read + cache write) |
-| Cost | in USD, marked **reported** (from the relay) or **est.** (list-price estimate) |
+| Cost | in USD, marked **reported** (from the relay or `opencode stats`) or **est.** (list-price estimate) |
 | Reviews | handler (the reviewer), leaks (bugs found), patches (edit calls) |
 
-**"—"** means the value is not available for that source (for example, tokens for an opencode relay). **"?"** means the value should exist but is unknown (for example, an unpriced model, or a result.json not read yet). A missing value is never shown as 0.
+**"—"** means the value is not available for that source (for example, tokens for an opencode relay with `opencodeStats` off). **"?"** means the value should exist but is unknown (for example, an unpriced model, or a result.json not read yet). A missing value is never shown as 0.
 
 ## Glossary
 
@@ -115,17 +117,29 @@ The docked sidebar needs the fullscreen layout. Elsewhere the sidebar opens inli
 | Source | Identity | Status | Tokens & cache | Cost |
 |---|---|---|---|---|
 | Agent-tool subagent | agent type; model and effort seen per request | from the spawn result, turn end and agent list | yes, per request | estimated from the price table (Claude models) |
-| `claude` relay | from the command and result.json (`lane`, `model`, `effort`) | from result.json | yes, from result.json `usage` | reported (`totalCostUsd`) |
-| `opencode` relay | from the command and result.json (`tool`, `model`, `variant`) | from result.json | — | reported only; `$0 reported` under subscription plans |
+| `claude` relay | from the command and result.json (`lane`, `model`, `effort`) | from result.json | yes, from result.json `usage`; live from its child report while it runs (see [Live numbers](#live-numbers)) | reported (`totalCostUsd`) |
+| `opencode` relay | from the command and result.json (`tool`, `model`, `variant`) | from result.json | — (with `opencodeStats` on: from `opencode stats`) | reported by the relay, or from `opencode stats` with `opencodeStats` on; `$0 reported` under subscription plans |
 | `codex` relay | from the command and result.json, when present | from result.json | — | — |
 | Other relay scripts (a `relay*` script, or one under a `*delegate*` folder) | from the path, `--tool`, or result.json `tool` (`unknown` until then) | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise from the Bash result only | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — |
-| Raw CLIs: `codex exec`, `opencode run`, `claude -p`, `gemini -p` | implementer, plus `--model`/`-m` if given literally | tool result (foreground) or background snapshots | — | — |
+| Raw CLIs: `codex exec`, `opencode run`, `claude -p`, `gemini -p` | implementer, plus `--model`/`-m` if given literally | tool result (foreground) or background snapshots | — (`opencode run` with `opencodeStats` on: `opencode stats`; `claude -p` with watchducks loaded in it: its child report) | — (same sources as tokens) |
 | Other background shell | implementer `shell` | background snapshots | — | — |
 | HQ (main loop) | session model | — | yes, per request | estimated; shown separately, never in delegated totals |
 
 > **`--out-dir` is optional.** With it, watchducks reads `<out-dir>/result.json`. Without it, watchducks finds the result itself (discovery). While a relay without an out-dir runs (up to 3 h) and for less than 2 minutes after it ends, it scans the allowed folders about every 9 s and pairs a `result.json` with the run by start time, tool and working directory. The out-dir, or the folder discovery finds, must be under the system temp dir, `/tmp`, the session root or a `relayRoots` entry.
 
 Runs the session did not start are not tracked.
+
+### Live numbers
+
+Numbers while a run is still going, not only when it ends:
+
+| Run | Live numbers |
+|---|---|
+| Subagent | yes, per request |
+| Claude child, however started | yes, about every 5 s (needs watchducks loaded in the child; see [Known limits](#known-limits)) |
+| opencode, however started | yes, about every 10 s, when `opencodeStats` is on |
+| Relay with `result.json` only | final numbers only |
+| codex, gemini | status and elapsed time only |
 
 ## Commands and tools
 
@@ -150,12 +164,14 @@ Example: *"Record a verdict: SMEW-1A reviewed GOLDENEYE-7Q, 2 bugs, 5 edits."*
 | Key | Values | Default | Meaning |
 |---|---|---|---|
 | `glyphs` | `emoji`, `ascii` | `emoji` | `ascii` draws the duck as `>o)` and status dots as `* + x ~ ?`, for terminals that draw emoji at the wrong width |
-| `motion` | `on`, `off` | `on` | animate the radar and status pulses |
+| `motion` | `on`, `off` | `on` | animate the terminal sidebar (radar, status pulses, stamps, token counts, duck blink); `off` stops all of it |
 | `autoOpen` | `on`, `off` | `on` | open the sidebar beside a fullscreen transcript when the first operative deploys |
 | `notify` | `on`, `off` | `off` | show a toast (codename only) when an operative finishes |
 | `relayRoots` | path list | empty | extra directories where relay `--out-dir` folders may live; separate entries with `:`; the temp dir and session root are always allowed |
 | `priceOverrides` | JSON | empty | per-model prices in USD per million tokens |
 | `recordHeadless` | `on`, `off` | `off` | write history from headless sessions (`claude -p`); off avoids double counting relay children |
+| `opencodeStats` | `on`, `off` | `off` | run `opencode stats` (numbers only) to give opencode runs live token and cost numbers; see [Privacy](#privacy) |
+| `reportToParent` | `on`, `off` | `on` | when this session was started by another Claude Code session, write a numbers-only report file for the parent; see [Privacy](#privacy) |
 | `showEngineOverhead` | `on`, `off` | `off` | show the engine's own loops (compaction, memory) as one line |
 
 `priceOverrides` example:
@@ -194,6 +210,31 @@ watchducks keeps only numbers, identifiers and enums. It never inspects, copies,
 
 **Other plugins can read this one's state.** Any installed plugin can read any plugin's state, so watchducks' state holds only allow-listed values.
 
+**opencode stats (opt-in).** When `opencodeStats` is on, watchducks runs one process, and it is the only process it starts:
+
+```sh
+opencode stats --json --days 1 --models --cost --project .
+```
+
+`opencode` is found on PATH. The process runs in the run's folder, or in the session root, which is passed as its working directory and never as an argument. It has a 10 s timeout, and only one runs at a time. From its stdout (ignored above 1 MiB) watchducks reads only these values, by name: the session count; the input, output, reasoning, cache read and cache write tokens; the cost; and, for each model (at most 64), its id, its provider id and the same numbers. Stderr is never read. watchducks does not read opencode's database, its server API or any transcript. If `opencode` cannot start, the adapter stops for the session and the cards keep "—".
+
+**Child report files.** When `reportToParent` is on and this session was started by another Claude Code session, watchducks writes one JSON file of at most 64 KiB:
+
+`<temp dir>/watchducks-children/<parent hash>/<session id>.json`
+
+The temp dir is `TMPDIR`, else `/tmp`. The parent hash is a fingerprint of the parent's session id. The file holds these fields and nothing else:
+
+- `schema`: `watchducks.child.v1`
+- `startedAt` and `updatedAt`: times
+- `workdirKey`: a hash of the session root
+- `status`: `running`, `done` or `failed`
+- `rows`: at most 32 rows, one per implementer and model (past 32, the smallest fold into one `other` row per implementer, so totals stay exact), each with `implementer`, `model`, `usage` (`uncached`, `output`, `cacheRead`, `cacheWrite`), `cost` and `costSource`
+- `hqModel` (optional): the model of the child's own requests with the most tokens, as an identifier. The parent uses it to match the report and as the card's model.
+
+The rows are the child's whole spend, including its subagents and the runs it delegated. No prompts, names, paths or text are written. The file is written at the start, at most every 5 s while anything changes, and once more at the end. A parent reads only its own folder. watchducks cannot delete these files. Readers ignore a report whose `updatedAt` is older than 24 h, and the OS temp cleanup removes old files.
+
+**Shared numbers.** Two or more opencode runs with the same model in one folder, active at the same time, cannot be told apart by any numbers watchducks can read. Their growth is split evenly among them. Their cards show `≈` before the token figures and `shared ×N`, where N is the largest group the run was in. The dossier says `even share of N runs`. Totals are plain sums of the cards, so they add up to what opencode measured.
+
 **On disk.** One history record per session (`history/v1/<sessionId>`) in the plugin store. It holds counts, tokens and costs per UTC day and implementer|model. Records are kept for 30 days, at most 200 of them. Headless sessions record nothing unless `recordHeadless` is on. `/flock purge` deletes all of it.
 
 **No network access. No telemetry.**
@@ -206,14 +247,18 @@ Estimated costs use a built-in price table for Claude models, dated 2026-10-06. 
 
 A cost reported by a relay always wins over an estimate. The two are never added together. A model with no price shows "?" and the run is flagged as partial. Override prices with `priceOverrides`.
 
+## Known limits
+
+- **Shared numbers can drift.** When one run of a shared group later gets exact figures from a relay's `result.json`, it shows those, and the others keep their even-share estimates. The totals can then differ from opencode's own totals by that run's estimation error. The other runs stay marked approximate.
+- **A run cleared early loses its last interval.** If `/flock clear` removes a run before its final snapshot, the run keeps the figures it had. The growth of its last interval is not counted, and no other run takes it.
+- **Claude children need watchducks loaded.** A Claude child writes a report only if watchducks loads in it. That happens when watchducks is installed at user scope, or, in development, when it is named in `CLAUDE_CODE_PLUGIN_DIRS`. Without it, the parent still tracks the child as a card with status and duration, but the card has no live numbers. The parent also cannot see that child's own delegated processes. This limit applies only to Claude children. opencode stats and the v0.1 tracking need nothing inside other agents.
+- **The parent's opencode stats can count a child's spend twice.** The parent's own opencode stats also see a child's opencode growth in the same folder at the same time, so that spend is counted twice. The parent's card is marked approximate.
+
 ## Not yet
 
-Planned for v0.2, not in v0.1:
+Not in v0.2:
 
-- an opt-in opencode stats adapter
-- a relay metrics sidecar
 - a mobile and VS Code sidebar (they get the band only for now)
-- terminal animation beyond the radar
 - relay result files on native Windows (v0.1 reads them on macOS, Linux and WSL)
 - more CLIs
 
