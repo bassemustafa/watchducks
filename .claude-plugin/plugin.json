@@ -1,6 +1,6 @@
 {
   "name": "watchducks",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A flock of spy ducks watching your delegated work: every subagent, relay and background run from this session with tokens, cache, cost, model, effort and reviews.",
   "author": {
     "name": "bassemustafa",
@@ -24,7 +24,7 @@
     "motion": {
       "type": "string",
       "title": "Motion",
-      "description": "Animate the radar and status pulses",
+      "description": "Animate the terminal sidebar: radar, status pulses, debrief stamps, token counts and the duck blink",
       "default": "on",
       "options": [
         "on",

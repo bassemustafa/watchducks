@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-14
+
 ### Added
 
 - opencode stats adapter, opt-in with the `opencodeStats` setting (default off): opencode runs get live token and cost numbers from `opencode stats`. Runs of the same model in one folder that are active together share their numbers evenly, and are marked approximate.
@@ -36,5 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Price table dated 2026-10-06, with `priceOverrides`.
 - CI: validate and tests on Claude Code 2.1.289 (the desktop app's engine) and 2.1.295, plus the gating-hook allow-list check on 2.1.295.
 
-[Unreleased]: https://github.com/bassemustafa/watchducks/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/bassemustafa/watchducks/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/bassemustafa/watchducks/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bassemustafa/watchducks/releases/tag/v0.1.0
