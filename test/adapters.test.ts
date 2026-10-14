@@ -901,8 +901,22 @@ const STEP = {
 type Written = { path: string; text: string }
 type Child = { clock: MockClock; writes: Written[]; order: string[]; ids: { own: string } }
 
+type Folder = 'missing' | 'dir' | 'link' | 'outside'
+type ChildOpts = {
+  root?: 'throw'
+  failWrites?: boolean
+  /** How the parent's report folder looks to a stat; by default it is not there until a write has been made. */
+  folder?: () => Folder
+  /** Every write waits for this before it returns (the write is logged when it starts). */
+  hold?: Promise<void>
+  /** `store.keys` (the first await of a session start) waits for this when it is set. */
+  keys?: { wait?: Promise<void> }
+  /** The stdout of each `opencode stats` call in turn (the last repeats). */
+  stats?: readonly string[]
+}
+
 /** The world beneath a child session: its own id, the environment it inherited, a root that may be unreadable, and a file system that records every write. */
-function childWorld(on: On, env: Record<string, string>, opts: { root?: 'throw'; failWrites?: boolean } = {}): Child {
+function childWorld(on: On, env: Record<string, string>, opts: ChildOpts = {}): Child {
   const writes: Written[] = []
   const order: string[] = []
   const ids = { own: 'S1' }
@@ -916,7 +930,10 @@ function childWorld(on: On, env: Record<string, string>, opts: { root?: 'throw';
   on('session.surfaces', async () => ({ value: ['terminal'] }))
   on('session.start', async ($, e) => ({ cwd: e.cwd }))
   on('session.end', async () => ({ sessionId: ids.own }))
-  on('store.keys', async () => ({ value: [] }))
+  on('store.keys', async () => {
+    if (opts.keys?.wait) await opts.keys.wait
+    return { value: [] }
+  })
   on('store.set', async () => {
     order.push('history')
     return { value: undefined }
@@ -924,9 +941,24 @@ function childWorld(on: On, env: Record<string, string>, opts: { root?: 'throw';
   on('fs.write', async ($, e) => {
     order.push('write')
     writes.push({ path: e.path, text: e.text })
+    if (opts.hold) await opts.hold
     if (opts.failWrites) throw new Error('disk full')
     return { value: undefined }
   })
+  on('fs.stat', async ($, e) => {
+    if (!e.path.includes('/watchducks-children/')) return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false, realPath: e.path } }
+    const folder = opts.folder ? opts.folder() : writes.length > 0 ? 'dir' : 'missing'
+    if (folder === 'missing') throw new Error('ENOENT')
+    return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: folder === 'link', realPath: folder === 'outside' ? '/elsewhere/x' : e.path } }
+  })
+  let statsCalls = 0
+  on('process.run', async () => {
+    const stdout = opts.stats?.[Math.min(statsCalls, (opts.stats?.length ?? 1) - 1)] ?? ''
+    statsCalls += 1
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } as never
+  })
+  on('tool.call', { tool: 'Bash' }, async ($, e) => ({ result: { backgroundTaskId: 't-' + e.tool_use_id } }) as never)
+  on('classic.Stop', async () => ({}))
   on('turn.step', async function* () {
     return STEP
   })
@@ -1018,6 +1050,7 @@ test('the timer writes again only when the numbers changed, not when only update
   expect(rows[0]!['implementer']).toBe('claude-code')
   expect(rows[0]!['model']).toBe('claude-sonnet-5-5')
   expect(rows[0]!['usage']).toEqual({ uncached: 1000, output: 100, cacheRead: 0, cacheWrite: 0 })
+  expect(reportOf(w.writes[1]!)['hqModel']).toBe('claude-sonnet-5-5') // the model of the child's own requests is named
   expect(reportOf(w.writes[1]!)['status']).toBe('running')
   spin(5)
   await w.clock.advance(5000)
@@ -1116,13 +1149,18 @@ const crow = (implementer: string, model: string, uncached: number) => ({
   costSource: 'estimated',
 })
 
+// A child's start is fixed for its session: every report of a test carries the one captured when the test's runs start
+// (just before the Bash calls, so it sits inside the match window), unless the test gives `startedAt` itself.
+let childStart = Date.now()
+
 function report(rows: readonly unknown[], over: Record<string, unknown> = {}): string {
   const now = new Date(Date.now()).toISOString()
-  return JSON.stringify({ schema: 'watchducks.child.v1', startedAt: now, updatedAt: now, status: 'running', rows, ...over })
+  return JSON.stringify({ schema: 'watchducks.child.v1', startedAt: new Date(childStart).toISOString(), updatedAt: now, status: 'running', rows, ...over })
 }
 
 /** Starts the session and the given background runs, then lets the watch tick see them (it starts the report timer). */
 async function withRuns($: Parameters<TestBody>[0], w: { clock: MockClock }, commands: readonly string[]): Promise<void> {
+  childStart = Date.now()
   await $.session.start(START)
   for (const [i, command] of commands.entries()) await $.tool.call(call(`u${i + 1}`, command))
   await w.clock.advance(500)
@@ -1543,4 +1581,221 @@ test('the whole exit step is bound by one deadline: a root lookup held past it e
   expect(w.calls.length).toBe(2) // no snapshot was started for the ended run
   expect(ledger().runs['bash:u1']!.usage).toEqual(flat(100)) // and none was dispatched
   expect(lastRecordTotals(w.stored).uncached).toBe(100)
+})
+
+// ---- Part B fixes
+
+/** Advances the mocked clock in steps of 100 ms until `work` has settled; the time that took, or null when it did not within `limit`. */
+async function settleWithin(work: Promise<unknown>, clock: MockClock, limit: number): Promise<number | null> {
+  let done = false
+  void work.then(
+    () => {
+      done = true
+    },
+    () => {
+      done = true
+    },
+  )
+  for (let t = 100; t <= limit; t += 100) {
+    await clock.advance(100)
+    if (done) return t
+  }
+  return null
+}
+
+const childPathOf = (id: string): string => `/tmp/watchducks-children/${fingerprint(PARENT)}/${id}.json`
+
+for (const folder of ['link', 'outside'] as const) {
+  test(`a child writes nothing into a report folder that is ${folder === 'link' ? 'a link' : 'outside the temp root'}`, async ($, on) => {
+    const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT }, { folder: () => folder })
+    await $.session.start(START)
+    await modelStep($, 0)
+    await w.clock.advance(5000)
+    await w.clock.advance(5000)
+    await $.session.end(END)
+    expect(w.writes.length).toBe(0)
+    expect(w.order).toContain('history') // and the session still ends
+  })
+}
+
+test('a child writes into a folder that is not there yet, then checks it before every further write', async ($, on) => {
+  let state: Folder = 'missing'
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT }, { folder: () => state })
+  await $.session.start(START)
+  expect(w.writes.length).toBe(1) // the write creates the folder
+  state = 'link' // and it turned out to be a link
+  await modelStep($, 0)
+  await w.clock.advance(5000)
+  await w.clock.advance(5000)
+  expect(w.writes.length).toBe(1)
+  state = 'dir' // a real folder again: the next tick writes what was held back
+  await w.clock.advance(5000)
+  expect(w.writes.length).toBe(2)
+  expect((reportOf(w.writes[1]!)['rows'] as unknown[]).length).toBe(1)
+})
+
+test('a held report write cannot hold the start or the end of the session, and no second write overlaps it', async ($, on) => {
+  let release = (): void => {}
+  const hold = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT }, { hold })
+  const started = await settleWithin($.session.start(START), w.clock, 3000)
+  expect(started).not.toBeNull()
+  expect(started!).toBeLessThanOrEqual(1200)
+  expect(w.writes.length).toBe(1)
+  await modelStep($, 0)
+  await w.clock.advance(20_000) // the ticks find the write still pending and start none
+  expect(w.writes.length).toBe(1)
+  const ended = await settleWithin($.session.end(END), w.clock, 3000)
+  expect(ended).not.toBeNull()
+  expect(ended!).toBeLessThanOrEqual(1200)
+  expect(w.writes.length).toBe(1) // the final write is skipped while the previous one is pending
+  expect(w.order).toContain('history')
+  release()
+})
+
+test('the final report of a child holds the stats that landed at session end', ON, async ($, on) => {
+  const stats = [statsJson(1, 1, 0.1), statsJson(2, 3, 0.4), statsJson(2, 5, 0.8)]
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT }, { stats })
+  await $.session.start(START)
+  await $.tool.call(call('u1', SOL))
+  await w.clock.advance(500)
+  await w.clock.advance(10_000) // the live numbers: 200
+  await $.classic.Stop(stop)
+  await $.session.end(END) // the last snapshot lands here: 400
+  const last = reportOf(w.writes[w.writes.length - 1]!)
+  expect(last['status']).toBe('done')
+  const rows = last['rows'] as Array<{ implementer: string; usage: { uncached: number } }>
+  expect(rows.find(r => r.implementer === 'opencode')!.usage.uncached).toBe(400)
+  expect(w.order.lastIndexOf('write')).toBeLessThan(w.order.lastIndexOf('history'))
+})
+
+test('a write pending against an old session builds nothing from the new one', async ($, on) => {
+  const keys: { wait?: Promise<void> } = {}
+  let release = (): void => {}
+  const w = childWorld(on, { CLAUDE_CODE_SESSION_ID: PARENT }, { keys })
+  await $.session.start(START)
+  await modelStep($, 0)
+  await w.clock.advance(5000)
+  const forOld = (): number => w.writes.filter(x => x.path === CHILD_PATH).length
+  expect(forOld()).toBe(2) // the start and the tick that carried the model's numbers
+  keys.wait = new Promise<void>(resolve => {
+    release = resolve
+  })
+  w.ids.own = 'S2'
+  const second = $.session.start(START) // the ledger is the new session's; its start waits in the history pruning
+  await w.clock.advance(5000) // the old child's tick falls due meanwhile
+  expect(forOld()).toBe(2)
+  release()
+  await second
+  expect(forOld()).toBe(2)
+  expect(w.writes.filter(x => x.path === childPathOf('S2')).length).toBeGreaterThan(0)
+})
+
+test('the parent looks once more at its children before the session ends, and the history keeps what it finds', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P])
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 100)]), mtimeMs: mt(1) })
+  await w.clock.advance(3000)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(100))
+  // the child's last report lands after the parent's last poll
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 400)], { status: 'done' }), mtimeMs: mt(2) })
+  await $.session.end({ reason: 'exit' } as never)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(400))
+  expect(lastRecordTotals(w.stored).uncached).toBe(400)
+})
+
+test('a reload keeps each report with its own run', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P, CLAUDE_P])
+  const now = Date.now()
+  const at = (ms: number): string => new Date(now + ms).toISOString()
+  fs.files.set(`${OWN_DIR}/a1.json`, { text: report([crow('claude-code', SONNET, 100)], { startedAt: at(-1000) }), mtimeMs: mt(1) })
+  fs.files.set(`${OWN_DIR}/a2.json`, { text: report([crow('claude-code', SONNET, 200)], { startedAt: at(-2000) }), mtimeMs: mt(1) })
+  await w.clock.advance(3000)
+  // the earliest run takes the earliest report
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(200))
+  expect(ledger().runs['bash:u2']!.usage).toEqual(flat(100))
+  expect(ledger().runs['bash:u1']!.childId).toBe('a2')
+  expect(ledger().runs['bash:u2']!.childId).toBe('a1')
+
+  await $.session.start(START) // a hot reload: the module state is gone, the ledger stays
+  fs.files.delete(`${OWN_DIR}/a2.json`)
+  fs.files.set(`${OWN_DIR}/a1.json`, { text: report([crow('claude-code', SONNET, 150)], { startedAt: at(-1000) }), mtimeMs: mt(2) })
+  await w.clock.advance(500)
+  await w.clock.advance(3000)
+  expect(ledger().runs['bash:u2']!.usage).toEqual(flat(150)) // a1 still belongs to the run it had
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(200))
+})
+
+test('a report whose run /flock clear removed is not given to another run', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P])
+  const started = new Date(Date.now() - 2000).toISOString()
+  fs.files.set(`${OWN_DIR}/a1.json`, { text: report([crow('claude-code', SONNET, 100)], { startedAt: started }), mtimeMs: mt(1) })
+  await w.clock.advance(3000)
+  fs.files.set(`${OWN_DIR}/a1.json`, { text: report([crow('claude-code', SONNET, 150)], { startedAt: started, status: 'done' }), mtimeMs: mt(2) })
+  await w.clock.advance(3000)
+  expect(ledger().runs['bash:u1']!.status).toBe('done')
+  await $.command.run({ command: 'flock', args: 'clear' } as never)
+  expect(ledger().runs['bash:u1']).toBeUndefined()
+  await w.clock.advance(500)
+  await $.tool.call(call('u2', CLAUDE_P)) // another run, started within a report's window
+  await w.clock.advance(500)
+  fs.files.set(`${OWN_DIR}/a1.json`, { text: report([crow('claude-code', SONNET, 900)], { startedAt: started, status: 'done' }), mtimeMs: mt(3) })
+  await w.clock.advance(3000)
+  await w.clock.advance(3000)
+  expect(ledger().runs['bash:u2']!.usage).toBeNull()
+  expect(ledger().runs['bash:u2']!.childId).toBeUndefined()
+})
+
+test('a model alias on the command still matches the report of its child', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, ['claude -p --model sonnet "x"'])
+  expect(ledger().runs['bash:u1']!.model).toBe('sonnet')
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 100)]), mtimeMs: mt(1) })
+  await w.clock.advance(3000)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(100))
+  expect(ledger().runs['bash:u1']!.model).toBe(SONNET)
+})
+
+test('a file that later says another start is not the child the run was matched with', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P])
+  const first = new Date(Date.now() - 1000).toISOString()
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 100)], { startedAt: first }), mtimeMs: mt(1) })
+  await w.clock.advance(3000)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(100))
+  expect(ledger().runs['bash:u1']!.childStartedAt).toBe(Date.parse(first))
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 999)], { startedAt: new Date(Date.now() - 3000).toISOString() }), mtimeMs: mt(2) })
+  await w.clock.advance(3000)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(100))
+  // the same file with its own start goes on updating the run
+  fs.files.set(`${OWN_DIR}/c1.json`, { text: report([crow('claude-code', SONNET, 130)], { startedAt: first }), mtimeMs: mt(3) })
+  await w.clock.advance(3000)
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(130))
+})
+
+test('300 names that cannot be reports in front of a report do not hide it', async ($, on) => {
+  const ledger = watchLedger(on)
+  const w = world(on, [])
+  const fs = childFs(on)
+  await withRuns($, w, [CLAUDE_P])
+  const text = report([crow('claude-code', SONNET, 100)])
+  for (let i = 0; i < 300; i++) fs.files.set(`${OWN_DIR}/bad name ${i}.json`, { text, mtimeMs: mt(1) })
+  fs.files.set(`${OWN_DIR}/ok.json`, { text, mtimeMs: mt(1) })
+  await w.clock.advance(3000)
+  expect(fs.reads).toEqual([`${OWN_DIR}/ok.json`])
+  expect(ledger().runs['bash:u1']!.usage).toEqual(flat(100))
 })

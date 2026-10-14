@@ -1,6 +1,6 @@
 import type { Implementer, Ledger, Run, Usage } from '../../types'
 import { fingerprint } from '../collect/relay'
-import { stationRowsFromLedger } from '../history'
+import { aggregateHistory, stationRowsFromLedger } from '../history'
 import { ident } from '../relay-result'
 import { exceedsBytes } from './opencode-stats'
 
@@ -28,6 +28,10 @@ const MAX_COST = 1e6
 const MAX_MODEL = 80
 const MAX_STAMP = 40
 const UNKNOWN_MODEL = 'unknown'
+/** The row a folded group of rows becomes when the report holds more than MAX_ROWS. */
+const OTHER_MODEL = 'other'
+/** A run's model counts for matching only when it names a full model (`claude-sonnet-5-5`), not an alias such as `sonnet`. */
+const FULL_MODEL = 'claude-'
 const WORKDIR_KEY = /^[0-9a-z]{1,16}$/
 const IMPLEMENTERS: ReadonlySet<string> = new Set<Implementer>(['claude-code', 'claude', 'opencode', 'codex', 'gemini', 'shell', 'unknown'])
 
@@ -37,6 +41,8 @@ export type ChildReport = {
   startedAt: number
   updatedAt: number
   workdirKey?: string
+  /** The model of the child's own requests, when the report says so (otherwise the largest `claude-code` row stands for it). */
+  hqModel?: string
   status: 'running' | 'done' | 'failed'
   rows: NonNullable<Run['rows']>
 }
@@ -94,9 +100,47 @@ function mergeRow(rows: Map<string, Row>, row: Row): void {
 }
 
 /**
+ * The rows of a report: the largest by tokens, and when there are more than MAX_ROWS the rest folded into one
+ * `{ implementer, model: 'other' }` row per implementer among the folded ones, so the total stays within MAX_ROWS rows and
+ * no usage or cost is lost.
+ */
+function capRows(merged: ReadonlyMap<string, Row>): Row[] {
+  const sorted = [...merged.values()].sort(
+    (a, b) => tokensOf(b.usage) - tokensOf(a.usage) || (`${a.implementer}|${a.model}` < `${b.implementer}|${b.model}` ? -1 : 1),
+  )
+  for (let keep = Math.min(sorted.length, MAX_ROWS); keep >= 0; keep--) {
+    const rows = new Map<string, Row>()
+    for (const row of sorted.slice(0, keep)) rows.set(`${row.implementer}|${row.model}`, row)
+    for (const row of sorted.slice(keep)) mergeRow(rows, { ...row, model: OTHER_MODEL })
+    if (rows.size <= MAX_ROWS) {
+      return [...rows.values()].sort(
+        (a, b) => tokensOf(b.usage) - tokensOf(a.usage) || (`${a.implementer}|${a.model}` < `${b.implementer}|${b.model}` ? -1 : 1),
+      )
+    }
+  }
+  return sorted.slice(0, MAX_ROWS)
+}
+
+/** The model of the main loop's requests: the one with the most tokens among `hqByModel` (the overflow bucket aside). */
+function hqModelOf(ledger: Ledger): string | undefined {
+  let best: string | undefined
+  let most = -1
+  for (const [model, spend] of Object.entries(ledger.hqByModel ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    if (model === OTHER_MODEL) continue
+    const tokens = tokensOf(usageOf(spend.usage))
+    if (tokens > most) {
+      most = tokens
+      best = modelName(model)
+    }
+  }
+  return best
+}
+
+/**
  * The JSON text of this session's report: its whole spend by implementer × model and nothing else. The rows are the main
  * loop's spend by model (implementer `claude-code`) plus the station board's rows of the ledger (the board's own spend
- * rules: a shared group once, a run with child rows contributing those), merged, the 32 largest by tokens.
+ * rules: a shared group once, a run with child rows contributing those) and the spend /flock clear retired, merged; past
+ * MAX_ROWS the smallest fold into `other` rows. `hqModel` names the model of the main loop's own requests.
  */
 export function buildReport(ledger: Ledger, startedAt: number, workdirKey: string | undefined, status: ChildReport['status'], now: number): string {
   const merged = new Map<string, Row>()
@@ -105,7 +149,8 @@ export function buildReport(ledger: Ledger, startedAt: number, workdirKey: strin
     const cost = spend.cost !== null && Number.isFinite(spend.cost) ? Math.min(Math.max(spend.cost, 0), MAX_COST) : null
     mergeRow(merged, { implementer: 'claude-code', model: modelName(model), usage, cost, costSource: cost === null ? null : 'estimated' })
   }
-  for (const s of stationRowsFromLedger(ledger)) {
+  const retired = aggregateHistory([{ v: 1, sessionStartedAt: ledger.sessionStartedAt, days: ledger.retired ?? {} }], now)
+  for (const s of [...stationRowsFromLedger(ledger), ...retired]) {
     // a bucket of runs that measured nothing carries no spend
     if (s.usageOps === 0 && s.costOps === 0) continue
     const total = s.costReported + s.costEstimated
@@ -114,16 +159,15 @@ export function buildReport(ledger: Ledger, startedAt: number, workdirKey: strin
     const usage = usageOf({ uncached: s.uncached, output: s.output, cacheRead: s.cacheRead, cacheWrite: s.cacheWrite })
     mergeRow(merged, { implementer: s.implementer, model: modelName(s.model), usage, cost, costSource })
   }
-  const rows = [...merged.values()]
-    .sort((a, b) => tokensOf(b.usage) - tokensOf(a.usage) || (`${a.implementer}|${a.model}` < `${b.implementer}|${b.model}` ? -1 : 1))
-    .slice(0, MAX_ROWS)
+  const hqModel = hqModelOf(ledger)
   return JSON.stringify({
     schema: CHILD_SCHEMA,
     startedAt: stampText(startedAt),
     updatedAt: stampText(now),
     ...(workdirKey !== undefined ? { workdirKey } : {}),
+    ...(hqModel !== undefined ? { hqModel } : {}),
     status,
-    rows,
+    rows: capRows(merged),
   })
 }
 
@@ -186,6 +230,9 @@ export function projectReport(text: string, now: number): ChildReport | null {
   if (status !== 'running' && status !== 'done' && status !== 'failed') return null
   const key = raw['workdirKey']
   if (key !== undefined && (typeof key !== 'string' || !WORKDIR_KEY.test(key))) return null
+  const hq = raw['hqModel']
+  const hqModel = hq === undefined ? undefined : ident(hq)
+  if (hq !== undefined && hqModel === undefined) return null
   const list = raw['rows']
   if (!Array.isArray(list) || list.length > MAX_ROWS) return null
   const rows: Row[] = []
@@ -194,11 +241,12 @@ export function projectReport(text: string, now: number): ChildReport | null {
     if (row === undefined) return null
     rows.push(row)
   }
-  return { startedAt, updatedAt, ...(key !== undefined ? { workdirKey: key } : {}), status, rows }
+  return { startedAt, updatedAt, ...(key !== undefined ? { workdirKey: key } : {}), ...(hqModel !== undefined ? { hqModel } : {}), status, rows }
 }
 
-/** The model of the child's own requests: its `claude-code` row with the most tokens (the first of equals). */
+/** The model of the child's own requests: the report's `hqModel`, else its `claude-code` row with the most tokens (the first of equals). */
 export function mainModel(r: ChildReport): string | undefined {
+  if (r.hqModel !== undefined) return r.hqModel
   let best: string | undefined
   let most = -1
   for (const row of r.rows) {
@@ -214,7 +262,8 @@ export function mainModel(r: ChildReport): string | undefined {
 
 /**
  * Pairs runs with reports (spec §4.6): the report started from 5 s before to 60 s after the run (edges included), its
- * folder and main model equal the run's when the run knows them (a report that does not say counts as different), the
+ * folder and main model equal the run's when the run knows them (a report that does not say counts as different; a model
+ * counts as known only when it is a full id, `claude-…`, not an alias such as `sonnet`), the
  * earliest run takes the earliest report, one each. Reports in `claimed` (by file) are skipped. Inputs are not changed.
  */
 export function matchReports(
@@ -234,7 +283,8 @@ export function matchReports(
       const lag = report.startedAt - run.startedAt
       if (lag < -MATCH_BEFORE_MS || lag > MATCH_AFTER_MS) return false
       if (run.workdirKey !== undefined && report.workdirKey !== run.workdirKey) return false
-      return run.model === undefined || mainModel(report) === run.model
+      // an alias (`sonnet`) or any other name that is not a full model id says nothing about the report's model
+      return run.model === undefined || !run.model.startsWith(FULL_MODEL) || mainModel(report) === run.model
     })
     if (hit === undefined) continue
     taken.add(hit.file)

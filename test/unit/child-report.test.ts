@@ -39,6 +39,11 @@ type Row = NonNullable<Run['rows']>[number]
 const row = (model: string, uncached: number, over: Partial<Row> = {}): Row =>
   ({ implementer: 'claude-code', model, usage: used(uncached), cost: 0.25, costSource: 'estimated', ...over })
 
+const stepOf = (model: string, input: number, over: Partial<Extract<Action, { type: 'step' }>> = {}): Action => ({
+  type: 'step', turnId: 't1', index: 0, model, at: T0 + 1000,
+  usage: { model, input_tokens: input, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, ...over,
+})
+
 const NOW = T0 + 10_000
 const iso = (ms: number): string => new Date(ms).toISOString()
 const reportText = (over: Record<string, unknown> = {}): string =>
@@ -62,7 +67,8 @@ test('buildReport writes only the allowed keys and nothing of a run: no codename
     adapter('r1', 300))
   const text = buildReport(l, T0, 'abc12', 'running', NOW)
   const out = JSON.parse(text) as Record<string, unknown>
-  expect(Object.keys(out).sort()).toEqual(['rows', 'schema', 'startedAt', 'status', 'updatedAt', 'workdirKey'])
+  expect(Object.keys(out).sort()).toEqual(['hqModel', 'rows', 'schema', 'startedAt', 'status', 'updatedAt', 'workdirKey'])
+  expect(out['hqModel']).toBe(OPUS)
   expect(out['schema']).toBe(CHILD_SCHEMA)
   expect(out['startedAt']).toBe(iso(T0))
   expect(out['updatedAt']).toBe(iso(NOW))
@@ -133,19 +139,70 @@ test('a cost that is only partly reported is estimated when rows merge', () => {
   expect(oc.costSource).toBe('estimated')
 })
 
-test('40 distinct pairs give 32 rows and the largest by tokens stay', () => {
+// changed with the row cap: the rows past 32 are folded into `other` rows instead of being dropped
+test('40 distinct pairs give 32 rows: the largest stay and the rest fold into one other row, so nothing is lost', () => {
   const hqByModel: NonNullable<Ledger['hqByModel']> = {}
-  for (let i = 1; i <= 40; i++) hqByModel[`model-${i}`] = { usage: { uncached: i * 10, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: null, costPartial: false }
+  for (let i = 1; i <= 40; i++) hqByModel[`model-${i}`] = { usage: { uncached: i * 10, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: i / 100, costPartial: false }
   const l: Ledger = { ...emptyLedger('s1', T0), hqByModel }
   const out = projectReport(buildReport(l, T0, undefined, 'running', NOW), NOW)!
   expect(out.rows.length).toBe(32)
-  const kept = out.rows.map(r => r.usage.uncached)
-  expect(Math.min(...kept)).toBe(90)
+  const other = out.rows.filter(r => r.model === 'other')
+  expect(other.length).toBe(1)
+  // models 1..9 (10..90 tokens) were folded
+  expect(other[0]!.implementer).toBe('claude-code')
+  expect(other[0]!.usage.uncached).toBe(450)
+  near(other[0]!.cost, 0.45)
+  const kept = out.rows.filter(r => r.model !== 'other').map(r => r.usage.uncached)
+  expect(kept.length).toBe(31)
+  expect(Math.min(...kept)).toBe(100)
   expect(Math.max(...kept)).toBe(400)
-  expect(out.rows[0]!.model).toBe('model-40')
-  // a row with no cost is null, not zero
-  expect(out.rows[0]!.cost).toBeNull()
-  expect(out.rows[0]!.costSource).toBeNull()
+  // usage and cost are preserved exactly
+  expect(out.rows.reduce((n, r) => n + r.usage.uncached, 0)).toBe(8200)
+  near(out.rows.reduce((n, r) => n + (r.cost ?? 0), 0), 8.2)
+  expect(out.hqModel).toBe('model-40')
+})
+
+test('rows folded past the cap get one other row per implementer', () => {
+  const l = apply(emptyLedger('s1', T0), ...Array.from({ length: 36 }, (_, i) => cliStart(`r${i}`, i % 2 === 0 ? 'opencode' : 'claude', `m-${i}`)),
+    ...Array.from({ length: 36 }, (_, i) => adapter(`r${i}`, (i + 1) * 10, { cost: null, costSource: null })))
+  const out = projectReport(buildReport(l, T0, undefined, 'running', NOW), NOW)!
+  expect(out.rows.length).toBeLessThanOrEqual(32)
+  const others = out.rows.filter(r => r.model === 'other').map(r => r.implementer).sort()
+  expect(others).toEqual(['claude', 'opencode'])
+  expect(out.rows.reduce((n, r) => n + r.usage.uncached, 0)).toBe(Array.from({ length: 36 }, (_, i) => (i + 1) * 10).reduce((a, b) => a + b, 0))
+})
+
+test('spend /flock clear retired stays in the report', () => {
+  const sub: Action[] = [
+    { type: 'spawn', id: 'a1', agentType: 'Explore', requestedModel: OPUS, at: T0 },
+    stepOf(OPUS, 900, { loop: 'a1', turnId: 't2', at: T0 + 2000 }),
+    { type: 'agentStatus', id: 'a1', status: 'completed', at: T0 + 3000 },
+  ]
+  const live = apply(emptyLedger('s1', T0), stepOf(OPUS, 100), ...sub)
+  const total = (l: Ledger): number => projectReport(buildReport(l, T0, undefined, 'running', NOW), NOW)!.rows.reduce((n, r) => n + r.usage.uncached, 0)
+  expect(total(live)).toBe(1000)
+  const cleared = apply(live, { type: 'clear', at: T0 + 4000 })
+  expect(cleared.runs['a1']).toBeUndefined()
+  expect(total(cleared)).toBe(1000)
+})
+
+test('hqModel names the model of the main loop, and mainModel prefers it to the largest claude-code row', () => {
+  const sonnet = 'claude-sonnet-5-5'
+  const l = apply(emptyLedger('s1', T0),
+    stepOf(sonnet, 100),
+    { type: 'spawn', id: 'a1', agentType: 'Explore', requestedModel: OPUS, at: T0 },
+    stepOf(OPUS, 900, { loop: 'a1', turnId: 't2', at: T0 + 2000 }))
+  const back = projectReport(buildReport(l, T0, undefined, 'running', NOW), NOW)!
+  expect(back.hqModel).toBe(sonnet)
+  expect(back.rows.find(r => r.model === OPUS)!.usage.uncached).toBe(900) // the subagent's row is the largest
+  expect(mainModel(back)).toBe(sonnet)
+  // a report without hqModel keeps the old rule
+  expect(mainModel(parsed({ rows: [row('small', 10), row('big', 900)] }))).toBe('big')
+})
+
+test('projectReport reads hqModel through the identifier check: a bad value rejects the report', () => {
+  expect(projectReport(reportText({ hqModel: 'claude-sonnet-5-5' }), NOW)!.hqModel).toBe('claude-sonnet-5-5')
+  for (const bad of ['has space', '', 7, null, 'x'.repeat(200)]) expect(projectReport(reportText({ hqModel: bad }), NOW)).toBeNull()
 })
 
 test('a model name the parent would refuse is made safe, so the report still projects', () => {
@@ -252,6 +309,17 @@ test('matchReports: workdir and model must agree when the run knows them', () =>
   const folderOnly = run('r3', T0, { workdirKey: 'abc12' })
   delete (folderOnly as { model?: string }).model
   expect(matchReports([folderOnly], [rep('f', T0, { rows: [row('x', 1)] })], new Set())).toEqual([{ id: 'r3', file: 'f' }])
+})
+
+test('matchReports: a model alias on the run says nothing about the report model', () => {
+  const sonnet = 'claude-sonnet-5-5'
+  const report = rep('f', T0, { hqModel: sonnet, rows: [row(sonnet, 5)] })
+  for (const alias of ['sonnet', 'opus', 'haiku', 'x']) {
+    expect(matchReports([run('r1', T0, { workdirKey: 'abc12', model: alias })], [report], new Set())).toEqual([{ id: 'r1', file: 'f' }])
+  }
+  // a full model id still has to agree
+  expect(matchReports([run('r1', T0, { workdirKey: 'abc12', model: 'claude-opus-5-5' })], [report], new Set())).toEqual([])
+  expect(matchReports([run('r1', T0, { workdirKey: 'abc12', model: sonnet })], [report], new Set())).toEqual([{ id: 'r1', file: 'f' }])
 })
 
 test('matchReports: identical runs and reports pair in start order, one each', () => {

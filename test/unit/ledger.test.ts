@@ -725,3 +725,55 @@ test('hqByModel is read as empty on a ledger saved without it', () => {
   expect(Object.keys(l.hqByModel!)).toEqual([OPUS])
   expect(emptyLedger('s1', T0).hqByModel).toEqual({})
 })
+
+// ---- Part B fixes: the report file a run was matched to, and a relay result without a cost
+
+const claim = (id: string, childId: string, startedAt = T0, over: Partial<Extract<Action, { type: 'adapterUsage' }>> = {}): Action =>
+  adapter(id, 'child', 100, { childId, childStartedAt: startedAt, ...over })
+
+test('a child report gives its run its file once, and no other file takes the run after that', () => {
+  const l = apply(emptyLedger('s1', T0), cliStart('c1', 'claude', OPUS), claim('c1', 'child-a', T0 + 7))
+  expect(l.runs['c1']!.childId).toBe('child-a')
+  expect(l.runs['c1']!.childStartedAt).toBe(T0 + 7)
+  // the same file goes on updating the run
+  const more = apply(l, claim('c1', 'child-a', T0 + 7, { usage: used(400) }))
+  expect(more.runs['c1']!.usage).toEqual(used(400))
+  // another file's numbers are not this run's, and the claim does not change
+  const other = apply(more, claim('c1', 'child-b', T0 + 9, { usage: used(900) }))
+  expect(other.runs['c1']).toEqual(more.runs['c1'])
+  expect(other.runs['c1']!.usage).toEqual(used(400))
+  expect(other.runs['c1']!.childId).toBe('child-a')
+  // an action without a file (stats) sets none
+  const stats = apply(emptyLedger('s1', T0), cliStart('s2'), adapter('s2', 'stats', 5))
+  expect(stats.runs['s2']!.childId).toBeUndefined()
+})
+
+test('a run whose relay result is exact takes no numbers from a report but still claims its file', () => {
+  const l = apply(emptyLedger('s1', T0), relayStart('r1'), relayDone('r1', 0.9), claim('r1', 'child-a'))
+  const r = l.runs['r1']!
+  expect(r.usage).toEqual(used(777))
+  expect(r.cost).toBe(0.9)
+  expect(r.childId).toBe('child-a')
+})
+
+const claudeRelay = (id: string): Action =>
+  ({ type: 'bashStart', id, cls: { kind: 'relay', implementer: 'claude', readOnly: false, model: OPUS, workdir: '/w', outDir: '/o/1' }, at: T0 })
+
+test('a relay result with usage but no cost keeps the cost a child report or stats measured, and estimates only without one', () => {
+  for (const source of ['child', 'stats'] as const) {
+    const l = apply(emptyLedger('s1', T0), claudeRelay('r1'), adapter('r1', source, 5, { cost: 2 }), relayDone('r1', null))
+    const r = l.runs['r1']!
+    expect(r.usageSource).toBe('relay')
+    expect(r.usage).toEqual(used(777))
+    expect(r.cost).toBe(2)
+    expect(r.costSource).toBe('reported')
+  }
+  // no measured cost: the relay's usage is priced as before
+  const est = apply(emptyLedger('s1', T0), claudeRelay('r1'), relayDone('r1', null)).runs['r1']!
+  expect(est.costSource).toBe('estimated')
+  expect(est.cost).not.toBe(2)
+  expect(est.cost).not.toBeNull()
+  // a child report that gave no cost does not count as a measured one
+  const none = apply(emptyLedger('s1', T0), claudeRelay('r1'), adapter('r1', 'child', 5, { cost: null, costSource: null }), relayDone('r1', null)).runs['r1']!
+  expect(none.costSource).toBe('estimated')
+})

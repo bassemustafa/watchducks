@@ -61,6 +61,10 @@ export type Run = {
   sharedSize?: number
   /** Set when a relay result reported the cost: no adapter replaces that cost, whether or not the result carried usage. */
   costLocked?: 'relay'
+  /** The Claude child's report file this run was matched to (its name without `.json`, a session id); set once, never changed. */
+  childId?: string
+  /** The `startedAt` of that report when it was matched: a file that later says another start is not this run's child. */
+  childStartedAt?: number
   /** A Claude child's whole spend by implementer × model, at most 32. */
   rows?: Array<{ implementer: Implementer; model: string; usage: Usage; cost: number | null; costSource: 'reported' | 'estimated' | null }>
 }

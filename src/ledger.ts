@@ -37,6 +37,9 @@ export type Action =
       model?: string
       rows?: Run['rows']
       status?: 'running' | 'done' | 'failed'
+      /** A child report's file (name without `.json`) and start: the run keeps the first pair it is given and takes no other file's numbers. */
+      childId?: string
+      childStartedAt?: number
       at: number
     }
   | { type: 'editCall'; loop?: string; at: number }
@@ -443,7 +446,8 @@ function reduceRelayResult(ledger: Ledger, a: Extract<Action, { type: 'relayResu
     cost = p.costReported
     costSource = 'reported'
     costPartial = false
-  } else if (usage && implementer === 'claude') {
+  } else if (usage && implementer === 'claude' && !(run.cost !== null && (run.usageSource === 'child' || run.usageSource === 'stats'))) {
+    // (a cost an adapter measured stays: an estimate from the relay's usage does not replace a measurement)
     cost = null
     costSource = null
     costPartial = false
@@ -493,8 +497,13 @@ function reduceAdapterUsage(ledger: Ledger, a: Extract<Action, { type: 'adapterU
   if (!run) return ledger
   const exact = run.usageSource === 'relay'
   const locked = run.costLocked === 'relay'
-  // a relay result that gave both usage and a cost is exact: nothing replaces it
-  if (locked && exact) return ledger
+  // the first report file a run is given is its own for good: another file's numbers are not this run's
+  const claim = a.source === 'child' && a.childId !== undefined
+  if (claim && run.childId !== undefined && run.childId !== a.childId) return ledger
+  const claimed: Partial<Run> =
+    claim && run.childId === undefined ? { childId: a.childId, ...(a.childStartedAt !== undefined ? { childStartedAt: a.childStartedAt } : {}) } : {}
+  // a relay result that gave both usage and a cost is exact: nothing replaces it, but the claim on the report file still holds
+  if (locked && exact) return Object.keys(claimed).length > 0 ? putRun(ledger, { ...run, ...claimed }) : ledger
   if (run.usageSource === 'child' && a.source === 'stats') return ledger
   const rows = exact ? undefined : a.rows?.slice(0, MAX_ROWS)
   const { approx: _approx, sharedSize: _sharedSize, rows: _rows, ...rest } = run
@@ -502,6 +511,7 @@ function reduceAdapterUsage(ledger: Ledger, a: Extract<Action, { type: 'adapterU
   const keepCost = locked || (a.cost === null && a.costSource === null)
   const updated: Run = {
     ...rest,
+    ...claimed,
     usage: exact ? run.usage : a.usage,
     usageSource: exact ? 'relay' : a.source,
     cost: keepCost ? run.cost : a.cost,

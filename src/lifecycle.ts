@@ -246,6 +246,37 @@ function readablePath(stat: FsStat, notBefore: number, roots: readonly string[],
   return realPath
 }
 
+/** The real paths the temp root lands on, as roots a file may live under; none when it cannot be resolved. */
+async function tempRoots($: EngineInterface, tmpDir: string): Promise<string[]> {
+  try {
+    const landed = (await $.fs.stat(tmpDir, { resolve: true })).realPath
+    return allowedRoots(landed === undefined ? [] : [landed])
+  } catch {
+    return []
+  }
+}
+
+/** A report folder may be used (read from, written into) only when it is a real directory, not a link, landing inside the temp root. */
+function usableFolder(stat: FsStat, roots: readonly string[]): boolean {
+  return stat.kind === 'dir' && !stat.isLink && stat.realPath !== undefined && isInsideRoots(stat.realPath, roots)
+}
+
+/** Waits for `work` (which never rejects) for at most `ms`; true when it finished in time. The work itself is not stopped. */
+async function within($: EngineInterface, work: Promise<void>, ms: number): Promise<boolean> {
+  if (ms <= 0) return false
+  let timer: Timer | undefined
+  const lapse = new Promise<boolean>(resolve => {
+    try {
+      timer = $.clock.after(ms, () => resolve(false))
+    } catch {
+      resolve(false) // without a timer nothing may wait
+    }
+  })
+  const finished = await Promise.race([work.then(() => true), lapse])
+  timer?.cancel()
+  return finished
+}
+
 async function readRelayResult(
   $: EngineInterface,
   outDir: string,
@@ -844,12 +875,13 @@ async function statsTick($: EngineInterface, table: PriceTable, options: PluginO
 type StatsExit = { sessionId: string; epoch: number; deadline: number }
 
 /**
- * The first thing the end hook does: remembers which session and epoch are ending and when the whole step must be over,
- * and tells ticks to start no further process. Nothing here awaits.
+ * The first thing the end hook does: remembers which session and epoch are ending and when the whole step must be over
+ * (STATS_EXIT_TIMEOUT_MS, or less when `ms` is all the end step has left), and tells ticks to start no further process.
+ * Nothing here awaits.
  */
-function beginStatsExit(): StatsExit {
+function beginStatsExit(ms: number): StatsExit {
   statsStopping = true
-  return { sessionId: statsSession, epoch: statsEpoch, deadline: Date.now() + STATS_EXIT_TIMEOUT_MS }
+  return { sessionId: statsSession, epoch: statsEpoch, deadline: Date.now() + Math.min(STATS_EXIT_TIMEOUT_MS, Math.max(0, ms)) }
 }
 
 /**
@@ -860,7 +892,7 @@ function beginStatsExit(): StatsExit {
  */
 async function finalStats($: EngineInterface, table: PriceTable, options: PluginOptions, exit: StatsExit): Promise<void> {
   try {
-    if (options.opencodeStats !== 'on') return
+    if (options.opencodeStats !== 'on' || exit.deadline - Date.now() <= 0) return
     let timer: Timer | undefined
     let expired = false
     const lapse = new Promise<void>(resolve => {
@@ -938,10 +970,19 @@ function watchStats($: EngineInterface, table: PriceTable, options: PluginOption
 
 // Claude child report (spec §4). A session started from another session's agent shell inherits that parent's
 // CLAUDE_CODE_SESSION_ID; it then writes its numbers-only spend into a folder named by a hash of the parent's id, once at
-// start, every REPORT_EVERY_MS while the report changed, and finally at session end. Every write is best effort.
+// start, every REPORT_EVERY_MS while the report changed, and finally at session end. Every write is best effort, goes
+// into a folder that is a real directory inside the temp root, and is waited for at most CHILD_BOUND_MS by a hook.
+
+const CHILD_BOUND_MS = 1000
+// kept back from the end hook's budget for the history write, which is never skipped
+const END_RESERVE_MS = 500
 
 type ChildMode = {
   path: string
+  dir: string
+  tmpDir: string
+  /** The session this child mode was started for: a write that finds the ledger on another session writes nothing. */
+  sessionId: string
   startedAt: number
   workdirKey: string | undefined
   /** The last report written, `updatedAt` removed: a tick whose text equals it writes nothing. */
@@ -962,12 +1003,31 @@ function withoutStamp(text: string): string {
   return text.replace(/"updatedAt":"[^"]*",/, '')
 }
 
+/**
+ * A folder that is not there yet is created by the write; one that is there must be usable (a real directory inside the
+ * temp root, not a link), else nothing is written into it. A stat that finds nothing at the path, whether it rejects or
+ * answers `other` for something that is not a link, counts as not there.
+ */
+async function childFolderUsable($: EngineInterface, c: ChildMode): Promise<boolean> {
+  let folder: FsStat
+  try {
+    folder = await $.fs.stat(c.dir, { resolve: true })
+  } catch {
+    return true
+  }
+  if (folder.kind === 'other' && !folder.isLink) return true
+  return usableFolder(folder, await tempRoots($, c.tmpDir))
+}
+
 /** One report write; a failed one leaves `last` as it was, so the next tick tries again. */
 async function writeChild($: EngineInterface, c: ChildMode, status: ChildReport['status']): Promise<void> {
   try {
-    const text = buildReport(await read($, ledgerAtom), c.startedAt, c.workdirKey, status, Date.now())
+    const ledger = await read($, ledgerAtom)
+    if (ledger.sessionId !== c.sessionId) return // a pending write of an older session builds nothing from the new one
+    const text = buildReport(ledger, c.startedAt, c.workdirKey, status, Date.now())
     const signature = withoutStamp(text)
     if (signature === c.last) return
+    if (!(await childFolderUsable($, c))) return
     await $.fs.write(c.path, text)
     c.last = signature
   } catch {
@@ -975,10 +1035,12 @@ async function writeChild($: EngineInterface, c: ChildMode, status: ChildReport[
   }
 }
 
-function flightOf($: EngineInterface, c: ChildMode): void {
-  c.flight = writeChild($, c, 'running').finally(() => {
-    c.flight = undefined
+function flightOf($: EngineInterface, c: ChildMode, status: ChildReport['status'] = 'running'): Promise<void> {
+  const flight = writeChild($, c, status).finally(() => {
+    if (c.flight === flight) c.flight = undefined
   })
+  c.flight = flight
+  return flight
 }
 
 async function startChild($: EngineInterface, options: PluginOptions): Promise<void> {
@@ -995,8 +1057,13 @@ async function startChild($: EngineInterface, options: PluginOptions): Promise<v
     } catch {
       // no session root: the report carries no folder key
     }
+    const tmpDir = await tmpRoot($)
+    const dir = reportDir(tmpDir, parentId)
     const c: ChildMode = {
-      path: `${reportDir(await tmpRoot($), parentId)}/${ownId}.json`,
+      path: `${dir}/${ownId}.json`,
+      dir,
+      tmpDir,
+      sessionId: ownId,
       startedAt: (await read($, ledgerAtom)).sessionStartedAt,
       workdirKey: key,
       last: '',
@@ -1004,31 +1071,37 @@ async function startChild($: EngineInterface, options: PluginOptions): Promise<v
       timer: undefined,
     }
     child = c
-    flightOf($, c)
-    await c.flight
-    if (child === c) c.timer = $.clock.every(REPORT_EVERY_MS, () => (child === c && !c.flight ? flightOf($, c) : undefined))
+    // the start hook waits for the first write for a moment only; a write left behind keeps the ticks from starting another
+    await within($, flightOf($, c), CHILD_BOUND_MS)
+    if (child === c) c.timer = $.clock.every(REPORT_EVERY_MS, () => (child === c && !c.flight ? void flightOf($, c) : undefined))
   } catch {
     // no child mode: the session works as any other
   }
 }
 
-/** The end of a child session: stop the timer, let a write in flight land, then the final report. Waits on `$.fs.write` only. */
-async function finishChild($: EngineInterface): Promise<void> {
+/**
+ * The end of a child session, within `ms` (at most CHILD_BOUND_MS): stop the timer, let a write in flight land, then the
+ * final report. A write that is still pending at the bound is not followed by another.
+ */
+async function finishChild($: EngineInterface, ms: number): Promise<void> {
   const c = child
   if (!c) return
   child = undefined
   c.timer?.cancel()
-  await c.flight // writeChild never rejects
+  const deadline = Date.now() + Math.min(ms, CHILD_BOUND_MS)
+  if (c.flight && !(await within($, c.flight, deadline - Date.now()))) return
   // the end event carries no error reason (clear, resume, logout, prompt_input_exit, other): the status is always done
-  await writeChild($, c, 'done')
+  await within($, flightOf($, c, 'done'), deadline - Date.now())
 }
 
 // Claude child reports, parent side (spec §4.5–4.9). While a `cli` or `relay` run of a Claude (or of an unattributed tool)
 // is running or ended less than the relay grace ago, one timer lists the parent's own report folder every READ_EVERY_MS.
-// Each file is checked like a relay result (regular, not a link, within the size cap, real path inside the temp root),
-// read only when its mtime or size changed, projected through the allow-list, and matched to a run once; from then on the
-// file belongs to that run and every change of it updates the run. All of a poll's updates go in one atomic ledger write.
-// What is kept here: file names (child session ids) bound to run ids, and fingerprints of the files already handled.
+// The folder must be a real directory inside the temp root; each file is checked like a relay result (regular, not a link,
+// within the size cap, real path inside the temp root), read only when its mtime or size changed, projected through the
+// allow-list, and matched to a run once. The match is stored on the run (`childId`, `childStartedAt`), so it survives a
+// reload; from then on the file belongs to that run and every change of it updates the run. All of a poll's updates go in
+// one atomic ledger write. What is kept here: file names (child session ids) bound to run ids, the names of files whose
+// run /flock clear removed (their claim outlives the run), and fingerprints of the files already handled.
 
 const REPORT_SUFFIX = '.json'
 
@@ -1037,8 +1110,14 @@ let reportsBusy = false
 let reportsSession = ''
 // bumped by a new session and by stopTimers: a poll that started under an older one discards what it read
 let reportsEpoch = 0
-// report file name -> the run it belongs to, at most MAX_REPORTS_LISTED: a full map refuses a new binding
-const reportBound = new Map<string, string>()
+type Bound = { id: string; startedAt: number | undefined }
+// report file name -> the run it belongs to and the start it was matched with; rebuilt from the ledger at every sync,
+// at most MAX_REPORTS_LISTED: a full map refuses a new binding
+const reportBound = new Map<string, Bound>()
+// files whose run left the ledger (/flock clear): still claimed, so no other run takes them; at most MAX_REPORTS_LISTED,
+// and once full a further one cannot be remembered, so nothing new is matched for the rest of the session
+const reportCleared = new Set<string>()
+let reportsFull = false
 // the files already handled, by fingerprint of the name, valid while their mtime and size stay the same
 const reportMemory = new DiscoveryMemory()
 
@@ -1046,17 +1125,30 @@ function resetReports(): void {
   reportsEpoch += 1
   reportsSession = ''
   reportBound.clear()
+  reportCleared.clear()
+  reportsFull = false
   reportMemory.clear()
 }
 
-/** A new session starts over; a run that left the ledger frees its file's binding. */
+/** The binding map as the ledger holds it: a new session starts over; a file whose run is gone keeps its claim. */
 function syncReportsSession(l: Ledger): void {
   if (l.sessionId !== reportsSession) {
     resetReports()
     reportsSession = l.sessionId
-    return
   }
-  for (const [file, id] of [...reportBound]) if (!Object.hasOwn(l.runs, id)) reportBound.delete(file)
+  const held = new Map<string, Bound>()
+  for (const id of l.order) {
+    const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
+    if (run?.childId === undefined || held.size >= MAX_REPORTS_LISTED) continue
+    held.set(run.childId + REPORT_SUFFIX, { id, startedAt: run.childStartedAt })
+  }
+  for (const file of reportBound.keys()) {
+    if (held.has(file)) continue
+    if (reportCleared.size < MAX_REPORTS_LISTED) reportCleared.add(file)
+    else reportsFull = true
+  }
+  reportBound.clear()
+  for (const [file, bound] of held) reportBound.set(file, bound)
 }
 
 /** A run whose child may write a report: a Claude (or not yet attributed) `cli` or `relay`, running or ended less than the grace ago. */
@@ -1082,8 +1174,8 @@ function reportFile(entry: FsEntry): string | null {
   return CHILD_ID.test(entry.name.slice(0, -REPORT_SUFFIX.length)) ? entry.name : null
 }
 
-/** What a report gives its run: the sum of its rows, the child's main model, its rows, and its end when it has one. */
-function childAction(id: string, report: ChildReport, at: number): Action {
+/** What a report gives its run: the sum of its rows, the child's main model, its rows, its end when it has one, and the file it is. */
+function childAction(id: string, file: string, report: ChildReport, at: number): Action {
   const { usage, cost, costSource } = reportUsage(report)
   const model = mainModel(report)
   return {
@@ -1096,6 +1188,8 @@ function childAction(id: string, report: ChildReport, at: number): Action {
     ...(model !== undefined ? { model } : {}),
     rows: report.rows,
     ...(report.status !== 'running' ? { status: report.status } : {}),
+    childId: file.slice(0, -REPORT_SUFFIX.length),
+    childStartedAt: report.startedAt,
     at,
   }
 }
@@ -1114,18 +1208,18 @@ async function pollReports($: EngineInterface, table: PriceTable): Promise<void>
     const tmpDir = await tmpRoot($)
     const dir = reportDir(tmpDir, await $.session.id())
     // the folder is looked at before it is listed: most sessions have no child that reports, and a folder that is
-    // missing, a link, or lands outside the temp root is not listed
+    // missing, a link, or lands outside the temp root is not listed. Only names that can be reports count toward the cap.
     const files: string[] = []
     let roots: string[]
     try {
       const folder = await $.fs.stat(dir, { resolve: true })
-      if (folder.kind !== 'dir' || folder.isLink || folder.realPath === undefined) return
-      const landed = (await $.fs.stat(tmpDir, { resolve: true })).realPath
-      roots = allowedRoots(landed === undefined ? [] : [landed])
-      if (!isInsideRoots(folder.realPath, roots)) return
-      for (const entry of (await $.fs.list(dir)).slice(0, MAX_REPORTS_LISTED)) {
+      roots = await tempRoots($, tmpDir)
+      if (!usableFolder(folder, roots)) return
+      for (const entry of (await $.fs.list(dir)).slice(0, MAX_LISTED_ENTRIES)) {
         const file = reportFile(entry)
-        if (file !== null) files.push(file)
+        if (file === null) continue
+        files.push(file)
+        if (files.length >= MAX_REPORTS_LISTED) break
       }
     } catch {
       return // no folder yet, or it cannot be listed: the next poll tries again
@@ -1135,6 +1229,7 @@ async function pollReports($: EngineInterface, table: PriceTable): Promise<void>
     const changed: ReportRead[] = []
     const invalid: Array<[string, number, number]> = []
     for (const file of files) {
+      if (reportCleared.has(file)) continue // its run is gone: nothing is read for it
       try {
         const stat = await $.fs.stat(`${dir}/${file}`, { resolve: true })
         const realPath = readablePath(stat, Date.now() - STALE_MS, roots, false)
@@ -1151,23 +1246,29 @@ async function pollReports($: EngineInterface, table: PriceTable): Promise<void>
     if (epoch !== reportsEpoch) return
 
     // bound files keep updating their run; the others are matched to the runs that have no file yet
-    const claimed = new Set(reportBound.keys())
-    const taken = new Set(reportBound.values())
-    const fresh = changed.filter(r => !claimed.has(r.file))
+    const claimed = new Set<string>([...reportBound.keys(), ...reportCleared])
+    const taken = new Set([...reportBound.values()].map(b => b.id))
+    const fresh = reportsFull ? [] : changed.filter(r => !claimed.has(r.file))
     const room = Math.max(0, MAX_REPORTS_LISTED - reportBound.size)
     const binding = matchReports(
       live.filter(run => !taken.has(run.id)),
       fresh,
       claimed,
     ).slice(0, room)
-    const owner = new Map<string, string>([...reportBound, ...binding.map(m => [m.file, m.id] as const)])
+    const owner = new Map<string, Bound>(reportBound)
+    for (const m of binding) owner.set(m.file, { id: m.id, startedAt: changed.find(r => r.file === m.file)?.report.startedAt })
     const at = Date.now()
     const actions: Action[] = []
     const sent: ReportRead[] = []
     for (const r of changed) {
-      const id = owner.get(r.file)
-      if (id === undefined) continue
-      actions.push(childAction(id, r.report, at))
+      const bound = owner.get(r.file)
+      if (bound === undefined) continue
+      // a file that now says another start is not the child this run was matched with
+      if (bound.startedAt !== undefined && bound.startedAt !== r.report.startedAt) {
+        invalid.push([r.file, r.mtimeMs, r.size])
+        continue
+      }
+      actions.push(childAction(bound.id, r.file, r.report, at))
       sent.push(r)
     }
 
@@ -1179,7 +1280,7 @@ async function pollReports($: EngineInterface, table: PriceTable): Promise<void>
       })
     }
     if (epoch !== reportsEpoch || !applied) return
-    for (const m of binding) reportBound.set(m.file, m.id)
+    for (const m of binding) reportBound.set(m.file, owner.get(m.file)!)
     for (const [file, mtimeMs, size] of invalid) reportMemory.rememberIdentity(file, mtimeMs, size, null)
     for (const r of sent) reportMemory.rememberIdentity(r.file, r.mtimeMs, r.size, null)
   } catch {
@@ -1187,6 +1288,12 @@ async function pollReports($: EngineInterface, table: PriceTable): Promise<void>
   } finally {
     reportsBusy = false
   }
+}
+
+/** The poll before the session ends, within `ms` (at most CHILD_BOUND_MS) and only when none is in flight; a poll left behind dispatches nothing. */
+async function finalReports($: EngineInterface, table: PriceTable, ms: number): Promise<void> {
+  if (ms <= 0 || reportsBusy) return
+  if (!(await within($, pollReports($, table), Math.min(ms, CHILD_BOUND_MS)))) reportsEpoch += 1
 }
 
 /** Called by the watch tick: the timer exists only while a run may still get a report. */
@@ -1507,14 +1614,25 @@ export function registerLifecycle(on: On, table: PriceTable, options: PluginOpti
 
   // One history write; a /clear then starts an empty ledger under the new session id.
   on('session.end', async ($, e, next) => {
+    // the steps below share the end hook's budget (the history write keeps a reserve and is never skipped); a step with no
+    // time left is skipped
+    const left = (): number => {
+      try {
+        const ms = next.budget.remainingMs - END_RESERVE_MS
+        return Number.isNaN(ms) ? 0 : ms
+      } catch {
+        return STATS_EXIT_TIMEOUT_MS
+      }
+    }
     // before anything awaits: which session ends, and when the stats part of the step must be over
-    const exit = beginStatsExit()
+    const exit = beginStatsExit(left())
     const turn = timersTurn
     let old: Ledger | undefined
-    // the parent is waiting for the final numbers: they go first, before anything that could take long
-    await finishChild($)
-    // runs that ended since the last poll get their final figures before the record is written
+    // runs that ended since the last poll get their final figures, so the report a child writes next and the record hold them
     await finalStats($, table, options, exit)
+    // the parent's last look at its children's reports, then the child's own final report (the parent waits for it)
+    await finalReports($, table, left())
+    await finishChild($, left())
     try {
       old = await read($, ledgerAtom)
       await writeHistory($, old, options)
