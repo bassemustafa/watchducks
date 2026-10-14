@@ -1,5 +1,7 @@
 import type { HistoryRecord, Implementer, Ledger, Run, StationRow } from '../types'
 
+import { shownCost, storedCost, type Pricing, type Shown } from './cost'
+
 // Pure per-session history (spec §5): a session's record is rebuilt from its
 // ledger, the 30-day board is an aggregate of records, pruning is a pure plan.
 
@@ -29,11 +31,17 @@ export function utcDay(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10)
 }
 
+/** What a run or row counts as spending: the cost a sink shows under `pricing` (src/cost.ts), else the stored one. */
+function shownOf(c: Parameters<typeof shownCost>[0], pricing: Pricing | undefined): Shown {
+  return pricing ? shownCost(c, pricing.mode, pricing.table) : storedCost(c)
+}
+
 /**
  * `own` false: the run's tokens and cost are not added here (they land on its rows' buckets, a Claude child).
  * Its op, status, reviews and bugs always are.
  */
-function addRun(c: Counters, run: Run, own = true): void {
+function addRun(c: Counters, run: Run, pricing: Pricing | undefined, own = true): void {
+  const shown = shownOf(run, pricing)
   c.ops += 1
   if (run.status === 'done') c.done += 1
   else if (run.status === 'failed') c.failed += 1
@@ -46,10 +54,10 @@ function addRun(c: Counters, run: Run, own = true): void {
     c.cacheRead += run.usage.cacheRead
     c.cacheWrite += run.usage.cacheWrite
   }
-  if (own && run.cost !== null) c.costOps += 1
-  if (own && run.cost !== null && run.costSource === 'reported') c.costReported += run.cost
-  else if (own && run.cost !== null && run.costSource === 'estimated') c.costEstimated += run.cost
-  else if (run.cost === null && (run.kind === 'agent' || (run.kind === 'relay' && run.implementer !== 'codex' && run.outDir !== undefined))) {
+  if (own && shown.cost !== null) c.costOps += 1
+  if (own && shown.cost !== null && shown.source === 'reported') c.costReported += shown.cost
+  else if (own && shown.cost !== null && shown.source === 'estimated') c.costEstimated += shown.cost
+  else if (shown.cost === null && (run.kind === 'agent' || (run.kind === 'relay' && run.implementer !== 'codex' && run.outDir !== undefined))) {
     // a codex relay, or one without an out dir, can never report a cost (as in runCost)
     c.unknownCostOps += 1
   }
@@ -63,27 +71,28 @@ function bucketKey(run: Run): string {
 }
 
 /** One breakdown row of a Claude child: its spend only, no op (the run's op is counted once, on the run's own bucket). */
-function addRow(c: Counters, row: NonNullable<Run['rows']>[number]): void {
+function addRow(c: Counters, row: NonNullable<Run['rows']>[number], pricing: Pricing | undefined): void {
+  const shown = shownOf(row, pricing)
   c.usageOps += 1
   c.uncached += row.usage.uncached
   c.output += row.usage.output
   c.cacheRead += row.usage.cacheRead
   c.cacheWrite += row.usage.cacheWrite
-  if (row.cost !== null) c.costOps += 1
-  if (row.cost !== null && row.costSource === 'reported') c.costReported += row.cost
-  else if (row.cost !== null && row.costSource === 'estimated') c.costEstimated += row.cost
+  if (shown.cost !== null) c.costOps += 1
+  if (shown.cost !== null && shown.source === 'reported') c.costReported += shown.cost
+  else if (shown.cost !== null && shown.source === 'estimated') c.costEstimated += shown.cost
 }
 
 /**
  * Adds one run to its bucket, or a run with child rows to the buckets of its rows: the run's own op stays
  * on its own implementer × model.
  */
-function addToBuckets(bucketOf: (key: string) => Counters, run: Run): void {
+function addToBuckets(bucketOf: (key: string) => Counters, run: Run, pricing: Pricing | undefined): void {
   const rows = run.rows
-  if (rows === undefined || rows.length === 0) addRun(bucketOf(bucketKey(run)), run)
+  if (rows === undefined || rows.length === 0) addRun(bucketOf(bucketKey(run)), run, pricing)
   else {
-    addRun(bucketOf(bucketKey(run)), run, false)
-    for (const row of rows) addRow(bucketOf(`${row.implementer}|${row.model}`), row)
+    addRun(bucketOf(bucketKey(run)), run, pricing, false)
+    for (const row of rows) addRow(bucketOf(`${row.implementer}|${row.model}`), row, pricing)
   }
 }
 
@@ -124,8 +133,9 @@ export function dropOldDays(days: HistoryRecord['days'], nowMs: number): History
 
 /**
  * A copy of `days` with every run added by its UTC end day and implementer × model bucket; the input is not changed.
+ * With `pricing` a bucket takes the cost the run shows (and its source), else the stored one.
  */
-export function addRunsToDays(days: HistoryRecord['days'], runs: readonly Run[]): HistoryRecord['days'] {
+export function addRunsToDays(days: HistoryRecord['days'], runs: readonly Run[], pricing?: Pricing): HistoryRecord['days'] {
   const out: HistoryRecord['days'] = {}
   for (const [day, byKey] of Object.entries(days)) {
     const bucket: HistoryRecord['days'][string] = {}
@@ -134,25 +144,25 @@ export function addRunsToDays(days: HistoryRecord['days'], runs: readonly Run[])
   }
   for (const run of runs) {
     const bucket = (out[utcDay(run.endedAt ?? run.startedAt)] ??= {})
-    addToBuckets(key => (bucket[key] ??= emptyCounters()) as Counters, run)
+    addToBuckets(key => (bucket[key] ??= emptyCounters()) as Counters, run, pricing)
   }
   return out
 }
 
 /** The session's whole record, rebuilt from the ledger (idempotent): runs /clear retired plus the live ones. HQ and overhead are excluded. */
-export function recordFromLedger(ledger: Ledger): HistoryRecord {
-  return { v: 1, sessionStartedAt: ledger.sessionStartedAt, days: addRunsToDays(ledger.retired ?? {}, orderedRuns(ledger)) }
+export function recordFromLedger(ledger: Ledger, pricing?: Pricing): HistoryRecord {
+  return { v: 1, sessionStartedAt: ledger.sessionStartedAt, days: addRunsToDays(ledger.retired ?? {}, orderedRuns(ledger), pricing) }
 }
 
 /** Station rows for the live session (all runs, no day split). */
-export function stationRowsFromLedger(ledger: Ledger): StationRow[] {
+export function stationRowsFromLedger(ledger: Ledger, pricing?: Pricing): StationRow[] {
   const buckets = new Map<string, Counters>()
   const bucketOf = (key: string): Counters => {
     let c = buckets.get(key)
     if (!c) buckets.set(key, (c = emptyCounters()))
     return c
   }
-  for (const run of orderedRuns(ledger)) addToBuckets(bucketOf, run)
+  for (const run of orderedRuns(ledger)) addToBuckets(bucketOf, run, pricing)
   return rowsFromBuckets(buckets)
 }
 

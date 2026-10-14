@@ -1,4 +1,5 @@
 import type { Usage } from '../types'
+import { LITELLM } from './prices-litellm'
 
 export type Rates = { input: number; output: number; cacheRead: number; cacheWrite: number }
 export type PriceTable = Record<string, Rates>
@@ -51,9 +52,40 @@ export function ratesFor(model: string, totalInput: number, table: PriceTable): 
   return rowFor(table, key) ?? null
 }
 
-export function estimateCost(usage: Usage, model: string, table: PriceTable): number | null {
+/** A LiteLLM snapshot: USD per million tokens `[input, output, cacheRead, cacheWrite]` by lower-cased LiteLLM key. */
+export type LitellmTable = Readonly<Record<string, readonly [number, number, number, number]>>
+
+/** Providers tried, in this order, for a model id that carries none. */
+const PROVIDER_ORDER = [
+  'openai', 'anthropic', 'gemini', 'vertex_ai', 'xai', 'deepseek', 'mistral', 'groq', 'azure', 'azure_ai', 'openrouter',
+  'bedrock', 'together_ai', 'fireworks_ai',
+] as const
+
+/**
+ * Rates from the bundled LiteLLM snapshot. `model` is `provider/id` or a bare id; a trailing `[1m]` and an `@variant` are
+ * dropped. Tried in order: the key as given, `${provider}/${id}` when a provider is known, the bare id, then the id under
+ * each provider of PROVIDER_ORDER. No other matching.
+ */
+export function litellmRates(model: string, provider?: string, table: LitellmTable = LITELLM): Rates | null {
+  const key = model.toLowerCase().replace(/\[1m\]$/, '').replace(/@.*$/, '')
+  const id = key.slice(key.indexOf('/') + 1)
+  if (id === '') return null
+  const tries = [key, ...(provider ? [`${provider.toLowerCase()}/${id}`] : []), id, ...PROVIDER_ORDER.map(p => `${p}/${id}`)]
+  for (const k of tries) {
+    const row = Object.hasOwn(table, k) ? table[k] : undefined
+    if (row) return { input: row[0], output: row[1], cacheRead: row[2], cacheWrite: row[3] }
+  }
+  return null
+}
+
+/** Effective rates: price overrides, then the Claude table (both are `table`), then the LiteLLM snapshot. */
+export function ratesForAny(model: string, totalInput: number, table: PriceTable, litellm: LitellmTable = LITELLM): Rates | null {
+  return ratesFor(model, totalInput, table) ?? litellmRates(model, undefined, litellm)
+}
+
+export function estimateCost(usage: Usage, model: string, table: PriceTable, litellm: LitellmTable = LITELLM): number | null {
   const totalInput = usage.uncached + usage.cacheRead + usage.cacheWrite
-  const rates = ratesFor(model, totalInput, table)
+  const rates = ratesForAny(model, totalInput, table, litellm)
   if (!rates) return null
   return (
     (usage.uncached * rates.input +

@@ -63,6 +63,17 @@
       "description": "JSON object: { \"<model>\": { \"input\": n, \"output\": n, \"cacheRead\": n, \"cacheWrite\": n } } in USD per million tokens",
       "default": ""
     },
+    "costMode": {
+      "type": "string",
+      "title": "Cost mode",
+      "description": "auto: a reported cost, else an estimate from tokens (a reported $0 with tokens is estimated); calculate: always estimate from tokens; display: only costs a source reported",
+      "default": "auto",
+      "options": [
+        "auto",
+        "calculate",
+        "display"
+      ]
+    },
     "recordHeadless": {
       "type": "string",
       "title": "Record headless sessions",

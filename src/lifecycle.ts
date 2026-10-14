@@ -52,10 +52,11 @@ import {
 } from './collect/relay'
 import { HISTORY_PREFIX, pruneHistory, recordFromLedger } from './history'
 import { emptyLedger, isKnownLoop, normalizeDir, reduce, workdirKey, type Action } from './ledger'
+import { shownCost, type Pricing } from './cost'
 import { ZERO_USAGE, addUsage, type PriceTable } from './price'
 import { fnv1a } from './codename'
 import { MAX_RESULT_BYTES, ident, isInsideRoots, projectRelayResult, relayIdentity } from './relay-result'
-import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, recordsHeadless } from './state'
+import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, pricing, recordsHeadless } from './state'
 import { ROSTER_SPEC, VERDICT_SPEC } from './tools'
 import { blipsFor, radar } from './ui/animate'
 import { fmtCost } from './ui/format'
@@ -137,7 +138,7 @@ async function writeHistory($: EngineInterface, ledger: Ledger, options: PluginO
   if (ledger.sessionId === '') return true
   try {
     if ((await isHeadless($)) && !recordsHeadless(options)) return true
-    await $.store.set(HISTORY_PREFIX + ledger.sessionId, recordFromLedger(ledger))
+    await $.store.set(HISTORY_PREFIX + ledger.sessionId, recordFromLedger(ledger, pricing(options)))
     return true
   } catch {
     // history is best effort: a failed write must never reach a hook
@@ -985,6 +986,8 @@ type ChildMode = {
   sessionId: string
   startedAt: number
   workdirKey: string | undefined
+  /** The cost mode and prices the report's costs are shown under. */
+  pricing: Pricing
   /** The last report written, `updatedAt` removed: a tick whose text equals it writes nothing. */
   last: string
   /** The write in flight, so ticks never overlap and the final write follows it. */
@@ -1024,7 +1027,7 @@ async function writeChild($: EngineInterface, c: ChildMode, status: ChildReport[
   try {
     const ledger = await read($, ledgerAtom)
     if (ledger.sessionId !== c.sessionId) return // a pending write of an older session builds nothing from the new one
-    const text = buildReport(ledger, c.startedAt, c.workdirKey, status, Date.now())
+    const text = buildReport(ledger, c.startedAt, c.workdirKey, status, Date.now(), c.pricing)
     const signature = withoutStamp(text)
     if (signature === c.last) return
     if (!(await childFolderUsable($, c))) return
@@ -1066,6 +1069,7 @@ async function startChild($: EngineInterface, options: PluginOptions): Promise<v
       sessionId: ownId,
       startedAt: (await read($, ledgerAtom)).sessionStartedAt,
       workdirKey: key,
+      pricing: pricing(options),
       last: '',
       flight: undefined,
       timer: undefined,
@@ -1355,13 +1359,15 @@ function stopBurst(): void {
 }
 
 /** Compare a running run's totals with the last seen ones and (re)start its count-up; true when a ticker was set. */
-function trackTotals(run: Run, now: number): boolean {
+function trackTotals(run: Run, now: number, pr: Pricing): boolean {
   const tokens = run.usage ? run.usage.uncached + run.usage.output + run.usage.cacheRead + run.usage.cacheWrite : 0
+  // the count-up runs on the cost the card shows
+  const cost = shownCost(run, pr.mode, pr.table).cost
   const prev = seenTotals.get(run.id)
-  seenTotals.set(run.id, { tokens, cost: run.cost })
-  if (!prev || (prev.tokens === tokens && prev.cost === run.cost)) return false
+  seenTotals.set(run.id, { tokens, cost })
+  if (!prev || (prev.tokens === tokens && prev.cost === cost)) return false
   const shown = Object.hasOwn(motion.tickers, run.id) ? tickerValue(motion.tickers[run.id]!, now) : { tokens: prev.tokens, cost: prev.cost ?? 0 }
-  motion.tickers[run.id] = { fromTokens: shown.tokens, toTokens: tokens, fromCost: shown.cost, toCost: run.cost ?? shown.cost, startedAt: now }
+  motion.tickers[run.id] = { fromTokens: shown.tokens, toTokens: tokens, fromCost: shown.cost, toCost: cost ?? shown.cost, startedAt: now }
   return true
 }
 let historyPending = false
@@ -1386,8 +1392,8 @@ function seed(l: Ledger): void {
 }
 
 /** The session id and the record's day buckets (counts only): it changes whenever the stored record would. */
-function historySignature(l: Ledger): { signature: string; empty: boolean } {
-  const days = JSON.stringify(recordFromLedger(l).days)
+function historySignature(l: Ledger, pr: Pricing): { signature: string; empty: boolean } {
+  const days = JSON.stringify(recordFromLedger(l, pr).days)
   return { signature: `${l.sessionId}|${days}`, empty: days === '{}' }
 }
 
@@ -1412,7 +1418,7 @@ async function saveHistory($: EngineInterface, options: PluginOptions, force: bo
   saving = true
   try {
     const ledger = await read($, ledgerAtom)
-    const { signature } = historySignature(ledger)
+    const { signature } = historySignature(ledger, pricing(options))
     if (force || signature !== savedSignature) {
       if (await writeHistory($, ledger, options)) savedSignature = signature
     }
@@ -1489,6 +1495,7 @@ async function watchTick($: EngineInterface, options: PluginOptions, table: Pric
     const l = await read($, ledgerAtom)
     const now = Date.now()
     const g = glyphs(options.glyphs === 'ascii' ? 'ascii' : 'emoji')
+    const pr = pricing(options)
 
     if (l.generation !== seenGeneration || l.sessionId !== seenSession) {
       seed(l)
@@ -1509,7 +1516,8 @@ async function watchTick($: EngineInterface, options: PluginOptions, table: Pric
           $.clock.after(STAMP_MS, () => void clearStamp($, id))
         }
         if (run.status !== 'running' && (before === undefined || before === 'running') && options.notify === 'on') {
-          $.ui.toast(`${g.duck} ${run.codename} ${statusWords(run.status).spy.toLowerCase()} · ${fmtCost(run.cost, run.costSource, run.costPartial)}`)
+          const shown = shownCost(run, pr.mode, pr.table)
+          $.ui.toast(`${g.duck} ${run.codename} ${statusWords(run.status).spy.toLowerCase()} · ${fmtCost(shown.cost, shown.source, shown.partial === true)}`)
         }
       }
     }
@@ -1521,13 +1529,13 @@ async function watchTick($: EngineInterface, options: PluginOptions, table: Pric
       let ticking = false
       for (const id of l.order) {
         const run = Object.hasOwn(l.runs, id) ? l.runs[id] : undefined
-        if (run && run.status === 'running' && trackTotals(run, now)) ticking = true
+        if (run && run.status === 'running' && trackTotals(run, now, pr)) ticking = true
       }
       if (ticking) startBurst($)
     }
 
     // any change to the stored record (a status, relay usage or cost arriving late, a replaced verdict) schedules one save
-    const history = historySignature(l)
+    const history = historySignature(l, pr)
     if (!history.empty && history.signature !== savedSignature) scheduleHistoryWrite($, options)
 
     const running = l.order.some(id => l.runs[id]?.status === 'running')

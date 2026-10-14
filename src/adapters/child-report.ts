@@ -1,5 +1,6 @@
 import type { Implementer, Ledger, Run, Usage } from '../../types'
 import { fingerprint } from '../collect/relay'
+import { shownCost, storedCost, type Pricing } from '../cost'
 import { aggregateHistory, stationRowsFromLedger } from '../history'
 import { ident } from '../relay-result'
 import { exceedsBytes } from './opencode-stats'
@@ -140,17 +141,28 @@ function hqModelOf(ledger: Ledger): string | undefined {
  * The JSON text of this session's report: its whole spend by implementer × model and nothing else. The rows are the main
  * loop's spend by model (implementer `claude-code`) plus the station board's rows of the ledger (the board's own spend
  * rules: a shared group once, a run with child rows contributing those) and the spend /flock clear retired, merged; past
- * MAX_ROWS the smallest fold into `other` rows. `hqModel` names the model of the main loop's own requests.
+ * MAX_ROWS the smallest fold into `other` rows. `hqModel` names the model of the main loop's own requests. With `pricing` the
+ * costs are the ones this session shows (cost mode and price table), else the stored ones.
  */
-export function buildReport(ledger: Ledger, startedAt: number, workdirKey: string | undefined, status: ChildReport['status'], now: number): string {
+export function buildReport(
+  ledger: Ledger,
+  startedAt: number,
+  workdirKey: string | undefined,
+  status: ChildReport['status'],
+  now: number,
+  pricing?: Pricing,
+): string {
   const merged = new Map<string, Row>()
   for (const [model, spend] of Object.entries(ledger.hqByModel ?? {})) {
     const usage = usageOf(spend.usage)
-    const cost = spend.cost !== null && Number.isFinite(spend.cost) ? Math.min(Math.max(spend.cost, 0), MAX_COST) : null
-    mergeRow(merged, { implementer: 'claude-code', model: modelName(model), usage, cost, costSource: cost === null ? null : 'estimated' })
+    // what the child shows: the cost under its own cost mode (the parent adds the rows up as they come)
+    const row = { cost: spend.cost, costSource: spend.cost === null ? null : ('estimated' as const), usage: spend.usage, model }
+    const shown = pricing ? shownCost(row, pricing.mode, pricing.table) : storedCost(row)
+    const cost = shown.cost !== null && Number.isFinite(shown.cost) ? Math.min(Math.max(shown.cost, 0), MAX_COST) : null
+    mergeRow(merged, { implementer: 'claude-code', model: modelName(model), usage, cost, costSource: cost === null ? null : (shown.source ?? 'estimated') })
   }
   const retired = aggregateHistory([{ v: 1, sessionStartedAt: ledger.sessionStartedAt, days: ledger.retired ?? {} }], now)
-  for (const s of [...stationRowsFromLedger(ledger), ...retired]) {
+  for (const s of [...stationRowsFromLedger(ledger, pricing), ...retired]) {
     // a bucket of runs that measured nothing carries no spend
     if (s.usageOps === 0 && s.costOps === 0) continue
     const total = s.costReported + s.costEstimated

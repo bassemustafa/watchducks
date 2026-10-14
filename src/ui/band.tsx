@@ -2,7 +2,7 @@ import { atom, read } from 'claude-code'
 import type { On, PluginOptions } from 'claude-code'
 
 import { totals } from '../ledger'
-import { INITIAL_LEDGER } from '../state'
+import { INITIAL_LEDGER, pricing } from '../state'
 import { radar } from './animate'
 import { totalTokens } from './dossier'
 import { cachePct, fmtCost, fmtTokens } from './format'
@@ -17,6 +17,7 @@ const RECENT_MS = 5 * 60_000
 
 export function registerBand(on: On, options: PluginOptions): void {
   const g = glyphs(options.glyphs === 'ascii' ? 'ascii' : 'emoji')
+  const pr = pricing(options)
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (typeof e.viewport?.isFullscreen === 'boolean') radar.fullscreen = e.viewport.isFullscreen
@@ -39,7 +40,7 @@ export function registerBand(on: On, options: PluginOptions): void {
     if (placed) return next(e)
 
     const { Box, Text } = $.ui.resolve(e)
-    const tot = totals(ledger)
+    const tot = totals(ledger, pr)
     const tokens = totalTokens(tot.usage) ?? 0
     return (
       <Box>

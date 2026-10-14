@@ -2,9 +2,10 @@ import { atom, read, update } from 'claude-code'
 import type { Elements, On, PluginOptions } from 'claude-code'
 
 import type { HistoryRecord, Implementer, Ledger, Run, StationRow, UiState } from '../../types'
+import { shownCost, shownHq, type Pricing } from '../cost'
 import { HISTORY_PREFIX, aggregateHistory, stationRowsFromLedger } from '../history'
 import { seriesWindow, totals, type Totals } from '../ledger'
-import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord } from '../state'
+import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, pricing } from '../state'
 import { RADAR_FULL, RADAR_SMALL, blipsFor, radar, svgBlipsFor } from './animate'
 import { codenameOf, dossierView, fit, runCost, runElapsed, runTokens, totalTokens, type Glyphs, type Press, type Table } from './dossier'
 import { cachePct, fmtCost, fmtDuration, fmtElapsedCoarse, fmtTokens, sparkline } from './format'
@@ -64,6 +65,8 @@ type Layout = {
   coarse: boolean
   /** The terminal element table when stamps may animate; null on the desktop and with motion off. */
   stampTable: Elements['terminal'] | null
+  /** The cost mode and prices every cost on the board is shown under. */
+  pricing: Pricing
 }
 
 /** What the surface-specific part of the field view contributes. */
@@ -310,7 +313,7 @@ function stampOf(ui: UiState, runId: string, now: number): { kind: StampKind; pr
   return s && s.until > now ? { kind: s.kind, progress: 1 - (s.until - now) / STAMP_MS } : undefined
 }
 
-function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g: Glyphs, stamp: { kind: StampKind; progress: number } | undefined, stampTable: Elements['terminal'] | null, press: Press, coarse: boolean): El {
+function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g: Glyphs, stamp: { kind: StampKind; progress: number } | undefined, stampTable: Elements['terminal'] | null, press: Press, coarse: boolean, pr: Pricing): El {
   const { Box, Text, Button } = t
   const color = statusColor(run.status)
   const words = statusWords(run.status)
@@ -347,7 +350,8 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
     const tick = stampTable && run.status === 'running' && Object.hasOwn(motionState.tickers, run.id) ? motionState.tickers[run.id] : undefined
     const live = tick && now - tick.startedAt < TICK_MS ? tickerValue(tick, now) : undefined
     const tokens = live ? fmtTokens(live.tokens) : runTokens(run)
-    const cost = live && run.cost !== null ? fmtCost(live.cost, run.costSource, run.costPartial) : runCost(run)
+    const shown = shownCost(run, pr.mode, pr.table)
+    const cost = live && shown.cost !== null ? fmtCost(live.cost, shown.source, shown.partial === true) : runCost(run, pr)
     const figures = [(coarse && run.status === 'running' ? fmtElapsedCoarse : fmtDuration)(runElapsed(run, now)), `${run.approx ? '≈' : ''}${tokens} tok`, cost]
     if (run.sharedSize !== undefined && run.sharedSize > 1) figures.push(`shared ×${run.sharedSize}`)
     const whole = `${status}   ${figures.join('   ')}`
@@ -385,7 +389,7 @@ function fieldView(
   const { Box, Text } = t
   const { inner, g } = lay
   const blank = <Text> </Text>
-  const tot = totals(ledger)
+  const tot = totals(ledger, lay.pricing)
   const runs = orderedRuns(ledger)
   const delegated = totalTokens(tot.usage) ?? 0
   const series = sparkline(seriesWindow(ledger, now, 30), Math.min(15, Math.max(4, inner - LABEL - 2)))
@@ -401,7 +405,8 @@ function fieldView(
   )
   const hq = ledger.hq
   const hqTokens = totalTokens(hq.usage) ?? 0
-  const hqLine = `HQ  ${hqTokens > 0 ? fmtTokens(hqTokens) + ' tok' : '—'} · ${hqTokens > 0 ? fmtCost(hq.cost, 'estimated', hq.costPartial) : '—'}`
+  const hqShown = shownHq(ledger, lay.pricing.mode, lay.pricing.table)
+  const hqLine = `HQ  ${hqTokens > 0 ? fmtTokens(hqTokens) + ' tok' : '—'} · ${hqTokens > 0 ? fmtCost(hqShown.cost, hqShown.source, hqShown.partial === true) : '—'}`
   const ohTokens = totalTokens(ledger.overhead.usage) ?? 0
 
   return (
@@ -448,7 +453,7 @@ function fieldView(
       {runs.length === 0 && <Text dimColor>No operatives yet — the flock is watching.</Text>}
       {runs.map((run, i) => (
         <Box flexDirection="column" key={'card:' + run.id} marginBottom={i === runs.length - 1 ? 0 : 1}>
-          {card(t, ledger, run, now, inner, g, stampOf(ui, run.id, now), lay.stampTable, press, lay.coarse)}
+          {card(t, ledger, run, now, inner, g, stampOf(ui, run.id, now), lay.stampTable, press, lay.coarse, lay.pricing)}
         </Box>
       ))}
     </Box>
@@ -473,6 +478,7 @@ export function registerSidebar(on: On, options: PluginOptions): void {
   const g: Glyphs = glyphs(options.glyphs === 'ascii' ? 'ascii' : 'emoji')
   const motion = options.motion !== 'off'
   const showOverhead = options.showEngineOverhead === 'on'
+  const pr = pricing(options)
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     // mobile and the editor get the band only
@@ -484,7 +490,7 @@ export function registerSidebar(on: On, options: PluginOptions): void {
     const now = Date.now()
     const columns = e.props.bodyColumns > 0 ? e.props.bodyColumns : e.viewport?.columns && e.viewport.columns > 0 ? e.viewport.columns : DEFAULT_COLUMNS
     const tier = columns >= 48 ? 'full' : columns >= 36 ? 'mid' : 'compact'
-    const lay: Layout = { columns, inner: Math.max(16, columns - PAD * 2), tier, g, showOverhead, coarse: e.surface === 'desktop', stampTable: e.surface === 'terminal' && motion ? $.ui.resolve(e) : null }
+    const lay: Layout = { columns, inner: Math.max(16, columns - PAD * 2), tier, g, showOverhead, coarse: e.surface === 'desktop', stampTable: e.surface === 'terminal' && motion ? $.ui.resolve(e) : null, pricing: pr }
     const press: Press = patch => void update($, uiAtom, u => ({ ...u, ...patch })).catch(() => undefined)
     radar.mounted = null
     motionState.dots = []
@@ -517,7 +523,7 @@ export function registerSidebar(on: On, options: PluginOptions): void {
     let body: El
     if (ui.view === 'dossier') {
       const run = ui.dossierId !== undefined && Object.hasOwn(ledger.runs, ui.dossierId) ? ledger.runs[ui.dossierId] : undefined
-      body = dossierView(t, run, ledger, now, lay.inner, g, press)
+      body = dossierView(t, run, ledger, now, lay.inner, g, press, pr)
     } else if (ui.view === 'station') {
       const rows =
         ui.span === '30d'
@@ -526,7 +532,7 @@ export function registerSidebar(on: On, options: PluginOptions): void {
               key => $.store.get(key),
               now,
             )
-          : stationRowsFromLedger(ledger)
+          : stationRowsFromLedger(ledger, pr)
       body = (
         <Box flexDirection="column">
           {nav}
@@ -535,7 +541,7 @@ export function registerSidebar(on: On, options: PluginOptions): void {
         </Box>
       )
     } else {
-      const tot = totals(ledger)
+      const tot = totals(ledger, pr)
       const art = e.surface === 'terminal' ? terminalArt($.ui.resolve(e), ledger, tot, lay) : desktopArt($.ui.resolve(e), ledger, tot, lay, motion)
       body = (
         <Box flexDirection="column">

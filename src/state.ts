@@ -1,6 +1,7 @@
 import type { PluginOptions } from 'claude-code'
 
 import type { HistoryRecord, UiState } from '../types'
+import { parseCostMode, type CostMode, type Pricing } from './cost'
 import { emptyLedger } from './ledger'
 import { PRICES, withOverrides, type PriceTable } from './price'
 
@@ -18,6 +19,15 @@ export const INITIAL_LEDGER = emptyLedger('', 0)
 export function prices(options: PluginOptions): PriceTable {
   const raw = options.priceOverrides
   return withOverrides(PRICES, typeof raw === 'string' ? raw : '')
+}
+
+export function costMode(options: PluginOptions): CostMode {
+  return parseCostMode(options.costMode)
+}
+
+/** The price table and the cost mode every sink prices with. */
+export function pricing(options: PluginOptions): Pricing {
+  return { table: prices(options), mode: costMode(options) }
 }
 
 export function recordsHeadless(options: PluginOptions): boolean {

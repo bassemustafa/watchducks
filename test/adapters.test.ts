@@ -1799,3 +1799,91 @@ test('300 names that cannot be reports in front of a report do not hide it', asy
   expect(fs.reads).toEqual([`${OWN_DIR}/ok.json`])
   expect(ledger().runs['bash:u1']!.usage).toEqual(flat(100))
 })
+
+// ---- cost mode: tokens priced when a source reported $0 (rates come through priceOverrides, so the bundled snapshot does not matter)
+
+const SOL_RATES = JSON.stringify({ 'openai/gpt-6.1-sol': { input: 1000, output: 2000, cacheRead: 500, cacheWrite: 0 } })
+/** The stats growth below (200 input, 22 output with reasoning, 2000 cache read) costs $1.244 at SOL_RATES. */
+const pricedOn = (costMode: string) => ({ options: { opencodeStats: 'on', costMode, priceOverrides: SOL_RATES, motion: 'off' } }) as const
+
+function solPane($: Engine) {
+  return $.ui.mount({
+    plugin: 'watchducks',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'flock',
+    props: { title: 'The Flock', isFocused: false, bodyColumns: 52, placement: 'dock' } as never,
+    viewport: { columns: 56, rows: 40, isFullscreen: true },
+  })
+}
+
+type Bucket = { costReported: number; costEstimated: number }
+const lastBuckets = (stored: readonly string[]): Bucket[] => {
+  const record = JSON.parse(stored[stored.length - 1]!) as { days: Record<string, Record<string, Bucket>> }
+  return Object.values(record.days).flatMap(day => Object.values(day))
+}
+
+async function costedRun($: Engine, on: On, replies: readonly string[]): Promise<{ ledger: () => Ledger; w: ReturnType<typeof world> }> {
+  const ledger = watchLedger(on)
+  const w = world(on, replies)
+  await $.session.start(START)
+  await $.tool.call(call('u1', SOL))
+  await w.clock.advance(500)
+  await w.clock.advance(10_000)
+  return { ledger, w }
+}
+
+test('auto: stats that report $0 with real tokens show an estimate on the card, in the dossier and in the history', pricedOn('auto'), async ($, on) => {
+  const { ledger, w } = await costedRun($, on, [statsJson(1, 1, 0), statsJson(2, 3, 0)])
+  const run = ledger().runs['bash:u1']!
+  expect(run.usage).toEqual({ uncached: 200, output: 22, cacheRead: 2000, cacheWrite: 0 })
+  // the ledger keeps what the source gave
+  expect(run.cost).toBe(0)
+  expect(run.costSource).toBe('reported')
+
+  const ui = await solPane($)
+  const card = JSON.stringify(await ui.drawn())
+  expect(card).toContain('$1.24 est.')
+  expect(card).not.toContain('reported $0')
+  await ui.press({ key: 'bash:u1' })
+  expect(JSON.stringify(await ui.drawn())).toContain('$1.24 est. (reported $0)')
+  await ui.unmount()
+
+  await $.session.end({ reason: 'exit' } as never)
+  const buckets = lastBuckets(w.stored)
+  near(buckets.reduce((n, c) => n + c.costEstimated, 0), 1.244)
+  expect(buckets.reduce((n, c) => n + c.costReported, 0)).toBe(0)
+})
+
+test('display: stats that report $0 show $0 reported and no estimate anywhere', pricedOn('display'), async ($, on) => {
+  const { w } = await costedRun($, on, [statsJson(1, 1, 0), statsJson(2, 3, 0)])
+  const ui = await solPane($)
+  const card = JSON.stringify(await ui.drawn())
+  expect(card).toContain('$0 reported')
+  expect(card).not.toContain('est.')
+  await ui.unmount()
+
+  await $.session.end({ reason: 'exit' } as never)
+  expect(lastBuckets(w.stored).reduce((n, c) => n + c.costEstimated, 0)).toBe(0)
+})
+
+test('calculate: a reported cost is priced again from the tokens', pricedOn('calculate'), async ($, on) => {
+  const { ledger } = await costedRun($, on, [statsJson(1, 1, 0.1), statsJson(2, 3, 0.4)])
+  const run = ledger().runs['bash:u1']!
+  near(run.cost, 0.3)
+  expect(run.costSource).toBe('reported')
+  const ui = await solPane($)
+  const card = JSON.stringify(await ui.drawn())
+  expect(card).toContain('$1.24 est.')
+  expect(card).not.toContain('$0.30')
+  await ui.unmount()
+})
+
+test('auto: a reported cost above $0 stays reported', pricedOn('auto'), async ($, on) => {
+  await costedRun($, on, [statsJson(1, 1, 0.1), statsJson(2, 3, 0.4)])
+  const ui = await solPane($)
+  const card = JSON.stringify(await ui.drawn())
+  expect(card).toContain('$0.30 reported')
+  expect(card).not.toContain('est.')
+  await ui.unmount()
+})

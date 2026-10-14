@@ -5,7 +5,7 @@ import type { UiState } from '../types'
 import { HISTORY_PREFIX } from './history'
 import { reduce } from './ledger'
 import type { PriceTable } from './price'
-import { INITIAL_LEDGER, INITIAL_UI } from './state'
+import { INITIAL_LEDGER, INITIAL_UI, costMode } from './state'
 import { glyphs } from './ui/theme'
 
 const ledgerAtom = atom({ plugin: 'watchducks', key: 'ledger' } as const, INITIAL_LEDGER)
@@ -50,7 +50,7 @@ export function registerCommands(on: On, table: PriceTable, options: PluginOptio
 
     if (arg === 'clear') {
       try {
-        await update($, ledgerAtom, l => reduce(l, { type: 'clear', at: Date.now() }, table))
+        await update($, ledgerAtom, l => reduce(l, { type: 'clear', at: Date.now(), mode: costMode(options) }, table))
       } catch {
         // the board keeps what it had
       }

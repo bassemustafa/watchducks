@@ -1,6 +1,7 @@
 import type { Elements } from 'claude-code'
 
 import type { Ledger, Run, UiState, Usage } from '../../types'
+import { shownCost, storedCost, type Pricing } from '../cost'
 import { cachePct, fmtCost, fmtDuration, fmtTokens } from './format'
 import { PALETTE, glyphs, statusColor, statusWords } from './theme'
 
@@ -33,13 +34,16 @@ export function runTokens(run: Run): string {
   return '?'
 }
 
-export function runCost(run: Run): string {
-  if (run.cost === null && run.costSource === null) {
+/** The run's cost text under `pricing` (the stored figures when none is given); `detail` adds what a card leaves out. */
+export function runCost(run: Run, pricing?: Pricing, detail = false): string {
+  const shown = pricing ? shownCost(run, pricing.mode, pricing.table) : storedCost(run)
+  if (shown.cost === null && shown.source === null) {
     if (run.kind === 'cli' || run.kind === 'shell') return '—'
     // a relay without an out dir has no result file to read, so its cost can never arrive
     if (run.kind === 'relay' && (run.implementer === 'codex' || run.outDir === undefined)) return '—'
   }
-  return fmtCost(run.cost, run.costSource, run.costPartial)
+  const text = fmtCost(shown.cost, shown.source, shown.partial === true)
+  return detail && shown.reportedZero ? `${text} (reported $0)` : text
 }
 
 const SOURCE_WORDS = { relay: 'result.json', child: 'child report', stats: 'opencode stats', steps: 'per request', complete: 'per request' } as const
@@ -76,6 +80,7 @@ export function dossierView(
   inner: number,
   g: Glyphs,
   press: Press,
+  pricing?: Pricing,
 ): ReturnType<Table['Box']> {
   const { Box, Text, Button } = t
   const back = (
@@ -100,6 +105,7 @@ export function dossierView(
     </Text>
   )
 
+  const costShown = pricing ? shownCost(run, pricing.mode, pricing.table) : storedCost(run)
   const u = run.usage
   const models = run.models && run.models.length > 0 ? run.models.join(', ') : (run.model ?? '—')
   const effort =
@@ -143,8 +149,8 @@ export function dossierView(
       {row('output', u ? fmtTokens(u.output) : runTokens(run))}
       {row('total', runTokens(run))}
       {row('cache hit', cachePct(u))}
-      {row('cost', runCost(run), PALETTE.accent)}
-      {run.costPartial && <Text dimColor>{'  some requests had no price'}</Text>}
+      {row('cost', runCost(run, pricing, true), PALETTE.accent)}
+      {costShown.partial === true && <Text dimColor>{'  some requests had no price'}</Text>}
       <Text> </Text>
       {row('patches', String(run.editCalls))}
       {row('leaks', String(run.bugsReported))}

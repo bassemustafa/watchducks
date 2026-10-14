@@ -1,5 +1,6 @@
 import type { Classification, Implementer, Ledger, RelayProjection, Review, Run, RunStatus, Spend, Usage } from '../types'
 import { fnv1a, codenameFor } from './codename'
+import { shownCost, type CostMode, type Pricing } from './cost'
 import { addRunsToDays, dropOldDays } from './history'
 import { ZERO_USAGE, addUsage, estimateCost, usageFromApi, type PriceTable } from './price'
 
@@ -45,7 +46,8 @@ export type Action =
   | { type: 'editCall'; loop?: string; at: number }
   | { type: 'findings'; loop?: string; toolUseId: string; count: number; at: number }
   | { type: 'verdict'; targetId: string; reviewerId?: string; bugs?: number; edits?: number; at: number }
-  | { type: 'clear'; at: number }
+  /** `mode`: the cost mode the retired days are priced under (default `auto`). */
+  | { type: 'clear'; at: number; mode?: CostMode }
 
 export type Totals = {
   running: number
@@ -260,7 +262,8 @@ function charge(
   prices: PriceTable,
 ): Ledger {
   const used = usageFromApi(usage)
-  const cost = estimateCost(used, usage.model || fallbackModel, prices)
+  // stored estimates are the Claude table's only; other models are priced at read time (src/cost.ts)
+  const cost = estimateCost(used, usage.model || fallbackModel, prices, {})
   if (loop === undefined) {
     const hqByModel = addByModel(ledger.hqByModel ?? {}, usage.model || fallbackModel, used, cost)
     return { ...ledger, hq: addSpend(ledger.hq, used, cost), hqByModel }
@@ -451,7 +454,7 @@ function reduceRelayResult(ledger: Ledger, a: Extract<Action, { type: 'relayResu
     cost = null
     costSource = null
     costPartial = false
-    const estimate = model !== undefined ? estimateCost(usage, model, prices) : null
+    const estimate = model !== undefined ? estimateCost(usage, model, prices, {}) : null
     if (estimate === null) costPartial = true
     else {
       cost = estimate
@@ -556,7 +559,7 @@ function reduceVerdict(ledger: Ledger, a: Extract<Action, { type: 'verdict' }>):
   return putRun(ledger, { ...target, reviews })
 }
 
-function reduceClear(ledger: Ledger, at: number): Ledger {
+function reduceClear(ledger: Ledger, at: number, pricing: Pricing): Ledger {
   const kept: Record<string, Run> = {}
   const removed: Run[] = []
   for (const [id, run] of Object.entries(ledger.runs)) {
@@ -578,7 +581,7 @@ function reduceClear(ledger: Ledger, at: number): Ledger {
     findings,
     bgSeen,
     // days past the 30-day window can never reach the board, so they are not kept
-    retired: dropOldDays(addRunsToDays(ledger.retired ?? {}, removed), at),
+    retired: dropOldDays(addRunsToDays(ledger.retired ?? {}, removed, pricing), at),
   })
 }
 
@@ -655,11 +658,12 @@ export function reduce(ledger: Ledger, action: Action, prices: PriceTable): Ledg
     case 'verdict':
       return reduceVerdict(ledger, action)
     case 'clear':
-      return reduceClear(ledger, action.at)
+      return reduceClear(ledger, action.at, { table: prices, mode: action.mode ?? 'auto' })
   }
 }
 
-export function totals(ledger: Ledger): Totals {
+/** Totals over the runs; with `pricing` each run's cost is the one a sink shows (src/cost.ts), else the stored one. */
+export function totals(ledger: Ledger, pricing?: Pricing): Totals {
   const t: Totals = {
     running: 0,
     done: 0,
@@ -675,12 +679,16 @@ export function totals(ledger: Ledger): Totals {
   for (const run of Object.values(ledger.runs)) {
     t[run.status] += 1
     if (run.usage) t.usage = addUsage(t.usage, run.usage)
-    if (run.cost !== null) t.cost = (t.cost ?? 0) + run.cost
-    if ((run.kind === 'agent' || run.kind === 'relay') && (run.cost === null || run.costPartial)) t.costPartial = true
+    const shown = pricing ? shownCost(run, pricing.mode, pricing.table) : { cost: run.cost, partial: run.costPartial || undefined }
+    if (shown.cost !== null) t.cost = (t.cost ?? 0) + shown.cost
+    if ((run.kind === 'agent' || run.kind === 'relay') && (shown.cost === null || shown.partial)) t.costPartial = true
     if (run.rows !== undefined && run.rows.length > 0) {
-      for (const row of run.rows) t.byImplementer[row.implementer] = (t.byImplementer[row.implementer] ?? 0) + (row.cost ?? 0)
+      for (const row of run.rows) {
+        const spent = pricing ? shownCost(row, pricing.mode, pricing.table).cost : row.cost
+        t.byImplementer[row.implementer] = (t.byImplementer[row.implementer] ?? 0) + (spent ?? 0)
+      }
     } else {
-      t.byImplementer[run.implementer] = (t.byImplementer[run.implementer] ?? 0) + (run.cost ?? 0)
+      t.byImplementer[run.implementer] = (t.byImplementer[run.implementer] ?? 0) + (shown.cost ?? 0)
     }
   }
   return t
