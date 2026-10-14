@@ -69,7 +69,7 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
 | Effort | observed, reported by the relay, or taken from a flag |
 | Tokens | uncached input, output, cache read, cache write |
 | Cache % | cache read ÷ total input (uncached + cache read + cache write) |
-| Cost | in USD, marked **reported** (from the relay or `opencode stats`) or **est.** (list-price estimate) |
+| Cost | in USD, marked **reported** (from the relay or `opencode stats`) or **est.** (estimated from tokens; see [Costs](#costs)) |
 | Reviews | handler (the reviewer), leaks (bugs found), patches (edit calls) |
 
 **"—"** means the value is not available for that source (for example, tokens for an opencode relay with `opencodeStats` off). **"?"** means the value should exist but is unknown (for example, an unpriced model, or a result.json not read yet). A missing value is never shown as 0.
@@ -116,7 +116,7 @@ The docked sidebar needs the fullscreen layout. Elsewhere the sidebar opens inli
 
 | Source | Identity | Status | Tokens & cache | Cost |
 |---|---|---|---|---|
-| Agent-tool subagent | agent type; model and effort seen per request | from the spawn result, turn end and agent list | yes, per request | estimated from the price table (Claude models) |
+| Agent-tool subagent | agent type; model and effort seen per request | from the spawn result, turn end and agent list | yes, per request | estimated from tokens (see [Costs](#costs)) |
 | `claude` relay | from the command and result.json (`lane`, `model`, `effort`) | from result.json | yes, from result.json `usage`; live from its child report while it runs (see [Live numbers](#live-numbers)) | reported (`totalCostUsd`) |
 | `opencode` relay | from the command and result.json (`tool`, `model`, `variant`) | from result.json | — (with `opencodeStats` on: from `opencode stats`) | reported by the relay, or from `opencode stats` with `opencodeStats` on; `$0 reported` under subscription plans |
 | `codex` relay | from the command and result.json, when present | from result.json | — | — |
@@ -169,6 +169,8 @@ Example: *"Record a verdict: SMEW-1A reviewed GOLDENEYE-7Q, 2 bugs, 5 edits."*
 | `notify` | `on`, `off` | `off` | show a toast (codename only) when an operative finishes |
 | `relayRoots` | path list | empty | extra directories where relay `--out-dir` folders may live; separate entries with `:`; the temp dir and session root are always allowed |
 | `priceOverrides` | JSON | empty | per-model prices in USD per million tokens |
+| `costMode` | `auto`, `estimate`, `reported` | `auto` | how a run's cost is set: `auto` keeps a reported cost and estimates a reported $0 with tokens; `estimate` always estimates from tokens when a price is known; `reported` shows only costs a source reported (see [Costs](#costs)) |
+| `priceUpdates` | `on`, `off` | `on` | refresh LiteLLM's price list at most once a day, with one GET that carries no data; `off` uses the bundled prices (see [Privacy](#privacy)) |
 | `recordHeadless` | `on`, `off` | `off` | write history from headless sessions (`claude -p`); off avoids double counting relay children |
 | `opencodeStats` | `on`, `off` | `off` | run `opencode stats` (numbers only) to give opencode runs live token and cost numbers; see [Privacy](#privacy) |
 | `reportToParent` | `on`, `off` | `on` | when this session was started by another Claude Code session, write a numbers-only report file for the parent; see [Privacy](#privacy) |
@@ -235,20 +237,39 @@ The rows are the child's whole spend, including its subagents and the runs it de
 
 **Shared numbers.** Two or more opencode runs with the same model in one folder, active at the same time, cannot be told apart by any numbers watchducks can read. Their growth is split evenly among them. Their cards show `≈` before the token figures and `shared ×N`, where N is the largest group the run was in. The dossier says `even share of N runs`. Totals are plain sums of the cards, so they add up to what opencode measured.
 
-**On disk.** One history record per session (`history/v1/<sessionId>`) in the plugin store. It holds counts, tokens and costs per UTC day and implementer|model. Records are kept for 30 days, at most 200 of them. Headless sessions record nothing unless `recordHeadless` is on. `/flock purge` deletes all of it.
+**On disk.** One history record per session (`history/v1/<sessionId>`) in the plugin store. It holds counts, tokens and costs per UTC day and implementer|model. Records are kept for 30 days, at most 200 of them. Headless sessions record nothing unless `recordHeadless` is on. `/flock purge` deletes all of it. With `priceUpdates` on, the store also holds one price record (`prices/litellm/v1`): the refreshed price list as numbers, with its dates; `/flock purge` keeps it.
 
-**No network access. No telemetry.**
+**Network.** watchducks makes one kind of network request: the daily price refresh. It is one GET, through the Claude Code host, to LiteLLM's public price list on GitHub:
+
+```text
+https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+```
+
+It has no headers, no query and no body, and carries nothing about you or your session. It runs at most once a day, with one attempt an hour after a failure. It is checked at session start and about hourly, and it never blocks a hook. The answer is capped at 8 MiB and reduced to four numbers per chat model; fewer than 100 valid entries are ignored. The result is kept in the plugin store. Without a fetched list, the price list bundled with this version is used.
+
+The refresh is skipped when `priceUpdates` is `off`, when `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set, or when your organization's web-fetch policy refuses it. To turn it off, set `priceUpdates` to `off`, at install with `--config priceUpdates=off` or later from the `/plugin` menu.
+
+watchducks makes no other network request. **No telemetry.**
 
 See [SECURITY.md](SECURITY.md) for the full data inventory and threat model.
 
 ## Costs
 
-Estimated costs use a built-in price table for Claude models, dated 2026-10-06. They are list-price estimates, not invoices or subscription charges. Cache writes are priced at the 5-minute rate.
+Estimated costs are priced from tokens, per million tokens, in this order: `priceOverrides`; watchducks' built-in table for Claude models, dated 2026-10-06; then LiteLLM's public price list, which is the copy fetched by the daily refresh or, until one succeeds, the copy bundled with this version (dated 2026-10-14). So a model that LiteLLM lists gets an estimate even when no cost was reported. Claude cache writes are priced at the 5-minute rate. LiteLLM rates are base-tier only (see [Known limits](#known-limits)).
 
-A cost reported by a relay always wins over an estimate. The two are never added together. A model with no price shows "?" and the run is flagged as partial. Override prices with `priceOverrides`.
+Estimates are list-price estimates, not invoices or subscription charges. Estimates are marked **est.**. The dossier names the price list date for a LiteLLM estimate.
+
+`costMode` sets when an estimate is used:
+
+- `auto` (default): a reported cost is used. A reported $0 with tokens is estimated, as for models used through a subscription. The dossier then says **(reported $0)**.
+- `estimate`: always estimate from tokens when a price is known.
+- `reported`: show only costs a source reported. No estimates.
+
+A run's cost is one figure: a reported cost and an estimate are never added together. A model with no price shows "?" and the run is flagged as partial.
 
 ## Known limits
 
+- **Long-context prices are not applied to LiteLLM rates.** watchducks sees a run's summed tokens, not single requests, so the base-tier rate is used. Estimates for very long requests can therefore be low.
 - **Shared numbers can drift.** When one run of a shared group later gets exact figures from a relay's `result.json`, it shows those, and the others keep their even-share estimates. The totals can then differ from opencode's own totals by that run's estimation error. The other runs stay marked approximate.
 - **A run cleared early loses its last interval.** If `/flock clear` removes a run before its final snapshot, the run keeps the figures it had. The growth of its last interval is not counted, and no other run takes it.
 - **Claude children need watchducks loaded.** A Claude child writes a report only if watchducks loads in it. That happens when watchducks is installed at user scope, or, in development, when it is named in `CLAUDE_CODE_PLUGIN_DIRS`. Without it, the parent still tracks the child as a card with status and duration, but the card has no live numbers. The parent also cannot see that child's own delegated processes. This limit applies only to Claude children. opencode stats and the v0.1 tracking need nothing inside other agents.
