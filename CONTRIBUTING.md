@@ -161,7 +161,7 @@ The mod engine enforces these rules. Breaking one either fails the load or silen
 
 This is the core promise of the project, and it is not negotiable.
 
-watchducks never reads, copies, displays, logs or stores message content, prompts, tool input or output text, file contents, or error text. It keeps only allow-listed metadata: ids, model, effort, token counts, cost, status, timings and counts. The files it reads are a relay's `result.json` and the numbers-only reports of child Claude sessions. It reads them transiently and keeps only allow-listed fields. With the `opencodeStats` setting on, it runs `opencode stats` with a fixed argument list and keeps only the numbers.
+watchducks never reads, copies, displays, logs or stores message content, prompts, tool input or output text, file contents, or error text. It keeps only allow-listed metadata: ids, model, effort, token counts, cost, status, timings and counts. The files it reads are a delegate relay's `result.json` and the numbers-only reports of child Claude sessions. It reads them transiently and keeps only allow-listed fields. With the `opencodeStats` setting on, it runs `opencode stats` with a fixed argument list and keeps only the numbers.
 
 Before you go undercover, check every change that touches collectors against this list:
 

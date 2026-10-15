@@ -166,7 +166,7 @@ test('privacy canary: planted sentinels never reach state, store, toasts, status
     tool: 'Bash',
     tool_use_id: 'p4',
     run_in_background: true,
-    command: 'node x/opencode-handoff/scripts/relay.mjs --lane quick --out-dir /tmp/p',
+    command: 'node x/opencode-delegation/scripts/relay.mjs --lane quick --out-dir /tmp/p',
   } as never)
   await clock.advance(3000)
   // the history record: the only thing the mod writes to the store
@@ -402,7 +402,7 @@ test('privacy canary: no environment value but the session id, TMPDIR and HOME r
   const clock = mock.clock(on)
 
   await $.session.start(START) // child mode: the first report is written at once
-  await $.tool.call({ tool: 'Bash', tool_use_id: 'u1', run_in_background: true, command: 'node x/opencode-handoff/scripts/relay.mjs --lane quick --out-dir /tmp/p' } as never)
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'u1', run_in_background: true, command: 'node x/opencode-delegation/scripts/relay.mjs --lane quick --out-dir /tmp/p' } as never)
   await $.tool.call({ tool: 'Bash', tool_use_id: 'u2', run_in_background: true, command: SOL_RUN } as never)
   await clock.advance(500)
   await clock.advance(10_000) // a relay poll and a stats tick

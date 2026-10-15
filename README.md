@@ -14,7 +14,7 @@
   <img src=".github/media/demo.gif" alt="A real session: one prompt deploys three Haiku subagents, a background sleep and an opencode run. The sidebar docks, the radar sweeps, operative cards go from IN FIELD to DEBRIEFED or RETURNED with stamps, spend splits between claude-code and opencode, then /flock station shows the station board." width="100%">
 </p>
 
-watchducks is an open-source Claude Code mod (a function-hooks plugin). It tracks every run your session hands off: Agent-tool subagents, relay runs, raw agent CLIs and background shell commands. For each run it shows status, model, effort, tokens, cache use, cost and review outcome. It reads only numbers, identifiers and enums. It never reads your prompts or answers (see [Privacy](#privacy)).
+watchducks is an open-source Claude Code mod (a function-hooks plugin). It tracks the work your session delegates to other agents: Agent-tool subagents, delegate relay runs, raw agent CLIs and background shell commands. For each run it shows status, model, effort, tokens, cache use, cost and review outcome. It reads only numbers, identifiers and enums. It never reads your prompts or answers (see [Privacy](#privacy)).
 
 ## 🕵️ Why ducks?
 
@@ -95,9 +95,9 @@ flowchart LR
 
 watchducks hooks into the events your session already produces. Each hook keeps only numbers, identifiers and enums, and writes them to a ledger. The sidebar, the band, the station board and the 30-day history all read from that ledger. Side inputs fill in what hooks cannot see: a relay's `result.json`, `opencode stats` (opt-in), reports from Claude children, and LiteLLM's price list, refreshed daily.
 
-## 🔁 What's a relay?
+## 🔁 What's a delegate relay?
 
-A relay is any small wrapper script that launches an agent CLI for you, often in the background. When the agent finishes, it leaves a `result.json` with the outcome. People write relays to hand work to other agents, to run them in parallel, or to keep a record.
+Delegation is your session handing a task to another agent. A delegate relay (relay for short) is any small wrapper script that does the handing off: it launches an agent CLI for you, often in the background, and when the agent finishes, it leaves a `result.json` with the outcome. People write relays to delegate work to other agents, to run them in parallel, or to keep a record.
 
 watchducks needs no particular relay. It recognizes a relay from the command line (a script whose file name starts with `relay`, or a script inside a folder whose name contains `delegate`, run directly or through `node`, `bun`, `deno`, `tsx`, `python`, `bash` or `sh`), picks up the flags listed in [Privacy](#privacy), and reads the result file if it follows the relay result format.
 
@@ -235,10 +235,10 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
 | Source | Identity | Status | Tokens & cache | Cost |
 |---|---|---|---|---|
 | Agent-tool subagent | agent type; model and effort seen per request | from the spawn result, turn end and agent list | yes, per request | estimated from tokens (see [Costs](#costs)) |
-| Relay running `claude` | from the command and result.json (`lane`, `model`, `effort`) | from result.json | yes, from result.json `usage`; live from its child report while it runs (see [Live numbers](#live-numbers)) | reported (`totalCostUsd`) |
-| Relay running `opencode` | from the command and result.json (`tool`, `model`, `variant`) | from result.json | — (with `opencodeStats` on: from `opencode stats`) | reported by the relay, or from `opencode stats` with `opencodeStats` on; `$0 reported` under subscription plans |
-| Relay running `codex` | from the command and result.json, when present | from result.json | — | — |
-| Relay running another tool (a `relay*` script, or one under a `*delegate*` folder) | from the path, `--tool`, or result.json `tool` (`unknown` until then) | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise from the Bash result only | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — |
+| `claude` relay | from the command and result.json (`lane`, `model`, `effort`) | from result.json | yes, from result.json `usage`; live from its child report while it runs (see [Live numbers](#live-numbers)) | reported (`totalCostUsd`) |
+| `opencode` relay | from the command and result.json (`tool`, `model`, `variant`) | from result.json | — (with `opencodeStats` on: from `opencode stats`) | reported by the relay, or from `opencode stats` with `opencodeStats` on; `$0 reported` under subscription plans |
+| `codex` relay | from the command and result.json, when present | from result.json | — | — |
+| Other relay scripts (a `relay*` script, or one under a `*delegate*` folder) | from the path, `--tool`, or result.json `tool` (`unknown` until then) | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise from the Bash result only | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — |
 | Raw CLIs: `codex exec`, `opencode run`, `claude -p`, `gemini -p` | implementer, plus `--model`/`-m` if given literally | tool result (foreground) or background snapshots | — (`opencode run` with `opencodeStats` on: `opencode stats`; `claude -p` with watchducks loaded in it: its child report) | — (same sources as tokens) |
 | Other background shell | implementer `shell` | background snapshots | — | — |
 | HQ (main loop) | session model | — | yes, per request | estimated; shown separately, never in delegated totals |

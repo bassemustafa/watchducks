@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- README: a recorded demo, a sidebar clip and the station board, a how-it-works diagram, and a plain explanation of relays with a 12-line example relay. The reference sections are collapsible.
+- README: a recorded demo, a sidebar clip and the station board, a how-it-works diagram, and a plain explanation of delegate relays with a 12-line example. The reference sections are collapsible.
 - Contributing: issue forms (bug, feature, new agent CLI, question), a labelled triage flow, a PR template with type and testing sections, and automatic area labels on pull requests.
 
 ## [0.2.1] - 2026-10-15
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Sidebar (docked beside a fullscreen transcript) and inline band showing every operative: subagents, relays running claude, opencode or codex, other CLI agents, and background shells started by the session.
+- Sidebar (docked beside a fullscreen transcript) and inline band showing every operative: subagents, claude, opencode and codex delegate relays, other CLI agents, and background shells started by the session.
 - Per run: status, implementer, model, effort, tokens (uncached, output, cache read, cache write), cost with its source (reported or estimated), edits, and bugs found by reviewers.
 - Dossier view for one run, and a station board grouped by implementer and model, for this session or the last 30 days.
 - `/flock`, `/flock station`, `/flock clear` and `/flock purge` commands, and the `verdict` and `roster` tools.

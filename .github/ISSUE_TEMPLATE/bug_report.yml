@@ -64,9 +64,9 @@ body:
       label: Kind of run
       options:
         - label: Subagent
-        - label: Relay running claude
-        - label: Relay running opencode
-        - label: Relay running codex
+        - label: Claude relay
+        - label: opencode relay
+        - label: Codex relay
         - label: Other relay
         - label: Raw agent CLI
         - label: Background shell
