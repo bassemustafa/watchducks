@@ -1,0 +1,75 @@
+- name: "type: bug"
+  color: d73a4a
+  description: Something the ducks got wrong
+- name: "type: feature"
+  color: a2eeef
+  description: A new capability or an improvement
+- name: "type: docs"
+  color: 0075ca
+  description: README, guides and other docs
+- name: "type: chore"
+  color: c5def5
+  description: CI, tooling, dependencies or refactors with no behaviour change
+- name: "type: question"
+  color: d876e3
+  description: Asking how something works
+- name: "area: tracking"
+  color: 1d76db
+  description: "Which runs are seen: subagents, relays, agent CLIs, background shells"
+- name: "area: ui"
+  color: f9a03f
+  description: Sidebar, band, dossier, station board, motion, desktop rendering
+- name: "area: costs"
+  color: 0e8a16
+  description: Prices, the LiteLLM list, costMode and estimates
+- name: "area: adapters"
+  color: 5319e7
+  description: "Live numbers: opencode stats and child reports"
+- name: "area: privacy"
+  color: b60205
+  description: Changes what data is read, kept or sent; needs maintainer review
+- name: "area: platform"
+  color: bfdadc
+  description: Windows, the desktop app, mobile, VS Code, engine versions
+- name: "area: tooling"
+  color: ededed
+  description: CI, tests, scripts and releases
+- name: "area: accessibility"
+  color: f143ab
+  description: Barriers for people with disabilities
+- name: "status: needs triage"
+  color: fbca04
+  description: New; a maintainer has not looked yet
+- name: "status: needs info"
+  color: fef2c0
+  description: Waiting for details from the reporter
+- name: "status: accepted"
+  color: c2e0c6
+  description: Agreed; ready for a pull request
+- name: "status: in progress"
+  color: 0052cc
+  description: Someone is working on it
+- name: "status: blocked"
+  color: e99695
+  description: Waiting on something else
+- name: "priority: high"
+  color: d93f0b
+  description: Do this soon
+- name: "priority: low"
+  color: d4c5f9
+  description: Nice to have
+- name: good first issue
+  color: "7057ff"
+  description: Small, well-scoped, good for newcomers
+- name: help wanted
+  color: "008672"
+  description: The maintainers would welcome a pull request
+- name: duplicate
+  color: cfd3d7
+  description: Already reported or proposed
+- name: invalid
+  color: e4e669
+  description: Not a watchducks problem, or not reproducible
+- name: wontfix
+  color: ffffff
+  description: Out of scope for watchducks

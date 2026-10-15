@@ -1,0 +1,77 @@
+name: "🐛 Bug report"
+description: Report something watchducks gets wrong
+labels: ["type: bug", "status: needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > [!WARNING]
+        > Do not paste prompts, transcripts, code, file contents, or tokens or keys in this issue. Screenshots of the watchducks views are fine.
+        > Security problems go to SECURITY.md, not here. Do not report them in a public issue.
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: input
+    id: claude-version
+    attributes:
+      label: Claude Code version
+      placeholder: "Output of: claude --version"
+    validations:
+      required: true
+  - type: input
+    id: watchducks-version
+    attributes:
+      label: watchducks version
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - Terminal fullscreen
+        - Terminal inline
+        - Desktop app
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+  - type: checkboxes
+    id: run-kind
+    attributes:
+      label: Kind of run
+      options:
+        - label: Subagent
+        - label: Relay running claude
+        - label: Relay running opencode
+        - label: Relay running codex
+        - label: Other relay
+        - label: Raw agent CLI
+        - label: Background shell
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: Screenshot of the watchducks view (optional)
+      description: Drag an image here. Screenshots of the watchducks views are fine; do not paste prompts, transcripts or code.

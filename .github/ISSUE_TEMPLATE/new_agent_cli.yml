@@ -1,0 +1,50 @@
+name: "🦆 Teach the ducks a new agent CLI"
+description: Ask watchducks to recognize another agent CLI
+labels: ["type: feature", "area: tracking", "status: needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > [!WARNING]
+        > Use placeholders in every example. Do not paste real prompts, paths, tokens or keys.
+  - type: input
+    id: cli
+    attributes:
+      label: CLI name and link
+    validations:
+      required: true
+  - type: textarea
+    id: started
+    attributes:
+      label: How it is started
+      description: Example command lines, with placeholders instead of real prompts.
+      placeholder: 'mycli run --model <model> "<prompt>"'
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: flags
+    attributes:
+      label: Model and effort flags
+      description: Which flags choose the model and the effort, if any?
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Does it run in the background or the foreground?
+      options:
+        - Background
+        - Foreground
+        - Both
+        - Not sure
+  - type: textarea
+    id: usage
+    attributes:
+      label: Numbers-only usage source
+      description: Does the CLI expose tokens or cost through a command or file that holds only numbers? Which one?
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed any prompt text, paths or secrets from the examples
+          required: true

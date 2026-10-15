@@ -1,0 +1,50 @@
+"area: tracking":
+  - changed-files:
+      - any-glob-to-any-file:
+          - src/collect/**
+          - src/classify.ts
+          - src/relay-result.ts
+          - src/codename.ts
+
+"area: ui":
+  - changed-files:
+      - any-glob-to-any-file:
+          - src/ui/**
+          - hooks/**
+
+"area: costs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - src/price.ts
+          - src/cost.ts
+          - src/prices-litellm.ts
+          - scripts/update-prices.mjs
+
+"area: adapters":
+  - changed-files:
+      - any-glob-to-any-file:
+          - src/adapters/**
+
+"area: privacy":
+  - changed-files:
+      - any-glob-to-any-file:
+          - test/privacy.test.ts
+          - test/gating-allowlist.json
+          - types/index.d.ts
+          - SECURITY.md
+
+"area: tooling":
+  - changed-files:
+      - any-glob-to-any-file:
+          - .github/**
+          - scripts/**
+          - package.json
+          - package-lock.json
+          - tsconfig.json
+          - test/**
+
+"type: docs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "*.md"
+          - docs/**

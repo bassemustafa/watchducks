@@ -1,8 +1,18 @@
+## Type
+
+- [ ] Bug fix
+- [ ] Feature
+- [ ] Docs
+- [ ] Chore
+- [ ] Tests
+
 ## Summary
 
 ## Linked issue
 
 Closes #
+
+## How I tested it
 
 ## Checklist
 
@@ -14,7 +24,7 @@ Closes #
 
 - [ ] No new reads of message, prompt, tool input or output, or file content
 - [ ] No new stored or logged fields beyond allow-listed metadata
-- [ ] No network calls
+- [ ] No new network calls (the daily price list GET is the only one)
 - [ ] `test/privacy.test.ts` passes
 - [ ] Any new gating hook is in `test/gating-allowlist.json`, with the reason given in the summary
 

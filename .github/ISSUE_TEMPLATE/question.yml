@@ -1,0 +1,16 @@
+name: "❓ Question"
+description: Ask how something works
+labels: ["type: question", "status: needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > [!WARNING]
+        > Do not paste prompts, transcripts, code, file contents, or tokens or keys in this issue. Screenshots of the watchducks views are fine.
+        > Security problems go to SECURITY.md, not here. Do not report them in a public issue.
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+    validations:
+      required: true

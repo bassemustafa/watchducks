@@ -1,0 +1,29 @@
+name: "✨ Feature request"
+description: Suggest a change or addition. For larger features, open this issue before writing code.
+labels: ["type: feature", "status: needs triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: Describe what you are trying to do and what gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The proposal
+      description: Describe the change you would like.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: data
+    attributes:
+      label: Data question
+      description: Does this need any new data about runs? If yes, which fields, and are they metadata only?
+    validations:
+      required: true
