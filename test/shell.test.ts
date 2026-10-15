@@ -4,7 +4,7 @@ import { expect, test } from 'claude-code/testing'
 import type { Ledger } from '../types'
 import { emptyLedger } from '../src/ledger'
 
-const RELAY = 'node x/opencode-delegate/scripts/relay.mjs --lane debate --out-dir /tmp/o1'
+const RELAY = 'node x/opencode-handoff/scripts/relay.mjs --lane debate --out-dir /tmp/o1'
 
 // The test's `$` has no `state` noun: an observer beneath the plugin sees every ledger the plugin writes.
 function watchLedger(on: On): () => Ledger {

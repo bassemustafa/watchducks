@@ -6,7 +6,7 @@ import { reduce, type Action } from '../src/ledger'
 import { PRICES } from '../src/price'
 import { INITIAL_UI } from '../src/state'
 
-const RELAY_CALL = { tool: 'Bash', tool_use_id: 'u1', run_in_background: true, command: 'node x/opencode-delegate/scripts/relay.mjs --lane debate --out-dir /tmp/o1' }
+const RELAY_CALL = { tool: 'Bash', tool_use_id: 'u1', run_in_background: true, command: 'node x/opencode-handoff/scripts/relay.mjs --lane debate --out-dir /tmp/o1' }
 
 // The test's `$` has no `state` noun: an observer beneath the plugin sees every ui value the plugin writes.
 function watchUi(on: On): () => UiState {

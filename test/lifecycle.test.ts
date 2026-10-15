@@ -82,7 +82,7 @@ test('hot reload keeps the runs and the relay poll still updates them', async ($
     tool: 'Bash',
     tool_use_id: 'l2',
     run_in_background: true,
-    command: 'node x/opencode-delegate/scripts/relay.mjs --out-dir /tmp/l',
+    command: 'node x/opencode-handoff/scripts/relay.mjs --out-dir /tmp/l',
   } as never)
   await $.session.start(START) // hot reload: timers are rebuilt from state
   await clock.advance(3000)
