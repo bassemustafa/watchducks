@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-15
+
 ### Fixed
 
 - Models used through a provider that LiteLLM does not list, such as opencode's `opencode-go`, are now priced from their maker's own entry (for example GLM from `zai`, Qwen from `dashscope`, Kimi from `moonshot`) instead of showing no estimate or a reseller's price.
+
+### Changed
+
+- The bundled LiteLLM price list is refreshed to 2026-10-15.
 
 ## [0.2.0] - 2026-10-14
 
@@ -42,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Price table dated 2026-10-06, with `priceOverrides`.
 - CI: validate and tests on Claude Code 2.1.289 (the desktop app's engine) and 2.1.295, plus the gating-hook allow-list check on 2.1.295.
 
-[Unreleased]: https://github.com/bassemustafa/watchducks/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/bassemustafa/watchducks/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/bassemustafa/watchducks/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bassemustafa/watchducks/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bassemustafa/watchducks/releases/tag/v0.1.0
