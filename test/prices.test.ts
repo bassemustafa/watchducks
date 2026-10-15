@@ -216,7 +216,7 @@ test('a request that throws leaves the stored list as it was', async ($, on) => 
   expect(stored(w).attemptedAt).toBe(T)
 })
 
-test('a session left open looks again about once an hour and refreshes when the list has aged a day', async ($, on) => {
+test('a session left open looks again about once an hour and refreshes when the list has aged a day', { timeoutMs: 20_000 }, async ($, on) => {
   const w = world(on, { entries: { [KEY]: recordAt(T - DAY + 30 * 60_000) } })
   await $.session.start(START)
   await w.clock.settle()

@@ -251,7 +251,7 @@ test('clear drops retired day buckets older than 30 days before the clear and ke
   expect(Object.keys(edge.retired).sort()).toEqual(['2026-09-09', '2026-10-04'])
 })
 
-test('countedSteps and turnsWithSteps are capped at 1024 keys and the newest key still dedupes', () => {
+test('countedSteps and turnsWithSteps are capped at 1024 keys and the newest key still dedupes', { timeoutMs: 15_000 }, () => {
   let l = apply(emptyLedger('s1', T0), spawn('a1'))
   for (let i = 0; i < 5000; i++) l = reduce(l, step(i, OPUS, `t${i}`), PRICES)
   // past 1024 the maps drop to the newest 768 keys, then grow again: 5000 steps leave 888

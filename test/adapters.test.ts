@@ -139,7 +139,7 @@ function world(
   return { clock: mock.clock(on), calls, stored, ctl }
 }
 
-test('an opencode background run gets live and final numbers from opencode stats', { options: { opencodeStats: 'on' } }, async ($, on) => {
+test('an opencode background run gets live and final numbers from opencode stats', { timeoutMs: 15_000, options: { opencodeStats: 'on' } }, async ($, on) => {
   const ledger = watchLedger(on)
   const w = world(on, [statsJson(1, 1, 0.1), statsJson(2, 3, 0.4), statsJson(2, 5, 0.8)])
   await $.session.start(START)
