@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Models used through a provider that LiteLLM does not list, such as opencode's `opencode-go`, are now priced from their maker's own entry (for example GLM from `zai`, Qwen from `dashscope`, Kimi from `moonshot`) instead of showing no estimate or a reseller's price.
+
 ## [0.2.0] - 2026-10-14
 
 ### Added

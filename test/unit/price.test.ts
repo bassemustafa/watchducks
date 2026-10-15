@@ -102,6 +102,30 @@ test('litellmRates: lower-cases, drops [1m] and an @variant, and is safe for odd
   expect(litellmRates('constructor', undefined, table)).toBeNull()
 })
 
+test('litellmRates: a model the used provider does not list is priced by its maker', () => {
+  // a reseller provider: the maker's entry wins over an entry in the generic provider order
+  expect(litellmRates('opencode-go/glm-5.3', 'opencode-go', { 'zai/glm-5.3': T(1), 'azure_ai/glm-5.3': T(2) })).toEqual(rates(1))
+  expect(litellmRates('opencode-go/kimi-k3', undefined, { 'moonshot/kimi-k3': T(1), 'fireworks_ai/kimi-k3': T(2) })).toEqual(rates(1))
+  expect(litellmRates('opencode-go/qwen3.8-max', undefined, { 'dashscope/qwen3.8-max': T(3) })).toEqual(rates(3))
+  // the key as given, provider/id and the bare id all beat the maker
+  expect(litellmRates('opencode-go/glm-5.3', undefined, { 'opencode-go/glm-5.3': T(4), 'zai/glm-5.3': T(1) })).toEqual(rates(4))
+  expect(litellmRates('x/glm-5.3', 'groq', { 'groq/glm-5.3': T(5), 'zai/glm-5.3': T(1) })).toEqual(rates(5))
+  expect(litellmRates('opencode-go/glm-5.3', undefined, { 'glm-5.3': T(6), 'zai/glm-5.3': T(1) })).toEqual(rates(6))
+  // a name no maker claims falls to the provider order as before
+  expect(litellmRates('gh/other-1', undefined, { 'zai/other-1': T(1), 'azure_ai/other-1': T(2) })).toEqual(rates(2))
+})
+
+test('litellmRates: the bare name after the last slash, then its maker', () => {
+  expect(litellmRates('openrouter/openai/gpt-6-sol', undefined, { 'gpt-6-sol': T(1) })).toEqual(rates(1))
+  expect(litellmRates('openrouter/moonshotai/kimi-k3', undefined, { 'moonshot/kimi-k3': T(1), 'fireworks_ai/kimi-k3': T(2) })).toEqual(rates(1))
+  // the id (after the first slash) still comes before the name
+  expect(litellmRates('openrouter/openai/gpt-6-sol', undefined, { 'openai/gpt-6-sol': T(2), 'gpt-6-sol': T(1) })).toEqual(rates(2))
+})
+
+test('litellmRates: upper case and an @variant still reach the maker', () => {
+  expect(litellmRates('OpenCode-Go/GLM-5.3@high', undefined, { 'zai/glm-5.3': T(1) })).toEqual(rates(1))
+})
+
 test('openai/gpt-6.1-sol resolves through the provider order to azure_ai only when openai/ and the bare id are absent', () => {
   const sol = { 'azure_ai/gpt-6.1-sol': T(2) }
   expect(litellmRates('openai/gpt-6.1-sol', undefined, sol)).toEqual(rates(2))

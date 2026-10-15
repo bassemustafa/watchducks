@@ -63,16 +63,38 @@ const PROVIDER_ORDER = [
   'bedrock', 'together_ai', 'fireworks_ai',
 ] as const
 
+/** Model-name prefixes and the maker's own LiteLLM provider; the first match wins. */
+const MAKERS: ReadonlyArray<readonly [RegExp, string]> = Object.freeze([
+  [/^glm-/, 'zai'],
+  [/^(qwen|qwq)/, 'dashscope'],
+  [/^(kimi-|moonshot-)/, 'moonshot'],
+  [/^deepseek-/, 'deepseek'],
+  [/^minimax-/, 'minimax'],
+  [/^grok-/, 'xai'],
+  [/^(mistral|devstral|codestral|magistral|ministral|pixtral)/, 'mistral'],
+  [/^(gemini-|gemma-)/, 'gemini'],
+] as const)
+
 /**
  * Rates from the bundled LiteLLM snapshot. `model` is `provider/id` or a bare id; a trailing `[1m]` and an `@variant` are
- * dropped. Tried in order: the key as given, `${provider}/${id}` when a provider is known, the bare id, then the id under
- * each provider of PROVIDER_ORDER. No other matching.
+ * dropped. Tried in order: the key as given, `${provider}/${id}` when a provider is known, the bare id (after the first
+ * `/`), the bare name (after the last `/`) when it differs from the id, the name under its maker's provider when MAKERS
+ * knows the name, then the id under each provider of PROVIDER_ORDER. No other matching.
  */
 export function litellmRates(model: string, provider?: string, table: LitellmTable = LITELLM): Rates | null {
   const key = model.toLowerCase().replace(/\[1m\]$/, '').replace(/@.*$/, '')
   const id = key.slice(key.indexOf('/') + 1)
   if (id === '') return null
-  const tries = [key, ...(provider ? [`${provider.toLowerCase()}/${id}`] : []), id, ...PROVIDER_ORDER.map(p => `${p}/${id}`)]
+  const name = key.slice(key.lastIndexOf('/') + 1)
+  const maker = MAKERS.find(([re]) => re.test(name))?.[1]
+  const tries = [
+    key,
+    ...(provider ? [`${provider.toLowerCase()}/${id}`] : []),
+    id,
+    ...(name !== id ? [name] : []),
+    ...(maker ? [`${maker}/${name}`] : []),
+    ...PROVIDER_ORDER.map(p => `${p}/${id}`),
+  ]
   for (const k of tries) {
     const row = Object.hasOwn(table, k) ? table[k] : undefined
     if (row) return { input: row[0], output: row[1], cacheRead: row[2], cacheWrite: row[3] }

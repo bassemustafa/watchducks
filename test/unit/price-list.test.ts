@@ -253,7 +253,11 @@ const COMMON: ReadonlyArray<readonly [model: string, key: string]> = [
   ['gemini-2.5-pro', 'gemini-2.5-pro'],
   ['deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-pro'],
   ['opencode-go/deepseek-v4.1-flash', 'azure_ai/deepseek-v4.1-flash'],
-  ['opencode-go/kimi-k3', 'fireworks_ai/kimi-k3'],
+  ['opencode-go/kimi-k3', 'moonshot/kimi-k3'],
+  ['opencode-go/glm-5.3', 'zai/glm-5.3'],
+  ['opencode-go/glm-5.3-flash', 'zai/glm-5.3-flash'],
+  ['opencode-go/qwen3.8-flash', 'dashscope/qwen3.8-flash'],
+  ['opencode-go/qwen3.8-max', 'dashscope/qwen3.8-max'],
   ['mistral/devstral-latest', 'mistral/devstral-latest'],
   ['xai/grok-4.20', 'xai/grok-4.20'],
 ]
