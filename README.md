@@ -1,18 +1,167 @@
-# watchducks
+<h1 align="center">🦆 watchducks</h1>
 
-A flock of spy ducks watching every subagent, relay and background run your Claude Code session starts.
+<p align="center"><b>Your agents went undercover. The ducks are watching.</b></p>
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![CI](https://github.com/bassemustafa/watchducks/actions/workflows/ci.yml/badge.svg)](https://github.com/bassemustafa/watchducks/actions/workflows/ci.yml)
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <a href="https://github.com/bassemustafa/watchducks/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/bassemustafa/watchducks/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/bassemustafa/watchducks/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/bassemustafa/watchducks"></a>
+  <img alt="Claude Code mod" src="https://img.shields.io/badge/Claude_Code-mod-orange">
+  <img alt="privacy: numbers only" src="https://img.shields.io/badge/privacy-numbers_only-brightgreen">
+</p>
 
-watchducks is an open-source Claude Code mod (a function-hooks plugin). It tracks the work your session hands to other agents: Agent-tool subagents, delegate relay runs, raw implementer CLIs and background shell commands. For each run it shows status, model, effort, tokens, cache use, cost and review outcome. It reads only numbers, identifiers and enums. It never reads your prompts or answers (see [Privacy](#privacy)).
+<p align="center">
+  <img src=".github/media/demo.gif" alt="A real session: one prompt deploys three Haiku subagents, a background sleep and an opencode run. The sidebar docks, the radar sweeps, operative cards go from IN FIELD to DEBRIEFED or RETURNED with stamps, spend splits between claude-code and opencode, then /flock station shows the station board." width="100%">
+</p>
 
-## What you see
+watchducks is an open-source Claude Code mod (a function-hooks plugin). It tracks every run your session hands off: Agent-tool subagents, relay runs, raw agent CLIs and background shell commands. For each run it shows status, model, effort, tokens, cache use, cost and review outcome. It reads only numbers, identifiers and enums. It never reads your prompts or answers (see [Privacy](#privacy)).
+
+## 🕵️ Why ducks?
+
+You fire off subagents, relays, agent CLIs and background shells. They scatter. Then the questions start: who is still running, what did it cost, which model did the work, did anyone review it? watchducks is the stakeout. One flock, one board, no wandering off.
+
+## 🚀 Quickstart
+
+Requires Claude Code 2.1.289 or newer (2.1.289 is the version the Claude desktop app bundles).
+
+In a shell:
+
+```sh
+claude plugin install watchducks --marketplace bassemustafa/watchducks
+```
+
+Inside Claude Code:
+
+```text
+/plugin install watchducks --marketplace bassemustafa/watchducks
+```
+
+Pass settings at install with `--config key=value`, for example `--config motion=off`, or change them later from the `/plugin` menu.
+
+The docked sidebar needs the fullscreen layout. Elsewhere the sidebar opens inline and the band is shown.
+
+Then just work. The sidebar docks itself when the first operative deploys; `/flock` opens it any time.
+
+## 🎒 What you get
+
+- 🦆 A sidebar with a pixel-art duck in a fedora and shades, and a radar with one blip per running operative
+- 📈 Live numbers: status, model, effort, tokens, cache and cost, while a run is still going
+- 💸 Costs for any model, marked `est.` when estimated from tokens
+- 🗂️ A station board with 30-day history
+- 📄 A dossier for every operative
+- 🎗️ A one-line band above the prompt when the sidebar is not shown
+- ✨ Motion in the terminal sidebar (pulses, stamps, counting numbers, a blinking duck)
+- 🖥️ Desktop app support
+- ✅ A `verdict` tool, so reviews are recorded, not guessed
+- 🔒 Privacy: numbers, identifiers and enums only. No telemetry.
+
+<table>
+  <tr>
+    <td align="center"><img src=".github/media/sidebar.gif" alt="The sidebar during a run: duck, radar, counters, signal, spend and operative cards" width="300"></td>
+    <td align="center"><img src=".github/media/station.png" alt="The station board: claude-code with claude-haiku-5-5, opencode with openai/gpt-6-luna, and shell" width="380"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>The sidebar, live: radar sweeping, cards going from IN FIELD to DEBRIEFED.</sub></td>
+    <td align="center"><sub>The station board: one row per implementer × model.</sub></td>
+  </tr>
+</table>
+
+| Terminal | Desktop app |
+|---|---|
+| <img src=".github/media/terminal.png" alt="The flock sidebar in the terminal: duck and radar, counters, signal, and two relay cards, a claude relay and an opencode relay, both debriefed with reported costs" width="380"> | <img src=".github/media/desktop.png" alt="The flock sidebar in the desktop app: vector header with radar, counters, signal bars, a background shell in field and a debriefed subagent" width="380"> |
+
+## 🛰️ How it works
+
+```mermaid
+flowchart LR
+  S["Your Claude Code session"] --> A["Agent-tool subagents"]
+  S --> R["Relay scripts"]
+  S --> C["Raw CLIs: claude -p, opencode run, codex exec, gemini -p"]
+  S --> B["Background shells"]
+  A --> H["watchducks hooks (numbers only)"]
+  R --> H
+  C --> H
+  B --> H
+  H --> L[("The ledger")]
+  L --> U["Sidebar"]
+  L --> BA["Band"]
+  L --> ST["Station board"]
+  L --> HI["History"]
+  RJ["result.json from relays"] -.-> H
+  OS["opencode stats (opt-in)"] -.-> H
+  CR["Child reports from Claude children"] -.-> H
+  LL["LiteLLM price list (daily)"] -.-> H
+```
+
+watchducks hooks into the events your session already produces. Each hook keeps only numbers, identifiers and enums, and writes them to a ledger. The sidebar, the band, the station board and the 30-day history all read from that ledger. Side inputs fill in what hooks cannot see: a relay's `result.json`, `opencode stats` (opt-in), reports from Claude children, and LiteLLM's price list, refreshed daily.
+
+## 🔁 What's a relay?
+
+A relay is any small wrapper script that launches an agent CLI for you, often in the background. When the agent finishes, it leaves a `result.json` with the outcome. People write relays to hand work to other agents, to run them in parallel, or to keep a record.
+
+watchducks needs no particular relay. It recognizes a relay from the command line (a script whose file name starts with `relay`, or a script inside a folder whose name contains `delegate`, run directly or through `node`, `bun`, `deno`, `tsx`, `python`, `bash` or `sh`), picks up the flags listed in [Privacy](#privacy), and reads the result file if it follows the relay result format.
+
+**Build your own in 12 lines:**
+
+```bash
+#!/usr/bin/env bash
+# relay.sh --out-dir DIR --model MODEL -- PROMPT
+# Runs an agent CLI, then leaves DIR/result.json for whoever is watching.
+while [ $# -gt 0 ]; do case "$1" in
+  --out-dir) out=$2; shift 2 ;; --model) model=$2; shift 2 ;; --) shift; break ;; *) break ;;
+esac; done
+mkdir -p "$out"; started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+opencode run -m "$model" "$*"; code=$?
+[ "$code" -eq 0 ] && status=completed || status=failed
+cat > "$out/result.json" <<EOF
+{"schema":"delegate-relay.result.v1","tool":"opencode","model":"$model","status":"$status","exitCode":$code,
+ "startedAt":"$started","finishedAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","workdir":"$PWD"}
+EOF
+```
+
+Call it:
+
+```sh
+bash relay.sh --out-dir /tmp/duck-1 --model openai/gpt-6-luna -- "write the tests"
+```
+
+- The card appears as soon as the command starts. When the file lands, status, model and times come from it.
+- Add `usage` (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`) and `cost` or `totalCostUsd` to get tokens and cost.
+- `status` values: `completed`, `failed`, `timeout`, `aborted`. `tool` may be `opencode`, `claude`, `codex` or `gemini`.
+- Everything that is read is listed under `result.json` in [Privacy](#privacy). The out-dir must be under the system temp dir, `/tmp`, the session root or a `relayRoots` entry. Without `--out-dir`, discovery finds the file.
+
+## 🔤 Spy lingo
+
+The ducks talk in code. Here's the decoder ring.
+
+| Term | Plain meaning |
+|---|---|
+| operative | a tracked run |
+| IN FIELD | running |
+| DEBRIEFED | done |
+| WENT DARK | failed |
+| BURNED | stopped |
+| RETURNED | ended, outcome unknown |
+| OFF RADAR | no signal |
+| handler | reviewer |
+| vetted | reviewed (only a recorded verdict counts) |
+| leaks | bugs |
+| patches | edit calls |
+| HQ | the main loop |
+| codename | a name for a run, such as `GOLDENEYE-7Q`: a duck species plus a two-character suffix |
+
+## 📚 The field manual
+
+<a id="what-you-see"></a>
+<details>
+<summary><b>📋 What you see</b></summary>
+
+<br>
 
 **The sidebar** (`/flock`). Top to bottom:
 
 1. **Header:** a pixel-art duck in a fedora and shades, a radar with one blip per running operative, and the title THE FLOCK.
-2. **Counters:** IN FIELD, DEBRIEFED and WENT DARK counts. RETURNED and OFF RADAR appear when they are not zero. (Status words are explained in the [Glossary](#glossary).)
+2. **Counters:** IN FIELD, DEBRIEFED and WENT DARK counts. RETURNED and OFF RADAR appear when they are not zero. (Status words are explained in the [Glossary](#-spy-lingo).)
 3. **Signal:** a tokens-per-minute sparkline for the last 30 minutes, total tokens, a cache hit bar, spend by implementer, and a dim line for HQ (the main loop).
 4. **Operative cards:** one two-line card per tracked run (an "operative"). Line 1: status dot, codename, implementer · model · effort. Line 2: elapsed time, tokens and cost, or the review line. Press a card to open its dossier.
 5. **Station board:** see below.
@@ -53,13 +202,14 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
 🦆 FLOCK  ▸ 2 in field · 3 debriefed · 1 dark   412k tok · 61% cache · $1.84   /flock
 ```
 
-| Terminal | Desktop app |
-|---|---|
-| <img src=".github/media/terminal.png" alt="The flock sidebar in the terminal: duck and radar, counters, signal, and two relay cards, a claude relay and an opencode relay, both debriefed with reported costs" width="380"> | <img src=".github/media/desktop.png" alt="The flock sidebar in the desktop app: vector header with radar, counters, signal bars, a background shell in field and a debriefed subagent" width="380"> |
-
 **Motion** runs only in the terminal sidebar. The status dot of each running card pulses. When a run ends, its card shows a stamp: `✦ DEBRIEFED ✦`, `✕ WENT DARK ✕` or `✕ BURNED ✕`. Token and cost figures count up to their new value over about 0.6 s. The header duck blinks while anything is in field. The desktop app and the band do not animate. The `motion` setting turns all of it off.
 
-## Per run
+</details>
+
+<details>
+<summary><b>🔎 Per run</b></summary>
+
+<br>
 
 | Field | Meaning |
 |---|---|
@@ -74,53 +224,21 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
 
 **"—"** means the value is not available for that source (for example, tokens for an opencode relay with `opencodeStats` off). **"?"** means the value should exist but is unknown (for example, an unpriced model, or a result.json not read yet). A missing value is never shown as 0.
 
-## Glossary
+</details>
 
-| Term | Plain meaning |
-|---|---|
-| operative | a tracked run |
-| IN FIELD | running |
-| DEBRIEFED | done |
-| WENT DARK | failed |
-| BURNED | stopped |
-| RETURNED | ended, outcome unknown |
-| OFF RADAR | no signal |
-| handler | reviewer |
-| vetted | reviewed (only a recorded verdict counts) |
-| leaks | bugs |
-| patches | edit calls |
-| HQ | the main loop |
-| codename | a name for a run, such as `GOLDENEYE-7Q`: a duck species plus a two-character suffix |
+<a id="coverage"></a>
+<details>
+<summary><b>🛰️ Coverage</b></summary>
 
-## Install
-
-Requires Claude Code 2.1.289 or newer (2.1.289 is the version the Claude desktop app bundles).
-
-In a shell:
-
-```sh
-claude plugin install watchducks --marketplace bassemustafa/watchducks
-```
-
-Inside Claude Code:
-
-```text
-/plugin install watchducks --marketplace bassemustafa/watchducks
-```
-
-Pass settings at install with `--config key=value`, for example `--config motion=off`, or change them later from the `/plugin` menu.
-
-The docked sidebar needs the fullscreen layout. Elsewhere the sidebar opens inline and the band is shown.
-
-## Coverage
+<br>
 
 | Source | Identity | Status | Tokens & cache | Cost |
 |---|---|---|---|---|
 | Agent-tool subagent | agent type; model and effort seen per request | from the spawn result, turn end and agent list | yes, per request | estimated from tokens (see [Costs](#costs)) |
-| `claude` relay | from the command and result.json (`lane`, `model`, `effort`) | from result.json | yes, from result.json `usage`; live from its child report while it runs (see [Live numbers](#live-numbers)) | reported (`totalCostUsd`) |
-| `opencode` relay | from the command and result.json (`tool`, `model`, `variant`) | from result.json | — (with `opencodeStats` on: from `opencode stats`) | reported by the relay, or from `opencode stats` with `opencodeStats` on; `$0 reported` under subscription plans |
-| `codex` relay | from the command and result.json, when present | from result.json | — | — |
-| Other relay scripts (a `relay*` script, or one under a `*delegate*` folder) | from the path, `--tool`, or result.json `tool` (`unknown` until then) | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise from the Bash result only | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — |
+| Relay running `claude` | from the command and result.json (`lane`, `model`, `effort`) | from result.json | yes, from result.json `usage`; live from its child report while it runs (see [Live numbers](#live-numbers)) | reported (`totalCostUsd`) |
+| Relay running `opencode` | from the command and result.json (`tool`, `model`, `variant`) | from result.json | — (with `opencodeStats` on: from `opencode stats`) | reported by the relay, or from `opencode stats` with `opencodeStats` on; `$0 reported` under subscription plans |
+| Relay running `codex` | from the command and result.json, when present | from result.json | — | — |
+| Relay running another tool (a `relay*` script, or one under a `*delegate*` folder) | from the path, `--tool`, or result.json `tool` (`unknown` until then) | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise from the Bash result only | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — |
 | Raw CLIs: `codex exec`, `opencode run`, `claude -p`, `gemini -p` | implementer, plus `--model`/`-m` if given literally | tool result (foreground) or background snapshots | — (`opencode run` with `opencodeStats` on: `opencode stats`; `claude -p` with watchducks loaded in it: its child report) | — (same sources as tokens) |
 | Other background shell | implementer `shell` | background snapshots | — | — |
 | HQ (main loop) | session model | — | yes, per request | estimated; shown separately, never in delegated totals |
@@ -129,9 +247,8 @@ The docked sidebar needs the fullscreen layout. Elsewhere the sidebar opens inli
 
 Runs the session did not start are not tracked.
 
-### Live numbers
-
-Numbers while a run is still going, not only when it ends:
+<a id="live-numbers"></a>
+**Live numbers.** Numbers while a run is still going, not only when it ends:
 
 | Run | Live numbers |
 |---|---|
@@ -141,7 +258,12 @@ Numbers while a run is still going, not only when it ends:
 | Relay with `result.json` only | final numbers only |
 | codex, gemini | status and elapsed time only |
 
-## Commands and tools
+</details>
+
+<details>
+<summary><b>⌨️ Commands and tools</b></summary>
+
+<br>
 
 | Command | Effect |
 |---|---|
@@ -159,7 +281,12 @@ Tools Claude can call:
 
 Example: *"Record a verdict: SMEW-1A reviewed GOLDENEYE-7Q, 2 bugs, 5 edits."*
 
-## Settings
+</details>
+
+<details>
+<summary><b>⚙️ Settings</b></summary>
+
+<br>
 
 | Key | Values | Default | Meaning |
 |---|---|---|---|
@@ -182,7 +309,15 @@ Example: *"Record a verdict: SMEW-1A reviewed GOLDENEYE-7Q, 2 bugs, 5 edits."*
 { "claude-sonnet-5-5": { "input": 2, "output": 10, "cacheRead": 0.2, "cacheWrite": 2.5 } }
 ```
 
-## Privacy
+</details>
+
+<a id="privacy"></a>
+**🔒 The flock watches the runs, never the words.** No telemetry.
+
+<details>
+<summary><b>🔒 Privacy</b></summary>
+
+<br>
 
 watchducks keeps only numbers, identifiers and enums. It never inspects, copies, displays, logs or stores any content:
 
@@ -253,7 +388,13 @@ watchducks makes no other network request. **No telemetry.**
 
 See [SECURITY.md](SECURITY.md) for the full data inventory and threat model.
 
-## Costs
+</details>
+
+<a id="costs"></a>
+<details>
+<summary><b>💸 Costs</b></summary>
+
+<br>
 
 Estimated costs are priced from tokens, per million tokens, in this order: `priceOverrides`; watchducks' built-in table for Claude models, dated 2026-10-06; then LiteLLM's public price list, which is the copy fetched by the daily refresh or, until one succeeds, the copy bundled with this version (dated 2026-10-15). So a model that LiteLLM lists gets an estimate even when no cost was reported. When the provider a model ran through is not in LiteLLM's list (for example `opencode-go/glm-5.3`), the price of the model's own maker is used (`zai/glm-5.3`). Claude cache writes are priced at the 5-minute rate. LiteLLM rates are base-tier only (see [Known limits](#known-limits)).
 
@@ -267,30 +408,52 @@ Estimates are list-price estimates, not invoices or subscription charges. Estima
 
 A run's cost is one figure: a reported cost and an estimate are never added together. A model with no price shows "?" and the run is flagged as partial.
 
-## Known limits
+</details>
+
+<a id="known-limits"></a>
+<details>
+<summary><b>🚧 Known limits</b></summary>
+
+<br>
 
 - **Long-context prices are not applied to LiteLLM rates.** watchducks sees a run's summed tokens, not single requests, so the base-tier rate is used. Estimates for very long requests can therefore be low.
 - **Shared numbers can drift.** When one run of a shared group later gets exact figures from a relay's `result.json`, it shows those, and the others keep their even-share estimates. The totals can then differ from opencode's own totals by that run's estimation error. The other runs stay marked approximate.
 - **A run cleared early loses its last interval.** If `/flock clear` removes a run before its final snapshot, the run keeps the figures it had. The growth of its last interval is not counted, and no other run takes it.
-- **Claude children need watchducks loaded.** A Claude child writes a report only if watchducks loads in it. That happens when watchducks is installed at user scope, or, in development, when it is named in `CLAUDE_CODE_PLUGIN_DIRS`. Without it, the parent still tracks the child as a card with status and duration, but the card has no live numbers. The parent also cannot see that child's own delegated processes. This limit applies only to Claude children. opencode stats and the v0.1 tracking need nothing inside other agents.
+- **Claude children need watchducks loaded.** A Claude child writes a report only if watchducks loads in it. That happens when watchducks is installed at user scope, or, in development, when it is named in `CLAUDE_CODE_PLUGIN_DIRS`. Without it, the parent still tracks the child as a card with status and duration, but the card has no live numbers. The parent also cannot see that child's own delegated processes. This limit applies only to Claude children. opencode stats and the rest of the tracking need nothing inside other agents.
 - **The parent's opencode stats can count a child's spend twice.** The parent's own opencode stats also see a child's opencode growth in the same folder at the same time, so that spend is counted twice. The parent's card is marked approximate.
 
-## Not yet
+</details>
 
-Not in v0.2:
+<details>
+<summary><b>🗺️ Not yet</b></summary>
+
+<br>
+
+Not yet (as of v0.2.1):
 
 - a mobile and VS Code sidebar (they get the band only for now)
-- relay result files on native Windows (v0.1 reads them on macOS, Linux and WSL)
+- relay result files on native Windows (read today on macOS, Linux and WSL)
 - more CLIs
 
-## Development
+</details>
+
+## 🤝 Join the flock
+
+Want to help? Read [CONTRIBUTING.md](CONTRIBUTING.md), then pick your mission:
+
+- 🐛 [Report a bug](https://github.com/bassemustafa/watchducks/issues/new?template=bug_report.yml)
+- ✨ [Suggest a feature](https://github.com/bassemustafa/watchducks/issues/new?template=feature_request.yml)
+- 🦆 [Teach the ducks a new agent CLI](https://github.com/bassemustafa/watchducks/issues/new?template=new_agent_cli.yml) (the most wanted one)
+- 🌱 New here? Grab a [`good first issue`](https://github.com/bassemustafa/watchducks/labels/good%20first%20issue).
+
+To work on watchducks:
 
 ```sh
 npm ci
 claude --plugin-dir .
 ```
 
-Gates:
+Every change passes four gates:
 
 ```sh
 claude plugin validate .
@@ -301,6 +464,10 @@ npm run check:gating
 
 `tsc` needs the engine's type declarations, which Claude Code writes when you load the mod with `--plugin-dir`. CI does not run it. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+If the ducks saved you from a surprise bill, toss them a ⭐.
+
 ## License
 
 MIT © 2026 bassemustafa. See [LICENSE](LICENSE). Also: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), [SECURITY.md](SECURITY.md), [CHANGELOG.md](CHANGELOG.md).
+
+<p align="center"><sub>🦆 no ducks were harmed in the making of this mod</sub></p>
