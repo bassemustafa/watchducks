@@ -8,6 +8,7 @@ import {
   PRICES_KEY,
   estimateDetail,
   fetchedPrices,
+  litellmRates,
   parsePriceRecord,
   pricedBy,
   projectLitellm,
@@ -239,4 +240,29 @@ test('runCost names the price list date for a LiteLLM estimate, shortening to fi
   // an own price (override or Claude table) names no list
   const own = { table: { 'own/m': { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 } }, mode: 'auto' as const, fetched: FETCHED, fetchedAt: 1 }
   expect(runCost(aRun('own/m'), own, true)).toBe('$1.00 est.')
+})
+
+// Models agent CLIs commonly run, and the LiteLLM entry each must price from. After `node scripts/update-prices.mjs`, a
+// failure here means a model lost its price (or moved to another entry) before a user sees "?".
+const COMMON: ReadonlyArray<readonly [model: string, key: string]> = [
+  ['openai/gpt-6.1-sol', 'gpt-6.1-sol'],
+  ['openai/gpt-6-sol', 'gpt-6-sol'],
+  ['openai/gpt-6-luna', 'gpt-6-luna'],
+  ['openai/gpt-5.6-sol', 'gpt-5.6-sol'],
+  ['google/gemini-3.8-flash', 'gemini-3.8-flash'],
+  ['gemini-2.5-pro', 'gemini-2.5-pro'],
+  ['deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-pro'],
+  ['opencode-go/deepseek-v4.1-flash', 'azure_ai/deepseek-v4.1-flash'],
+  ['opencode-go/kimi-k3', 'fireworks_ai/kimi-k3'],
+  ['mistral/devstral-latest', 'mistral/devstral-latest'],
+  ['xai/grok-4.20', 'xai/grok-4.20'],
+]
+
+test('common agent models keep a price in the bundled list', () => {
+  for (const [model, key] of COMMON) {
+    const row = Object.hasOwn(LITELLM, key) ? LITELLM[key]! : null
+    expect(row ? model : `${model}: no entry ${key}`).toBe(model)
+    const rates = row ? { input: row[0], output: row[1], cacheRead: row[2], cacheWrite: row[3] } : null
+    expect({ model, rates: litellmRates(model) }).toEqual({ model, rates })
+  }
 })
