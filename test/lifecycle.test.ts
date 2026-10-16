@@ -312,7 +312,8 @@ test('a running card on the terminal gets radar, dot and duck blits from the ani
   const { clock, keys } = await motionWorld($, on, 'terminal')
   await clock.advance(1000)
   expect(keys).toContain('radar')
-  expect(keys).toContain('dot:l1')
+  // the dot belongs to the group card the run is in, keyed by a hash of the group id
+  expect(keys.some(k => /^dot:g[0-9a-f]+$/.test(k))).toBe(true)
   expect(keys).toContain('duck')
 })
 
@@ -335,7 +336,7 @@ test('a stamp is blitted while it reveals and stops after STAMP_MS', async ($, o
   await m.drawn()
   keys.length = 0
   await clock.advance(600)
-  expect(keys).toContain('stamp:l1')
+  expect(keys.some(k => /^stamp:g[0-9a-f]+$/.test(k))).toBe(true)
   await clock.advance(1200) // past STAMP_MS; the stamp entry has cleared
   await m.drawn()
   keys.length = 0

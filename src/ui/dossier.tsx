@@ -5,6 +5,7 @@ import { shownCost, shownHq, storedCost, type Pricing } from '../cost'
 import { utcDay } from '../history'
 import { LITELLM_DATE } from '../prices-litellm'
 import { cachePct, fmtCost, fmtDuration, fmtTokens } from './format'
+import { countParts, groupFigures, groupIdOf, groupLabel, groupStatus, taskCount, vettedText, type Group, type GroupFigures } from './groups'
 import { PALETTE, glyphs, statusColor, statusWords } from './theme'
 
 // Pure tree builders (spec §9.2): they take values the render hook already
@@ -21,6 +22,23 @@ export function fit(text: string, width: number): string {
   const w = Math.max(1, Math.floor(width))
   const chars = Array.from(text)
   return chars.length <= w ? text : chars.slice(0, w - 1).join('') + '…'
+}
+
+/** Greedy-wraps `parts` joined by " · " into lines of at most `width` cells; a part is never split. */
+export function packFigures(parts: readonly string[], width: number): string[] {
+  const lines: string[] = []
+  let current = ''
+  for (const part of parts) {
+    const joined = current === '' ? part : `${current} · ${part}`
+    if (current !== '' && Array.from(joined).length > width) {
+      lines.push(current)
+      current = part
+    } else {
+      current = joined
+    }
+  }
+  if (current !== '') lines.push(current)
+  return lines.map(line => fit(line, width))
 }
 
 export function totalTokens(u: Usage | null): number | null {
@@ -100,8 +118,15 @@ export function dossierView(
   pricing?: Pricing,
 ): ReturnType<Table['Box']> {
   const { Box, Text, Button } = t
+  // a run's Back returns to its group's dossier; a run that is gone returns to the field
   const back = (
-    <Button key="back" hotkey="b" plain label="← Back" onPress={() => press({ view: 'field', dossierId: undefined })} />
+    <Button
+      key="back"
+      hotkey="b"
+      plain
+      label="← Back"
+      onPress={() => press(run ? { view: 'dossier', dossierId: groupIdOf(run) } : { view: 'field', dossierId: undefined })}
+    />
   )
   if (!run) {
     return (
@@ -220,6 +245,108 @@ export function hqDossierView(t: Table, ledger: Ledger, now: number, inner: numb
       {row('cache hit', cachePct(u))}
       {row('cost', fmtCost(shown.cost, shown.source, shown.partial === true), PALETTE.accent)}
       {shown.partial === true && <Text dimColor>{'  some requests had no price'}</Text>}
+    </Box>
+  )
+}
+
+/** A group's status counts and task count as one dim line with the band's colors; plain dim text when it would not fit. */
+export function countsLine(t: Table, figures: GroupFigures, inner: number): ReturnType<Table['Box']> {
+  const { Box, Text } = t
+  const parts = countParts(figures)
+  const tasks = taskCount(figures.tasks)
+  const whole = [...parts.map(p => p.text), tasks].join(' · ')
+  if (Array.from(whole).length > inner) return <Text dimColor>{fit(whole, inner)}</Text>
+  const cells = parts.flatMap(p => [<Text color={statusColor(p.status)}>{p.text}</Text>, <Text dimColor>{' · '}</Text>])
+  return (
+    <Box>
+      {cells}
+      <Text dimColor>{tasks}</Text>
+    </Box>
+  )
+}
+
+/**
+ * A group's dossier (id `group:<key>`): the overview of every run of one implementer, model and effort, then its tasks by
+ * codename. A task opens the run's own dossier. Tasks are named by codename only: no description, no free text.
+ */
+export function groupDossierView(
+  t: Table,
+  group: Group | undefined,
+  ledger: Ledger,
+  now: number,
+  inner: number,
+  g: Glyphs,
+  press: Press,
+  pricing: Pricing,
+): ReturnType<Table['Box']> {
+  const { Box, Text, Button } = t
+  const back = <Button key="back" hotkey="b" plain label="← Back" onPress={() => press({ view: 'field', dossierId: undefined })} />
+  if (!group) {
+    return (
+      <Box flexDirection="column">
+        {back}
+        <Text> </Text>
+        <Text dimColor>That group is no longer on the board.</Text>
+      </Box>
+    )
+  }
+  const f = groupFigures(group, now, pricing)
+  const status = groupStatus(group)
+  const row = (label: string, value: string, valueColor?: string) => (
+    <Text wrap="truncate">
+      <Text dimColor>{label.padEnd(LABEL)}</Text>
+      <Text color={valueColor}>{fit(value, inner - LABEL)}</Text>
+    </Text>
+  )
+  const u = f.usage
+  const part = (n: number | undefined): string => (n === undefined ? '—' : fmtTokens(n))
+  return (
+    <Box flexDirection="column">
+      {back}
+      <Text> </Text>
+      <Text bold color={statusColor(status)} wrap="truncate">
+        {fit(`${g.dot[status]} ${groupLabel(group)}`, inner)}
+      </Text>
+      {countsLine(t, f, inner)}
+      <Text> </Text>
+      {row('time', fmtDuration(f.elapsedMs))}
+      {row('tokens', f.tokens === null ? '—' : `${f.approx ? '≈' : ''}${fmtTokens(f.tokens)}`)}
+      {row('  in', part(u ? u.uncached + u.cacheRead + u.cacheWrite : undefined))}
+      {row('  out', part(u?.output))}
+      {row('cache hit', cachePct(u))}
+      {row('cost', f.cost === null ? (f.costPartial ? '?' : '—') : fmtCost(f.cost, f.costSource, f.costPartial), PALETTE.accent)}
+      {f.costPartial && <Text dimColor>{'  some requests had no price'}</Text>}
+      {row('vetted', vettedText(f))}
+      <Text> </Text>
+      <Text bold dimColor>
+        TASKS
+      </Text>
+      <Text> </Text>
+      {group.runs.map(run => {
+        const dot = g.dot[run.status]
+        const spy = statusWords(run.status).spy
+        const label = fit(`${run.codename}  ${run.kind} · ${run.agentType ?? run.lane ?? '—'}`, Math.max(1, inner - (Array.from(dot).length + 1)))
+        const figures = [fmtDuration(runElapsed(run, now)), `${run.approx ? '≈' : ''}${runTokens(run)} tok`, runCost(run, pricing)]
+        if (run.sharedSize !== undefined && run.sharedSize > 1) figures.push(`shared ×${run.sharedSize}`)
+        const whole = `${spy}   ${figures.join('   ')}`
+        const lines = Array.from(whole).length <= inner ? [whole] : [fit(spy, inner), ...packFigures(figures, inner)]
+        const review = run.reviews.length > 0 ? run.reviews[run.reviews.length - 1] : undefined
+        const handler = review
+          ? `vetted by ${codenameOf(ledger, review.reviewerId)} · ${review.bugs ?? '?'} leaks · ${review.edits ?? '?'} patches`
+          : run.suspectedHandlers.length > 0
+            ? `suspected handler? ${codenameOf(ledger, run.suspectedHandlers[0] ?? '')}`
+            : undefined
+        return (
+          <Box flexDirection="column" key={`task-${run.id}`}>
+            <Box>
+              <Text color={statusColor(run.status)} bold={run.status === 'running'}>{`${dot} `}</Text>
+              <Button key={run.id} plain label={label} onPress={() => press({ view: 'dossier', dossierId: run.id })} />
+            </Box>
+            <Text dimColor>{lines.join('\n')}</Text>
+            {handler !== undefined && <Text color={PALETTE.handler}>{fit(handler, inner)}</Text>}
+          </Box>
+        )
+      })}
     </Box>
   )
 }

@@ -163,7 +163,7 @@ The ducks talk in code. Here's the decoder ring.
 1. **Header:** a pixel-art duck in a fedora and shades, a radar with one blip per running operative, and the title THE FLOCK.
 2. **Counters:** IN FIELD, DEBRIEFED and WENT DARK counts. RETURNED and OFF RADAR appear when they are not zero. (Status words are explained in the [Glossary](#-spy-lingo).)
 3. **Signal:** a tokens-per-minute sparkline for the last 30 minutes, total tokens, a cache hit bar and spend by implementer. HQ (the main loop) counts in all of it, like any Claude model.
-4. **Operative cards:** an HQ card first (once the main loop has used tokens), then one two-line card per tracked run (an "operative"). Line 1: status dot, codename, implementer · model · effort. Line 2: elapsed time, tokens and cost, or the review line. The HQ card has a fixed dot and no status words: its line 2 is time since the session started, tokens and cost. Press a card to open its dossier.
+4. **Operative cards:** an HQ card first (once the main loop has used tokens), then one three-line card per implementer · model · effort, grouping the tracked runs (the "operatives") that share them. Line 1: status dot and the implementer · model · effort. Line 2: how many operatives are in field, debriefed, dark and so on, and the task count (a stamp takes this line for a moment when one of them finishes). Line 3: time, tokens and cost of the group. The HQ card has a fixed dot and no status words: its line 2 is time since the session started, tokens and cost. Press a card to open its dossier.
 5. **Station board:** see below.
 
 A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
@@ -183,18 +183,19 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
   ● HQ  claude-code · claude-opus-5-5 · high
     38m   96k tok   $0.71
 
-  ● GOLDENEYE-7Q   claude · claude-sonnet-5-5 · high
-    4m 12s · 88k tok · $0.42 reported
+  ● claude-code · claude-sonnet-5-5 · high
+    2 in field · 3 debriefed · 5 tasks
+    14m   412k tok   $1.86 est.
 
-  ● MALLARD-0K     opencode · glm-5 · —
-    1m 03s · — · $0 reported
-
-  ● TEAL-3X        claude-code · claude-opus-5-5 · high
-    vetted by SMEW-1A · 2 leaks · 5 patches
+  ● opencode · openai/gpt-6.1-sol · high
+    1 debriefed · 1 dark · 2 tasks
+    9m   —   $0.42 reported
 
   STATION BOARD   [Session | 30 days]
   claude × sonnet-5-5   ████████   4 ops  …
 ```
+
+**The group dossier** opens when you press a card. It shows the group's counts, time, tokens (with `in`, `out` and cache hit), cost, and how many of its operatives were vetted, with leaks per vetted one. Under `TASKS` it lists each operative by codename, with its kind, agent type or lane, status, time, tokens and cost, and its review line when it has one. Press a codename to open that operative's dossier; its Back returns to the group.
 
 **The dossier** is the detail view of one operative (HQ's has no status, end, lane or handlers: kind `main loop`, its models, effort as observed, start, duration, tokens and cost): codename, kind, agent type, lane, implementer, model or models, effort and where it came from, read-only flag, status, start, end and duration, tokens, cache %, cost with its source, handler reviews, patches and leaks. Tokens show `input` (uncached + cache read + cache write) with those three parts under it, then `output` and `total`. It has a Back button. The Agent call's description is not shown.
 
@@ -374,7 +375,7 @@ The temp dir is `TMPDIR`, else `/tmp`. The parent hash is a fingerprint of the p
 
 The rows are the child's whole spend, including its subagents and the runs it delegated. No prompts, names, paths or text are written. The file is written at the start, at most every 5 s while anything changes, and once more at the end. A parent reads only its own folder. watchducks cannot delete these files. Readers ignore a report whose `updatedAt` is older than 24 h, and the OS temp cleanup removes old files.
 
-**Shared numbers.** Two or more opencode runs with the same model in one folder, active at the same time, cannot be told apart by any numbers watchducks can read. Their growth is split evenly among them. Their cards show `≈` before the token figures and `shared ×N`, where N is the largest group the run was in. The dossier says `even share of N runs`. Totals are plain sums of the cards, so they add up to what opencode measured.
+**Shared numbers.** Two or more opencode runs with the same model in one folder, active at the same time, cannot be told apart by any numbers watchducks can read. Their growth is split evenly among them. Their group card shows `≈` before the token total, and the group dossier shows `≈` and `shared ×N` on each of them, where N is the largest group the run was in. The dossier says `even share of N runs`. Totals are plain sums of the cards, so they add up to what opencode measured.
 
 **On disk.** One history record per session (`history/v1/<sessionId>`) in the plugin store. It holds counts, tokens and costs per UTC day and implementer|model. Records are kept for 30 days, at most 200 of them. Headless sessions record nothing unless `recordHeadless` is on. `/flock purge` deletes all of it. With `priceUpdates` on, the store also holds one price record (`prices/litellm/v1`): the refreshed price list as numbers, with its dates; `/flock purge` keeps it.
 

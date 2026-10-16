@@ -1817,6 +1817,19 @@ function solPane($: Engine) {
   })
 }
 
+// A run sits one press deeper than the field: its group's dossier first, then the run's own.
+async function openRun(ui: Awaited<ReturnType<typeof solPane>>, key: string): Promise<void> {
+  for (const [, group] of JSON.stringify(await ui.drawn()).matchAll(/"key":"(group:[^"]+)"/g)) {
+    await ui.press({ key: group! })
+    if (JSON.stringify(await ui.drawn()).includes(`"key":"${key}"`)) {
+      await ui.press({ key })
+      return
+    }
+    await ui.press({ key: 'back' })
+  }
+  throw new Error(`no group card holds ${key}`)
+}
+
 type Bucket = { costReported: number; costEstimated: number }
 const lastBuckets = (stored: readonly string[]): Bucket[] => {
   const record = JSON.parse(stored[stored.length - 1]!) as { days: Record<string, Record<string, Bucket>> }
@@ -1845,7 +1858,7 @@ test('auto: stats that report $0 with real tokens show an estimate on the card, 
   const card = JSON.stringify(await ui.drawn())
   expect(card).toContain('$1.24 est.')
   expect(card).not.toContain('reported $0')
-  await ui.press({ key: 'bash:u1' })
+  await openRun(ui, 'bash:u1')
   expect(JSON.stringify(await ui.drawn())).toContain('$1.24 est. (reported $0)')
   await ui.unmount()
 

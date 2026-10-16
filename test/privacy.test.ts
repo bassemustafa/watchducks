@@ -45,6 +45,21 @@ async function drawn(m: { drawn: () => Promise<unknown> }): Promise<string> {
   return JSON.stringify(await m.drawn())
 }
 
+// A run sits one press deeper than the field: the dossier of the group that lists it, then the run's own.
+// Returns the tree of that group dossier, so the canary reads it too.
+async function openRun(ui: Awaited<ReturnType<typeof pane>>, key: string): Promise<string> {
+  for (const [, group] of (await drawn(ui)).matchAll(/"key":"(group:[^"]+)"/g)) {
+    await ui.press({ key: group! })
+    const tree = await drawn(ui)
+    if (tree.includes(`"key":"${key}"`)) {
+      await ui.press({ key })
+      return tree
+    }
+    await ui.press({ key: 'back' })
+  }
+  throw new Error(`no group card holds ${key}`)
+}
+
 // Everything the plugin writes or shows, as the hooks beneath it see it: serialised at the moment of the write.
 type Seen = { state: string[]; store: string[]; shown: string[]; storeKeys: () => string[] }
 
@@ -183,11 +198,13 @@ test('privacy canary: planted sentinels never reach state, store, toasts, status
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await pane($, surface, 60)
     trees.push(await drawn(ui)) // field view
-    await ui.press({ key: 'c1' })
+    trees.push(await openRun(ui, 'c1')) // group dossier of the subagent
     trees.push(await drawn(ui)) // dossier of the subagent
     await ui.press({ key: 'back' })
-    await ui.press({ key: 'bash:p4' })
+    await ui.press({ key: 'back' })
+    trees.push(await openRun(ui, 'bash:p4')) // group dossier of the relay run
     trees.push(await drawn(ui)) // dossier of the relay run
+    await ui.press({ key: 'back' })
     await ui.press({ key: 'back' })
     await ui.press({ key: 'station' })
     await ui.press({ key: 'span' })
@@ -247,8 +264,9 @@ test('privacy: an agent adopted from $.agent.list() never leaks its listed descr
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await pane($, surface, 60)
     trees.push(await drawn(ui)) // field view
-    await ui.press({ key: 'f1' })
+    trees.push(await openRun(ui, 'f1')) // group dossier of the adopted agent
     trees.push(await drawn(ui)) // dossier of the adopted agent
+    await ui.press({ key: 'back' })
     await ui.press({ key: 'back' })
     await ui.unmount()
   }
@@ -334,8 +352,9 @@ async function treesOf($: Engine, keys: readonly string[]): Promise<string[]> {
     const ui = await pane($, surface, 60)
     trees.push(await drawn(ui))
     for (const key of keys) {
-      await ui.press({ key })
+      trees.push(await openRun(ui, key))
       trees.push(await drawn(ui))
+      await ui.press({ key: 'back' })
       await ui.press({ key: 'back' })
     }
     await ui.unmount()

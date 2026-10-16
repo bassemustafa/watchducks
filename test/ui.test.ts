@@ -54,6 +54,31 @@ async function view($: Engine, surface: 'terminal' | 'desktop', columns: number)
   }
 }
 
+type Mounted = Awaited<ReturnType<typeof pane>>
+
+// The group cards of the field, by their keys.
+const groupKeys = (text: string): string[] => [...text.matchAll(/"key":"(group:[^"]+)"/g)].map(m => m[1]!)
+
+// The first group card of the field is pressed: its dossier lists the group's runs by codename.
+async function openGroup(ui: Mounted): Promise<void> {
+  const [first] = groupKeys(await drawn(ui))
+  if (first === undefined) throw new Error('the field has no group card')
+  await ui.press({ key: first })
+}
+
+// A run sits one press deeper than the field: the dossier of the group that lists it, then the run's own.
+async function openRun(ui: Mounted, key: string): Promise<void> {
+  for (const group of groupKeys(await drawn(ui))) {
+    await ui.press({ key: group })
+    if ((await drawn(ui)).includes(`"key":"${key}"`)) {
+      await ui.press({ key })
+      return
+    }
+    await ui.press({ key: 'back' })
+  }
+  throw new Error(`no group card holds ${key}`)
+}
+
 function backgroundRelay(on: On): void {
   on('tool.call', { tool: 'Bash' }, async () => ({ result: { backgroundTaskId: 't1' } }) as never)
 }
@@ -69,8 +94,11 @@ test('one running relay shows its codename and IN FIELD', async ($, on) => {
   await $.tool.call(RELAY_CALL as never)
   const ui = await pane($, 'terminal', 40)
   const text = await drawn(ui)
-  expect(text).toMatch(/[A-Z]+-[0-9A-Z]{2}/)
   expect(text).toContain('IN FIELD')
+  // the field names the group, not the codename; the group's dossier lists it
+  expect(text).not.toMatch(/[A-Z]+-[0-9A-Z]{2}/)
+  await openGroup(ui)
+  expect(await drawn(ui)).toMatch(/[A-Z]+-[0-9A-Z]{2}/)
 })
 
 test('pressing a card opens the dossier, which has a Back button', async ($, on) => {
@@ -78,7 +106,7 @@ test('pressing a card opens the dossier, which has a Back button', async ($, on)
   backgroundRelay(on)
   await $.tool.call(RELAY_CALL as never)
   const ui = await pane($, 'terminal', 40)
-  await ui.press({ key: 'bash:u1' })
+  await openRun(ui, 'bash:u1')
   expect(state().view).toBe('dossier')
   expect(state().dossierId).toBe('bash:u1')
   expect(await drawn(ui)).toContain('Back')
@@ -89,7 +117,10 @@ test('the back button returns from the dossier to the field', async ($, on) => {
   backgroundRelay(on)
   await $.tool.call(RELAY_CALL as never)
   const ui = await pane($, 'terminal', 40)
-  await ui.press({ key: 'bash:u1' })
+  await openRun(ui, 'bash:u1')
+  // a run's Back returns to its group's dossier, whose Back returns to the field
+  await ui.press({ key: 'back' })
+  expect(state().view).toBe('dossier')
   await ui.press({ key: 'back' })
   expect(state().view).toBe('field')
 })
@@ -168,13 +199,14 @@ test('a run that turns done is stamped for 1.5 s and the stamp then clears', asy
   expect(state().stamps).toBeUndefined()
 })
 
-// Two agents that end in the same watch tick: a1 answers, a2 errors.
+// Two agents of different models that end in the same watch tick: a1 answers, a2 errors.
 async function endTwo(on: On, ui: Engine) {
   let n = 0
   on('command.register', async () => ({ value: { command: 'flock' } }))
   on('session.id', async () => ({ value: 'S1' }))
   on('session.start', async ($, e) => ({ cwd: e.cwd }))
-  on('agent.spawn', async () => ({ model: 'claude-sonnet-5-5', agentId: `a${++n}` }))
+  // two models, so the two runs are two group cards and each card shows its own stamp
+  on('agent.spawn', async () => ({ model: ++n === 1 ? 'claude-sonnet-5-5' : 'claude-haiku-5-5', agentId: `a${n}` }))
   on('turn.complete', async () => ({ text: '' }))
   on('ui.panes', async () => ({ value: [] }))
   mock.store(on)
@@ -189,11 +221,12 @@ async function endTwo(on: On, ui: Engine) {
   return clock
 }
 
-test('two runs ending in one tick each get a raster stamp on the terminal', async ($, on) => {
+test('two runs ending in one tick each get a raster stamp on the terminal, keyed by their group card', async ($, on) => {
   await endTwo(on, $)
   const text = await view($, 'terminal', 52)
-  expect(text).toContain('"key":"stamp:a1"')
-  expect(text).toContain('"key":"stamp:a2"')
+  expect(text.match(/"key":"stamp:g[0-9a-f]+"/g)?.length).toBe(2)
+  expect(text).not.toContain('stamp:a1')
+  expect(text).not.toContain('stamp:a2')
 })
 
 test('two runs ending in one tick each show a stamp text on the desktop; a failed run reads WENT DARK', async ($, on) => {
@@ -361,7 +394,7 @@ test('F19: the dossier values use the terminal text color', async ($, on) => {
   backgroundRelay(on)
   await $.tool.call(RELAY_CALL as never)
   const ui = await pane($, 'terminal', 52)
-  await ui.press({ key: 'bash:u1' })
+  await openRun(ui, 'bash:u1')
   const text = await drawn(ui)
   expect(text).toContain('implementer')
   expect(text).not.toContain('#e2e8f0')
@@ -395,7 +428,7 @@ test('the dossier lists input as the sum of its parts, then output and the total
   })
   await stepAgent($)
   const ui = await pane($, 'terminal', 52)
-  await ui.press({ key: 'a1' })
+  await openRun(ui, 'a1')
   const text = await drawn(ui)
   // 100k + 60k + 40k input, 20k output
   expect(text).toMatch(/"input\s+"[^]*"200k"/)
@@ -545,13 +578,27 @@ function measured(on: On, ids: string[], over: Measured): void {
 const OC_RUN = (n: number) => ({ tool: 'Bash', tool_use_id: 'c' + n, command: `opencode run -m openai/gpt-6.1-sol "task ${n}"` }) as never
 const MEASURED = { uncached: 12000, output: 3000, cacheRead: 0, cacheWrite: 0 }
 
-// Opens the dossier of the card keyed `key` on the field view and draws it. The ui state outlives the pane, so the
-// way Back returns to the field before the next card is opened.
+// Opens the dossier of the run keyed `key` (its group's dossier first) and draws it. The ui state outlives the pane,
+// so Back returns to the field before the next one is opened.
 async function dossierText($: Engine, surface: 'terminal' | 'desktop', key: string): Promise<string> {
   const ui = await pane($, surface, 52)
   try {
-    expect(await drawn(ui)).toContain(`"key":"${key}"`)
-    await ui.press({ key })
+    await openRun(ui, key)
+    const text = await drawn(ui)
+    await ui.press({ key: 'back' })
+    await ui.press({ key: 'back' })
+    return text
+  } finally {
+    await ui.unmount()
+  }
+}
+
+// The dossier of the group that lists the run keyed `key`, drawn from the field and left again.
+async function groupText($: Engine, surface: 'terminal' | 'desktop', key: string): Promise<string> {
+  const ui = await pane($, surface, 52)
+  try {
+    await openRun(ui, key)
+    await ui.press({ key: 'back' })
     const text = await drawn(ui)
     await ui.press({ key: 'back' })
     return text
@@ -567,7 +614,9 @@ test('an approximate card reads ≈ before its tokens and an exact one does not,
   await $.tool.call(OC_RUN(1))
   await $.tool.call(OC_RUN(2))
   for (const surface of ['terminal', 'desktop'] as const) {
-    const text = await view($, surface, 52)
+    // the two runs are one group: its card sums them and is approximate, its tasks read each run's own figures
+    expect(await view($, surface, 52)).toContain('≈36k tok')
+    const text = await groupText($, surface, 'bash:c1')
     expect(text).toContain('≈15k tok')
     expect(text).toContain('21k tok')
     expect(text).not.toContain('≈21k')
@@ -581,10 +630,12 @@ test('the cards that hold a share read shared ×3 and the header adds every card
   measured(on, ['bash:c4'], { source: 'stats', usage: MEASURED, cost: 0.4, costSource: 'reported', sharedSize: 1 })
   for (const n of [1, 2, 3, 4]) await $.tool.call(OC_RUN(n))
   for (const surface of ['terminal', 'desktop'] as const) {
-    const text = await view($, surface, 52)
-    expect(text.match(/shared ×3/g)?.length).toBe(3)
-    expect(text).not.toContain('shared ×1')
+    // the runs are one group, whose tasks carry the marks
+    const tasks = await groupText($, surface, 'bash:c1')
+    expect(tasks.match(/shared ×3/g)?.length).toBe(3)
+    expect(tasks).not.toContain('shared ×1')
     // four cards of 15k: 60k delegated
+    const text = await view($, surface, 52)
     expect(text).toContain('60k')
     expect(text).not.toContain('30k')
   }
@@ -691,5 +742,145 @@ test('the station board shows the HQ model as a claude-code row', async ($, on) 
   const ui = await pane($, 'terminal', 52)
   await ui.press({ key: 'station' })
   expect(await drawn(ui)).toContain('claude-code · claude-sonnet-5-5')
+})
+
+// ---- the field groups operatives by implementer · model · effort; a group opens its tasks, a task opens its dossier
+
+const CODENAME = /[A-Z]+-[0-9A-Z]{2}/
+
+// Two subagents of one model, started in a session; `ends` are the agents whose turn then completes (and are stamped).
+async function sameModelAgents($: Engine, on: On, ends: readonly string[]) {
+  let n = 0
+  on('command.register', async () => ({ value: { command: 'flock' } }))
+  on('session.id', async () => ({ value: 'S1' }))
+  on('session.start', async ($, e) => ({ cwd: e.cwd }))
+  on('agent.spawn', async () => ({ model: 'claude-sonnet-5-5', agentId: `a${++n}` }))
+  on('turn.step', async function* ($, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: BIG_USAGE } as never
+  })
+  on('turn.complete', async () => ({ text: '' }))
+  on('ui.panes', async () => ({ value: [] }))
+  mock.store(on)
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/work', surface: null, isInteractive: true })
+  await $.agent.spawn({ subagentType: 'Explore' } as never)
+  await $.agent.spawn({ subagentType: 'Explore' } as never)
+  for (const id of ['a1', 'a2']) {
+    for await (const _ of $.turn.step({ agentId: id, turnId: 't' + id, index: 0, model: 'claude-sonnet-5-5', effort: 'high' } as never)) {
+      /* chunks are never read */
+    }
+  }
+  await clock.advance(100)
+  for (const id of ends) await $.turn.complete({ agentId: id, turnId: 't' + id, reason: 'answer', answer: '', durationMs: 1, isAborted: false } as never)
+  await clock.advance(600)
+  return clock
+}
+
+const GROUP = 'group:claude-code|claude-sonnet-5-5|high'
+
+test('two subagents of one model and effort are one group card with their counts, and the field names no codename', async ($, on) => {
+  await sameModelAgents($, on, [])
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const text = await view($, surface, 52)
+    expect(text.match(/"key":"group:/g)?.length).toBe(1)
+    expect(text).toContain(`"key":"${GROUP}"`)
+    expect(text).toContain('"label":"claude-code · claude-sonnet-5-5 · high"')
+    expect(text).toContain('"2 in field"')
+    expect(text).toContain('"2 tasks"')
+    // two runs of 220k: the card sums them
+    expect(text).toContain('440k tok')
+    expect(text).toContain('$1.20 est.')
+    expect(text).not.toContain('"key":"a1"')
+    expect(text).not.toContain('"key":"a2"')
+    // the desktop header is SVG markup, so only the terminal tree is searched for names
+    if (surface === 'terminal') expect(text).not.toMatch(CODENAME)
+  }
+})
+
+test('pressing a group opens its dossier: the figures, then the tasks by codename', async ($, on) => {
+  const state = watchUi(on)
+  await sameModelAgents($, on, [])
+  const ui = await pane($, 'terminal', 52)
+  await ui.press({ key: GROUP })
+  expect(state().view).toBe('dossier')
+  expect(state().dossierId).toBe(GROUP)
+  const text = await drawn(ui)
+  expect(text).toContain('TASKS')
+  expect(text).toContain('claude-code · claude-sonnet-5-5 · high')
+  expect(text).toContain('"2 in field"')
+  expect(text.match(/"label":"[A-Z]+-[0-9A-Z]{2}  agent · Explore"/g)?.length).toBe(2)
+  expect(text).toContain('"key":"a1"')
+  expect(text).toContain('"key":"a2"')
+  for (const row of ['time', 'tokens', 'cache hit', 'cost', 'vetted']) expect(text).toContain(`"${row.padEnd(14)}"`)
+  expect(text).toContain('"440k"')
+  expect(text).toContain('"$1.20 est."')
+  expect(text).toContain('"none"')
+  // the overview is not a run's dossier
+  expect(text).not.toContain('implementer')
+  expect(text).toContain('Back')
+})
+
+test('pressing a task opens the run dossier; its Back returns to the group and the group Back to the field', async ($, on) => {
+  const state = watchUi(on)
+  await sameModelAgents($, on, [])
+  const ui = await pane($, 'terminal', 52)
+  await ui.press({ key: GROUP })
+  await ui.press({ key: 'a1' })
+  expect(state().dossierId).toBe('a1')
+  const run = await drawn(ui)
+  expect(run).toContain('implementer')
+  expect(run).toContain('cache hit')
+  expect(run).not.toContain('TASKS')
+  await ui.press({ key: 'back' })
+  expect(state().view).toBe('dossier')
+  expect(state().dossierId).toBe(GROUP)
+  expect(await drawn(ui)).toContain('TASKS')
+  await ui.press({ key: 'back' })
+  expect(state().view).toBe('field')
+  expect(await drawn(ui)).toContain(`"key":"${GROUP}"`)
+})
+
+test('a group dossier whose runs /flock clear removed says the group is no longer on the board', async ($, on) => {
+  await sameModelAgents($, on, ['a1', 'a2'])
+  const ui = await pane($, 'terminal', 52)
+  await ui.press({ key: GROUP })
+  expect(await drawn(ui)).toContain('TASKS')
+  await ui.unmount()
+  await $.command.run({ command: 'flock', args: 'clear' } as never)
+  // the ui state outlives the pane: a new pane still shows the group's dossier
+  const again = await pane($, 'terminal', 52)
+  const text = await drawn(again)
+  expect(text).toContain('That group is no longer on the board.')
+  expect(text).toContain('Back')
+  await again.press({ key: 'back' })
+  expect(await drawn(again)).toContain('No operatives yet')
+})
+
+test('a stamp shows on the group card when one of its runs finishes: a Raster on the terminal', async ($, on) => {
+  await sameModelAgents($, on, ['a1'])
+  const text = await view($, 'terminal', 52)
+  expect(text.match(/"key":"stamp:g[0-9a-f]+"/g)?.length).toBe(1)
+  expect(text).not.toContain('stamp:a1')
+  expect(text).toContain('"key":"dot:g')
+  // the other run is still in the field: the stamp stands in for the counts line
+  expect(text).not.toContain('"1 in field"')
+})
+
+test('with motion off the stamp is the text on the group card', { options: { motion: 'off' } }, async ($, on) => {
+  await sameModelAgents($, on, ['a1'])
+  const text = await view($, 'terminal', 52)
+  expect(text).not.toContain('stamp:')
+  expect(text).toContain('✦ DEBRIEFED ✦')
+  expect(text.match(/"key":"group:/g)?.length).toBe(1)
+})
+
+test('once the stamp has cleared the group card counts a debriefed and an in-field run', async ($, on) => {
+  const clock = await sameModelAgents($, on, ['a1'])
+  await clock.advance(1600)
+  const text = await view($, 'terminal', 52)
+  expect(text).not.toContain('stamp:')
+  expect(text).toContain('"1 in field"')
+  expect(text).toContain('"1 debriefed"')
+  expect(text).toContain('"2 tasks"')
 })
 

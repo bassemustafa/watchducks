@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The field groups operatives by implementer · model · effort: one card per group with its status counts and task count, then its time, tokens and cost (the count-up and the debrief stamps play on the group card). Pressing a group opens its dossier: the group's overview (time, tokens in and out, cache hit, cost, vetted and leaks), then its tasks by codename with their own status and figures. Pressing a task opens the operative's dossier as before; its Back returns to the group.
 - README: a recorded demo, a sidebar clip and the station board, a how-it-works diagram, and a plain explanation of delegate relays with a 12-line example. The reference sections are collapsible.
 - Contributing: issue forms (bug, feature, new agent CLI, question), a labelled triage flow, a PR template with type and testing sections, and automatic area labels on pull requests.
 

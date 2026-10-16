@@ -241,6 +241,19 @@ function pane($: Engine) {
   })
 }
 
+// A run sits one press deeper than the field: its group's dossier first, then the run's own.
+async function openRun(ui: Awaited<ReturnType<typeof pane>>, key: string): Promise<void> {
+  for (const [, group] of JSON.stringify(await ui.drawn()).matchAll(/"key":"(group:[^"]+)"/g)) {
+    await ui.press({ key: group! })
+    if (JSON.stringify(await ui.drawn()).includes(`"key":"${key}"`)) {
+      await ui.press({ key })
+      return
+    }
+    await ui.press({ key: 'back' })
+  }
+  throw new Error(`no group card holds ${key}`)
+}
+
 async function agentOfModel($: Engine, on: On, entries?: Record<string, unknown>): Promise<void> {
   mock.store(on, entries)
   on('agent.spawn', async () => ({ model: 'zz-fetched-only', agentId: 'a1' }))
@@ -259,7 +272,7 @@ test('a model only the fetched list knows is priced: the card shows est. and the
   const card = JSON.stringify(await ui.drawn())
   // 1000 in at $1000/M + 1000 out at $2000/M
   expect(card).toContain('$3.00 est.')
-  await ui.press({ key: 'a1' })
+  await openRun(ui, 'a1')
   expect(JSON.stringify(await ui.drawn())).toContain('$3.00 est. (LiteLLM 2026-10-14)')
   await ui.unmount()
 })
@@ -339,7 +352,7 @@ test('privacy canary: strings in a price list answer reach no store record, stat
   const trees: string[] = []
   const ui = await pane($)
   trees.push(JSON.stringify(await ui.drawn()))
-  await ui.press({ key: 'a1' })
+  await openRun(ui, 'a1')
   trees.push(JSON.stringify(await ui.drawn()))
   await ui.unmount()
   expect(trees[0]).toContain('est.')

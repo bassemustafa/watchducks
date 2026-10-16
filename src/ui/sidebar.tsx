@@ -1,15 +1,17 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, On, PluginOptions } from 'claude-code'
 
-import type { HistoryRecord, Implementer, Ledger, Run, StationRow, UiState } from '../../types'
+import type { HistoryRecord, Implementer, Ledger, StationRow, UiState } from '../../types'
+import { fnv1a } from '../codename'
 import { hqModelOf, shownCost, shownHq, type Pricing } from '../cost'
 import { HISTORY_PREFIX, aggregateHistory, stationRowsFromLedger } from '../history'
 import { seriesWindow, totals, type Totals } from '../ledger'
 import { PRICES_KEY, fetchedPrices } from '../price'
 import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, pricing, withFetched } from '../state'
 import { RADAR_FULL, RADAR_SMALL, blipsFor, radar, svgBlipsFor } from './animate'
-import { codenameOf, dossierView, hqDossierView, fit, runCost, runElapsed, runTokens, totalTokens, type Glyphs, type Press, type Table } from './dossier'
+import { countsLine, dossierView, groupDossierView, hqDossierView, fit, packFigures, totalTokens, type Glyphs, type Press, type Table } from './dossier'
 import { cachePct, fmtCost, fmtDuration, fmtElapsedCoarse, fmtTokens, sparkline } from './format'
+import { GROUP_PREFIX, groupFigures, groupLabel, groupStatus, groupsOf, type Group } from './groups'
 import { STAMP_MS, STAMP_TEXT, TICK_MS, dotFrame, dotRaster, motion as motionState, stampRaster, tickerValue, type StampKind } from './motion'
 import { duckLogo, gradientBar, hex, radarFrame, type RasterSpec } from './raster'
 import { stationView } from './station'
@@ -52,18 +54,6 @@ const IMPLEMENTER_COLORS: Record<Implementer, string> = {
   gemini: '#fb923c',
   shell: '#94a3b8',
   unknown: '#64748b',
-}
-
-/** Running runs newest first, then ended ones newest first. */
-function orderedRuns(ledger: Ledger): Run[] {
-  const runs: Run[] = []
-  for (const id of ledger.order) {
-    const run = Object.hasOwn(ledger.runs, id) ? ledger.runs[id] : undefined
-    if (run) runs.push(run)
-  }
-  const running = runs.filter(r => r.status === 'running').sort((a, b) => b.startedAt - a.startedAt)
-  const ended = runs.filter(r => r.status !== 'running').sort((a, b) => (b.endedAt ?? b.startedAt) - (a.endedAt ?? a.startedAt))
-  return [...running, ...ended]
 }
 
 function raster(spec: RasterSpec): { key: string; columns: number; rows: number; cells: string } {
@@ -300,23 +290,6 @@ function desktopArt(t: Elements['desktop'], ledger: Ledger, tot: Totals, lay: La
 
 // -------------------------------------------------------------- field view
 
-/** Greedy-wraps `parts` joined by " · " into lines of at most `width` cells; a part is never split. */
-function packFigures(parts: readonly string[], width: number): string[] {
-  const lines: string[] = []
-  let current = ''
-  for (const part of parts) {
-    const joined = current === '' ? part : `${current} · ${part}`
-    if (current !== '' && Array.from(joined).length > width) {
-      lines.push(current)
-      current = part
-    } else {
-      current = joined
-    }
-  }
-  if (current !== '') lines.push(current)
-  return lines.map(line => fit(line, width))
-}
-
 function hexOf(kind: StampKind): string {
   return kind === 'done' ? PALETTE.done : kind === 'failed' ? PALETTE.failed : PALETTE.ended
 }
@@ -327,21 +300,39 @@ function stampOf(ui: UiState, runId: string, now: number): { kind: StampKind; pr
   return s && s.until > now ? { kind: s.kind, progress: 1 - (s.until - now) / STAMP_MS } : undefined
 }
 
-function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g: Glyphs, stamp: { kind: StampKind; progress: number } | undefined, stampTable: Elements['terminal'] | null, press: Press, coarse: boolean, pr: Pricing): El {
-  const { Box, Text, Button } = t
-  const color = statusColor(run.status)
-  const words = statusWords(run.status)
-  const dot = g.dot[run.status]
-  if (stampTable && run.status === 'running') motionState.dots.push(run.id)
-  const rest = fit(`${run.codename}  ${run.implementer} · ${run.model ?? '—'} · ${run.effort ?? '—'}`, Math.max(1, inner - (Array.from(dot).length + 1)))
+/** The id a group's dot and stamp Rasters are keyed by: short, and free of the characters of the group id. */
+function motionId(group: Group): string {
+  return 'g' + fnv1a(group.id).toString(16)
+}
 
-  const review = run.reviews.length > 0 ? run.reviews[run.reviews.length - 1] : undefined
+/** The group's newest active stamp (the one with the least progress); the stamps stay keyed by run id. */
+function groupStamp(ui: UiState, group: Group, now: number): { kind: StampKind; progress: number } | undefined {
+  let newest: { kind: StampKind; progress: number } | undefined
+  for (const run of group.runs) {
+    const s = stampOf(ui, run.id, now)
+    if (s && (newest === undefined || s.progress < newest.progress)) newest = s
+  }
+  return newest
+}
+
+/** One card per implementer · model · effort: the label as the button, the status counts, then time, tokens and cost. */
+function groupCard(t: Table, group: Group, ui: UiState, now: number, inner: number, g: Glyphs, stampTable: Elements['terminal'] | null, press: Press, coarse: boolean, pr: Pricing): El {
+  const { Box, Text, Button } = t
+  const status = groupStatus(group)
+  const running = status === 'running'
+  const mid = motionId(group)
+  const dot = g.dot[status]
+  if (stampTable && running) motionState.dots.push(mid)
+  const rest = fit(groupLabel(group), Math.max(1, inner - (Array.from(dot).length + 1)))
+  const f = groupFigures(group, now, pr)
+
+  const stamp = groupStamp(ui, group, now)
   let line2: El
   if (stamp) {
     if (stampTable) {
       const Raster = stampTable.Raster
-      motionState.stamps[run.id] = { kind: stamp.kind, startedAt: now - stamp.progress * STAMP_MS }
-      line2 = <Raster {...raster(stampRaster(run.id, stamp.kind, stamp.progress))} />
+      motionState.stamps[mid] = { kind: stamp.kind, startedAt: now - stamp.progress * STAMP_MS }
+      line2 = <Raster {...raster(stampRaster(mid, stamp.kind, stamp.progress))} />
     } else {
       line2 = (
         <Text bold color={hexOf(stamp.kind)}>
@@ -349,44 +340,46 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
         </Text>
       )
     }
-  } else if (run.status !== 'running' && review) {
-    line2 = (
-      <Text color={PALETTE.handler}>
-        {fit(`vetted by ${codenameOf(ledger, review.reviewerId)} · ${review.bugs ?? '?'} leaks · ${review.edits ?? '?'} patches`, inner)}
-      </Text>
-    )
-  } else if (run.status !== 'running' && run.suspectedHandlers.length > 0) {
-    const id = run.suspectedHandlers[0] ?? ''
-    line2 = <Text color={PALETTE.handler}>{fit(`suspected handler? ${codenameOf(ledger, id)}`, inner)}</Text>
   } else {
-    const status = `${words.spy} · ${words.plain}`
-    // the terminal counts up while a ticker runs; the desktop and motion off always show the ledger value
-    const tick = stampTable && run.status === 'running' && Object.hasOwn(motionState.tickers, run.id) ? motionState.tickers[run.id] : undefined
-    const live = tick && now - tick.startedAt < TICK_MS ? tickerValue(tick, now) : undefined
-    const tokens = live ? fmtTokens(live.tokens) : runTokens(run)
-    const shown = shownCost(run, pr.mode, pr.table, pr.fetched)
-    const cost = live && shown.cost !== null ? fmtCost(live.cost, shown.source, shown.partial === true) : runCost(run, pr)
-    const figures = [(coarse && run.status === 'running' ? fmtElapsedCoarse : fmtDuration)(runElapsed(run, now)), `${run.approx ? '≈' : ''}${tokens} tok`, cost]
-    if (run.sharedSize !== undefined && run.sharedSize > 1) figures.push(`shared ×${run.sharedSize}`)
-    const whole = `${status}   ${figures.join('   ')}`
-    // too long for one line: the status keeps its own line, the figures wrap whole so tokens and cost never get cut
-    const lines = Array.from(whole).length <= inner ? [whole] : [fit(status, inner), ...packFigures(figures, inner)]
-    line2 = <Text dimColor>{lines.join('\n')}</Text>
+    line2 = countsLine(t, f, inner)
   }
+
+  // the terminal counts up while a ticker runs: a running run with one contributes the ticker's value instead of its ledger value
+  let tokens = f.tokens
+  let cost = f.cost
+  if (stampTable) {
+    for (const run of group.runs) {
+      if (run.status !== 'running' || !Object.hasOwn(motionState.tickers, run.id)) continue
+      const tick = motionState.tickers[run.id]
+      if (!tick || now - tick.startedAt >= TICK_MS) continue
+      const live = tickerValue(tick, now)
+      tokens = (tokens ?? 0) + live.tokens - (totalTokens(run.usage) ?? 0)
+      const shown = shownCost(run, pr.mode, pr.table, pr.fetched)
+      if (shown.cost !== null && cost !== null) cost += live.cost - shown.cost
+    }
+  }
+  const figures = [
+    (coarse && running ? fmtElapsedCoarse : fmtDuration)(f.elapsedMs),
+    tokens === null ? '—' : `${f.approx ? '≈' : ''}${fmtTokens(tokens)} tok`,
+    cost === null ? (f.costPartial ? '?' : '—') : fmtCost(cost, f.costSource, f.costPartial),
+  ]
+  const whole = figures.join('   ')
+  const lines = Array.from(whole).length <= inner ? [whole] : packFigures(figures, inner)
   return (
-    <Box key={`card-${run.id}`} flexDirection="column">
+    <Box key={`card-${group.id}`} flexDirection="column">
       <Box>
-        {stampTable && run.status === 'running' ? (
+        {stampTable && running ? (
           <Box>
-            <stampTable.Raster {...raster(dotRaster(run.id, g.on, dotFrame(now).color))} />
+            <stampTable.Raster {...raster(dotRaster(mid, g.on, dotFrame(now).color))} />
             <Text>{' '}</Text>
           </Box>
         ) : (
-          <Text color={color} bold={run.status === 'running'}>{`${dot} `}</Text>
+          <Text color={statusColor(status)} bold={running}>{`${dot} `}</Text>
         )}
-        <Button key={run.id} plain label={rest} onPress={() => press({ view: 'dossier', dossierId: run.id })} />
+        <Button key={group.id} plain label={rest} onPress={() => press({ view: 'dossier', dossierId: group.id })} />
       </Box>
       {line2}
+      <Text dimColor>{lines.join('\n')}</Text>
     </Box>
   )
 }
@@ -425,7 +418,7 @@ function fieldView(
   const { inner, g } = lay
   const blank = <Text> </Text>
   const tot = totals(ledger, lay.pricing)
-  const runs = orderedRuns(ledger)
+  const groups = groupsOf(ledger)
   const signalTokens = totalTokens(tot.usage) ?? 0
   const series = sparkline(seriesWindow(ledger, now, 30), Math.min(15, Math.max(4, inner - LABEL - 2)))
   const parts = spendParts(tot)
@@ -479,11 +472,11 @@ function fieldView(
         OPERATIVES
       </Text>
       {blank}
-      {hq !== null && <Box flexDirection="column" marginBottom={runs.length === 0 ? 0 : 1}>{hq}</Box>}
-      {runs.length === 0 && hq === null && <Text dimColor>No operatives yet — the flock is watching.</Text>}
-      {runs.map((run, i) => (
-        <Box flexDirection="column" key={'card:' + run.id} marginBottom={i === runs.length - 1 ? 0 : 1}>
-          {card(t, ledger, run, now, inner, g, stampOf(ui, run.id, now), lay.stampTable, press, lay.coarse, lay.pricing)}
+      {hq !== null && <Box flexDirection="column" marginBottom={groups.length === 0 ? 0 : 1}>{hq}</Box>}
+      {groups.length === 0 && hq === null && <Text dimColor>No operatives yet — the flock is watching.</Text>}
+      {groups.map((group, i) => (
+        <Box flexDirection="column" key={'card:' + group.id} marginBottom={i === groups.length - 1 ? 0 : 1}>
+          {groupCard(t, group, ui, now, inner, g, lay.stampTable, press, lay.coarse, lay.pricing)}
         </Box>
       ))}
     </Box>
@@ -552,8 +545,15 @@ export function registerSidebar(on: On, options: PluginOptions): void {
 
     let body: El
     if (ui.view === 'dossier') {
-      const run = ui.dossierId !== undefined && Object.hasOwn(ledger.runs, ui.dossierId) ? ledger.runs[ui.dossierId] : undefined
-      body = ui.dossierId === 'hq' ? hqDossierView(t, ledger, now, lay.inner, press, pr) : dossierView(t, run, ledger, now, lay.inner, g, press, pr)
+      const id = ui.dossierId
+      if (id === 'hq') {
+        body = hqDossierView(t, ledger, now, lay.inner, press, pr)
+      } else if (id !== undefined && id.startsWith(GROUP_PREFIX)) {
+        body = groupDossierView(t, groupsOf(ledger).find(group => group.id === id), ledger, now, lay.inner, g, press, pr)
+      } else {
+        const run = id !== undefined && Object.hasOwn(ledger.runs, id) ? ledger.runs[id] : undefined
+        body = dossierView(t, run, ledger, now, lay.inner, g, press, pr)
+      }
     } else if (ui.view === 'station') {
       const rows =
         ui.span === '30d'
