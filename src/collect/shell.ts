@@ -11,6 +11,13 @@ const ledgerAtom = atom({ plugin: 'watchducks', key: 'ledger' } as const, INITIA
 // Bash collector (spec §6.2): the command goes to the classifier and nowhere
 // else; stdout and stderr are never read. A relay's result.json is polled from
 // state by the timer in src/lifecycle.ts, so nothing starts here but the run.
+// A background task's notification row (UserMessage) gives its real outcome:
+// only its status and ids are read, never its text; the row is passed on untouched.
+
+// rows redraw often (scroll, resize): an outcome already sent is not sent again
+const sentOutcomes = new Set<string>()
+
+const OUTCOMES: Readonly<Record<string, 'done' | 'failed' | 'killed'>> = { completed: 'done', failed: 'failed', killed: 'killed' }
 
 async function send($: EngineInterface, action: Action, table: PriceTable): Promise<void> {
   try {
@@ -72,5 +79,31 @@ export function registerShellCollector(on: On, table: PriceTable): void {
       )
     }
     return r
+  }).catch(($, e, next) => next(e))
+
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    const props = e.props
+    const task = props.task
+    const word = task?.status
+    const status = typeof word === 'string' && Object.hasOwn(OUTCOMES, word) ? OUTCOMES[word] : undefined
+    if (props.origin.kind === 'task-notification' && task && status) {
+      const taskId = typeof task.id === 'string' && task.id !== '' ? task.id : undefined
+      const toolUseId = typeof task.toolUseId === 'string' && task.toolUseId !== '' ? task.toolUseId : undefined
+      const key = `${taskId ?? ''}|${toolUseId ?? ''}|${status}`
+      if (!sentOutcomes.has(key)) {
+        if (sentOutcomes.size > 1000) sentOutcomes.clear()
+        sentOutcomes.add(key)
+        const action: Action = {
+          type: 'bgOutcome',
+          ...(taskId !== undefined ? { taskId } : {}),
+          ...(toolUseId !== undefined ? { runId: 'bash:' + toolUseId } : {}),
+          status,
+          at: Date.now(),
+        }
+        // state is not written while a row draws: the write waits for a timer of its own
+        $.clock.after(0, () => void send($, action, table))
+      }
+    }
+    return next(e)
   }).catch(($, e, next) => next(e))
 }

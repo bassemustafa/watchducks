@@ -24,6 +24,7 @@ export type Action =
   | { type: 'bashStart'; id: string; cls: Classification; at: number; home?: string }
   | { type: 'bashResult'; id: string; isError: boolean; interrupted: boolean; backgroundTaskId?: string; at: number }
   | { type: 'bgSnapshot'; taskIds: readonly string[]; at: number }
+  | { type: 'bgOutcome'; taskId?: string; runId?: string; status: 'done' | 'failed' | 'killed'; at: number }
   | { type: 'relayResult'; id: string; proj: RelayProjection; at: number }
   | { type: 'relayFound'; id: string; outDir: string; at: number }
   | {
@@ -417,12 +418,24 @@ function reduceBgSnapshot(ledger: Ledger, a: Extract<Action, { type: 'bgSnapshot
   for (const [taskId, runId] of Object.entries(ledger.bgSeen)) {
     const run = getRun(ledger, runId)
     if (!run || run.status !== 'running' || present.has(taskId)) continue
-    // gone from the snapshot: returned, outcome unknown; a relay's result.json
-    // (read for a grace period after endedAt) can still give the real status
+    // gone from the snapshot: `ended` is the fallback when no task notification
+    // gives the outcome (it can arrive before or after the snapshot); a relay's
+    // result.json (read for a grace period after endedAt) can still give the real status
     changed.push(finish(run, 'ended', a.at))
   }
   if (changed.length === 0) return ledger
   return withHandlers({ ...ledger, runs: { ...ledger.runs, ...Object.fromEntries(changed.map(r => [r.id, r])) } })
+}
+
+/** The real outcome of a background task, from its task notification: a relay's result.json read wins over it. */
+function reduceBgOutcome(ledger: Ledger, a: Extract<Action, { type: 'bgOutcome' }>): Ledger {
+  const byTask = a.taskId !== undefined && Object.hasOwn(ledger.bgSeen, a.taskId) ? ledger.bgSeen[a.taskId] : undefined
+  const runId = byTask ?? a.runId
+  const run = runId === undefined ? undefined : getRun(ledger, runId)
+  if (!run || run.resultRead) return ledger
+  if (run.status === 'running') return withHandlers(putRun(ledger, finish(run, a.status, a.at)))
+  if (run.status === 'ended') return withHandlers(putRun(ledger, { ...run, status: a.status }))
+  return ledger
 }
 
 /** A relay started without `--out-dir` whose result.json was found: only a run that has neither an out-dir nor a result yet takes it. */
@@ -643,6 +656,8 @@ export function reduce(ledger: Ledger, action: Action, prices: PriceTable): Ledg
       return reduceBashResult(ledger, action)
     case 'bgSnapshot':
       return reduceBgSnapshot(ledger, action)
+    case 'bgOutcome':
+      return reduceBgOutcome(ledger, action)
     case 'relayResult':
       return reduceRelayResult(ledger, action, prices)
     case 'relayFound':

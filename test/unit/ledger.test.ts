@@ -96,6 +96,48 @@ test('background runs gone from a snapshot are ended; a relay result then gives 
   expect(l.runs['bash:tu2']!.status).toBe('done')
 })
 
+const bgShell = (id: string, taskId: string) => [
+  { type: 'bashStart', id, cls: { kind: 'cli', implementer: 'opencode' }, at: T0 },
+  { type: 'bashResult', id, isError: false, interrupted: false, backgroundTaskId: taskId, at: T0 + 1 },
+] as const
+
+test('an ended background run takes the outcome of its task notification and keeps its end', () => {
+  let l = apply(emptyLedger('s1', T0), ...bgShell('bash:tu20', 'b20'), { type: 'bgSnapshot', taskIds: [], at: T0 + 3 })
+  expect(l.runs['bash:tu20']!.status).toBe('ended')
+  l = reduce(l, { type: 'bgOutcome', taskId: 'b20', status: 'done', at: T0 + 9 }, PRICES)
+  expect(l.runs['bash:tu20']!.status).toBe('done')
+  expect(l.runs['bash:tu20']!.endedAt).toBe(T0 + 3)
+  expect(l.runs['bash:tu20']!.durationMs).toBe(3)
+})
+
+test('a running background run takes the outcome first and a later empty snapshot leaves it', () => {
+  let l = apply(emptyLedger('s1', T0), ...bgShell('bash:tu21', 'b21'))
+  l = reduce(l, { type: 'bgOutcome', taskId: 'b21', status: 'failed', at: T0 + 5 }, PRICES)
+  expect(l.runs['bash:tu21']!.status).toBe('failed')
+  expect(l.runs['bash:tu21']!.endedAt).toBe(T0 + 5)
+  l = reduce(l, { type: 'bgSnapshot', taskIds: [], at: T0 + 6 }, PRICES)
+  expect(l.runs['bash:tu21']!.status).toBe('failed')
+  expect(l.runs['bash:tu21']!.endedAt).toBe(T0 + 5)
+})
+
+test('an outcome with an unknown task id falls back to the run id', () => {
+  let l = apply(emptyLedger('s1', T0), ...bgShell('bash:tu22', 'b22'))
+  l = reduce(l, { type: 'bgOutcome', taskId: 'nope', runId: 'bash:tu22', status: 'killed', at: T0 + 5 }, PRICES)
+  expect(l.runs['bash:tu22']!.status).toBe('killed')
+  expect(reduce(l, { type: 'bgOutcome', taskId: 'nope', runId: 'bash:none', status: 'done', at: T0 + 6 }, PRICES)).toBe(l)
+})
+
+test('a relay result that was read is not changed by a task outcome', () => {
+  let l = apply(emptyLedger('s1', T0),
+    { type: 'bashStart', id: 'bash:tu23', cls: { kind: 'relay', implementer: 'opencode', readOnly: true, outDir: '/tmp/o23' }, at: T0 },
+    { type: 'bashResult', id: 'bash:tu23', isError: false, interrupted: false, backgroundTaskId: 'b23', at: T0 + 1 },
+    { type: 'bgSnapshot', taskIds: [], at: T0 + 2 },
+    { type: 'relayResult', id: 'bash:tu23', proj: { status: 'failed', readOnly: true, costReported: 0, usage: null, touchedFiles: 0 }, at: T0 + 3 })
+  expect(l.runs['bash:tu23']!.status).toBe('failed')
+  l = reduce(l, { type: 'bgOutcome', taskId: 'b23', status: 'done', at: T0 + 4 }, PRICES)
+  expect(l.runs['bash:tu23']!.status).toBe('failed')
+})
+
 test('a relay result with costReported 0 gives cost 0 from the report', () => {
   let l = apply(emptyLedger('s1', T0), { type: 'bashStart', id: 'bash:tu4', cls: { kind: 'relay', implementer: 'opencode', readOnly: false }, at: T0 })
   l = apply(l, { type: 'relayResult', id: 'bash:tu4', proj: { status: 'done', readOnly: false, costReported: 0, usage: null, touchedFiles: null }, at: T0 + 5 })

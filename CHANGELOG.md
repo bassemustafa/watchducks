@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Background shells (a command started with `run_in_background`, such as `sleep 40` or an `opencode run`) now end DEBRIEFED, WENT DARK or BURNED, from the status their task notification reports, instead of RETURNED (outcome unknown). Only the status and ids are read, never the notification's text. RETURNED remains for a task whose notification is never drawn.
+
 ### Changed
 
 - README: a recorded demo, a sidebar clip and the station board, a how-it-works diagram, and a plain explanation of delegate relays with a 12-line example. The reference sections are collapsible.
