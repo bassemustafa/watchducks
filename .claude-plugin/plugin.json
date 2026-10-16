@@ -1,6 +1,6 @@
 {
   "name": "watchducks",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "A flock of spy ducks watching your delegated work: every subagent, relay and background run from this session with tokens, cache, cost, model, effort and reviews.",
   "author": {
     "name": "bassemustafa",

@@ -401,7 +401,7 @@ See [SECURITY.md](SECURITY.md) for the full data inventory and threat model.
 
 <br>
 
-Estimated costs are priced from tokens, per million tokens, in this order: `priceOverrides`; watchducks' built-in table for Claude models, dated 2026-10-06; then LiteLLM's public price list, which is the copy fetched by the daily refresh or, until one succeeds, the copy bundled with this version (dated 2026-10-15). So a model that LiteLLM lists gets an estimate even when no cost was reported. When the provider a model ran through is not in LiteLLM's list (for example `opencode-go/glm-5.3`), the price of the model's own maker is used (`zai/glm-5.3`). Claude cache writes are priced at the 5-minute rate. LiteLLM rates are base-tier only (see [Known limits](#known-limits)).
+Estimated costs are priced from tokens, per million tokens, in this order: `priceOverrides`; watchducks' built-in table for Claude models, dated 2026-10-06; then LiteLLM's public price list, which is the copy fetched by the daily refresh or, until one succeeds, the copy bundled with this version (dated 2026-10-16). So a model that LiteLLM lists gets an estimate even when no cost was reported. When the provider a model ran through is not in LiteLLM's list (for example `opencode-go/glm-5.3`), the price of the model's own maker is used (`zai/glm-5.3`). Claude cache writes are priced at the 5-minute rate. LiteLLM rates are base-tier only (see [Known limits](#known-limits)).
 
 Estimates are list-price estimates, not invoices or subscription charges. Estimates are marked **est.**. The dossier names the price list date for a LiteLLM estimate.
 
