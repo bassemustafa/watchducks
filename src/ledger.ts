@@ -1,7 +1,7 @@
 import type { Classification, Implementer, Ledger, RelayProjection, Review, Run, RunStatus, Spend, Usage } from '../types'
 import { fnv1a, codenameFor } from './codename'
-import { shownCost, type CostMode, type Pricing } from './cost'
-import { addRunsToDays, dropOldDays } from './history'
+import { shownCost, shownHq, type CostMode, type Pricing } from './cost'
+import { addRunsToDays, dropOldDays, utcDay } from './history'
 import { ZERO_USAGE, addUsage, estimateCost, usageFromApi, type LitellmTable, type PriceTable } from './price'
 
 // Pure ledger reducer (spec §5-§7): every action returns a new ledger and the
@@ -266,8 +266,12 @@ function charge(
   // stored estimates are the Claude table's only; other models are priced at read time (src/cost.ts)
   const cost = estimateCost(used, usage.model || fallbackModel, prices, {})
   if (loop === undefined) {
-    const hqByModel = addByModel(ledger.hqByModel ?? {}, usage.model || fallbackModel, used, cost)
-    return { ...ledger, hq: addSpend(ledger.hq, used, cost), hqByModel }
+    const model = usage.model || fallbackModel
+    const day = utcDay(at)
+    const days = ledger.hqDays ?? {}
+    const hqDays = { ...days, [day]: addByModel(Object.hasOwn(days, day) ? days[day]! : {}, model, used, cost) }
+    const hqByModel = addByModel(ledger.hqByModel ?? {}, model, used, cost)
+    return bumpSeries({ ...ledger, hq: addSpend(ledger.hq, used, cost), hqByModel, hqDays }, at, totalTokens(used))
   }
   const run = getRun(ledger, loop)
   if (!run) return { ...ledger, overhead: addSpend(ledger.overhead, used, cost) }
@@ -277,8 +281,7 @@ function charge(
     usageSource: source === 'steps' ? 'steps' : (run.usageSource ?? 'complete'),
     ...(cost === null ? { costPartial: true } : { cost: (run.cost ?? 0) + cost, costSource: 'estimated' as const }),
   }
-  const tokens = used.uncached + used.output + used.cacheRead + used.cacheWrite
-  return bumpSeries(putRun(ledger, charged), at, tokens)
+  return bumpSeries(putRun(ledger, charged), at, totalTokens(used))
 }
 
 function stepKey(loop: string | undefined, turnId: string, index: number): string {
@@ -293,6 +296,7 @@ function reduceStep(ledger: Ledger, a: Extract<Action, { type: 'step' }>, prices
   const key = stepKey(a.loop, a.turnId, a.index)
   if (Object.hasOwn(ledger.countedSteps, key)) return ledger
   let next = ledger
+  if (a.loop === undefined && a.effort !== undefined) next = { ...next, hqEffort: a.effort }
   if (a.usage) {
     next = charge(next, a.loop, a.usage, a.model, 'steps', a.at, prices)
     next = {
@@ -501,7 +505,9 @@ function reduceRelayResult(ledger: Ledger, a: Extract<Action, { type: 'relayResu
   return rise > 0 ? bumpSeries(next, a.at, rise) : next
 }
 
-const totalTokens = (u: Usage | null): number => (u ? u.uncached + u.output + u.cacheRead + u.cacheWrite : 0)
+function totalTokens(u: Usage | null): number {
+  return u ? u.uncached + u.output + u.cacheRead + u.cacheWrite : 0
+}
 
 /**
  * Usage an adapter measured for a run (spec §3, §4, §4.7): the values are totals and replace the run's.
@@ -690,6 +696,15 @@ export function totals(ledger: Ledger, pricing?: Pricing): Totals {
     cost: null,
     costPartial: false,
     byImplementer: {},
+  }
+  // HQ counts in the usage, cost and implementer split like any Claude model, never in the status counters
+  const hq = ledger.hq
+  t.usage = addUsage(t.usage, hq.usage)
+  if (totalTokens(hq.usage) > 0) {
+    const shown = pricing ? shownHq(ledger, pricing.mode, pricing.table, pricing.fetched) : { cost: hq.cost, partial: hq.costPartial || undefined }
+    if (shown.cost !== null) t.cost = (t.cost ?? 0) + shown.cost
+    if (shown.cost === null || shown.partial) t.costPartial = true
+    t.byImplementer['claude-code'] = (t.byImplementer['claude-code'] ?? 0) + (shown.cost ?? 0)
   }
   for (const run of Object.values(ledger.runs)) {
     t[run.status] += 1

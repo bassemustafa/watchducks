@@ -1,6 +1,6 @@
 import type { Implementer, Ledger, Run, Usage } from '../../types'
 import { fingerprint } from '../collect/relay'
-import { shownCost, storedCost, type Pricing } from '../cost'
+import { hqModelOf, type Pricing } from '../cost'
 import { aggregateHistory, stationRowsFromLedger } from '../history'
 import { ident } from '../relay-result'
 import { exceedsBytes } from './opencode-stats'
@@ -122,25 +122,10 @@ function capRows(merged: ReadonlyMap<string, Row>): Row[] {
   return sorted.slice(0, MAX_ROWS)
 }
 
-/** The model of the main loop's requests: the one with the most tokens among `hqByModel` (the overflow bucket aside). */
-function hqModelOf(ledger: Ledger): string | undefined {
-  let best: string | undefined
-  let most = -1
-  for (const [model, spend] of Object.entries(ledger.hqByModel ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
-    if (model === OTHER_MODEL) continue
-    const tokens = tokensOf(usageOf(spend.usage))
-    if (tokens > most) {
-      most = tokens
-      best = modelName(model)
-    }
-  }
-  return best
-}
-
 /**
- * The JSON text of this session's report: its whole spend by implementer × model and nothing else. The rows are the main
- * loop's spend by model (implementer `claude-code`) plus the station board's rows of the ledger (the board's own spend
- * rules: a shared group once, a run with child rows contributing those) and the spend /flock clear retired, merged; past
+ * The JSON text of this session's report: its whole spend by implementer × model and nothing else. The rows are the station
+ * board's rows of the ledger (the board's own spend rules: the main loop's spend as `claude-code` rows, a shared group once, a
+ * run with child rows contributing those) and the spend /flock clear retired, merged; past
  * MAX_ROWS the smallest fold into `other` rows. `hqModel` names the model of the main loop's own requests. With `pricing` the
  * costs are the ones this session shows (cost mode and price table), else the stored ones.
  */
@@ -153,14 +138,6 @@ export function buildReport(
   pricing?: Pricing,
 ): string {
   const merged = new Map<string, Row>()
-  for (const [model, spend] of Object.entries(ledger.hqByModel ?? {})) {
-    const usage = usageOf(spend.usage)
-    // what the child shows: the cost under its own cost mode (the parent adds the rows up as they come)
-    const row = { cost: spend.cost, costSource: spend.cost === null ? null : ('estimated' as const), usage: spend.usage, model }
-    const shown = pricing ? shownCost(row, pricing.mode, pricing.table, pricing.fetched) : storedCost(row)
-    const cost = shown.cost !== null && Number.isFinite(shown.cost) ? Math.min(Math.max(shown.cost, 0), MAX_COST) : null
-    mergeRow(merged, { implementer: 'claude-code', model: modelName(model), usage, cost, costSource: cost === null ? null : (shown.source ?? 'estimated') })
-  }
   const retired = aggregateHistory([{ v: 1, sessionStartedAt: ledger.sessionStartedAt, days: ledger.retired ?? {} }], now)
   for (const s of [...stationRowsFromLedger(ledger, pricing), ...retired]) {
     // a bucket of runs that measured nothing carries no spend
@@ -171,7 +148,8 @@ export function buildReport(
     const usage = usageOf({ uncached: s.uncached, output: s.output, cacheRead: s.cacheRead, cacheWrite: s.cacheWrite })
     mergeRow(merged, { implementer: s.implementer, model: modelName(s.model), usage, cost, costSource })
   }
-  const hqModel = hqModelOf(ledger)
+  const hqRaw = hqModelOf(ledger)
+  const hqModel = hqRaw === undefined ? undefined : modelName(hqRaw)
   return JSON.stringify({
     schema: CHILD_SCHEMA,
     startedAt: stampText(startedAt),

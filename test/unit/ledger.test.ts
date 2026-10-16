@@ -819,3 +819,74 @@ test('a relay result with usage but no cost keeps the cost a child report or sta
   const none = apply(emptyLedger('s1', T0), claudeRelay('r1'), adapter('r1', 'child', 5, { cost: null, costSource: null }), relayDone('r1', null)).runs['r1']!
   expect(none.costSource).toBe('estimated')
 })
+
+// ---- HQ is an operative: its steps join the series, the effort and day record, and totals()
+
+const DAY = 86_400_000
+const hqStep = (index: number, at: number, over: Partial<Extract<Action, { type: 'step' }>> = {}): Action =>
+  ({ type: 'step', turnId: 't1', index, model: OPUS, usage: stepUsage(OPUS), at, ...over })
+
+test('a main-loop step joins the tokens-per-minute series', () => {
+  const l = apply(emptyLedger('s1', T0), hqStep(0, T0))
+  expect(seriesWindow(l, T0, 3)).toEqual([0, 0, 1100])
+  // a subagent step lands in the same minute bucket
+  expect(seriesWindow(apply(l, spawn('a1'), step(0)), T0 + 1000, 1)).toEqual([2200])
+})
+
+test('a main-loop step records the effort it carried, and a later one replaces it', () => {
+  const l = apply(emptyLedger('s1', T0), hqStep(0, T0, { effort: 'high' }))
+  expect(l.hqEffort).toBe('high')
+  expect(apply(l, hqStep(1, T0, { effort: 'low' })).hqEffort).toBe('low')
+  // a step without an effort leaves it, and a subagent's effort is never HQ's
+  expect(apply(l, hqStep(1, T0)).hqEffort).toBe('high')
+  expect(apply(l, spawn('a1'), step(0)).hqEffort).toBe('high')
+  expect(emptyLedger('s1', T0).hqEffort).toBeUndefined()
+})
+
+test('hqDays: main-loop steps on two UTC days land on two days, by model', () => {
+  const l = apply(emptyLedger('s1', T0),
+    hqStep(0, T0), hqStep(1, T0 + 1000, { model: 'claude-sonnet-5-5', usage: stepUsage('claude-sonnet-5-5') }), hqStep(2, T0 + DAY))
+  expect(Object.keys(l.hqDays!).sort()).toEqual(['2026-10-09', '2026-10-10'])
+  expect(Object.keys(l.hqDays!['2026-10-09']!).sort()).toEqual([OPUS, 'claude-sonnet-5-5'])
+  expect(l.hqDays!['2026-10-09']![OPUS]!.usage.uncached).toBe(1000)
+  expect(l.hqDays!['2026-10-10']![OPUS]!.usage.uncached).toBe(1000)
+  near(l.hqDays!['2026-10-10']![OPUS]!.cost, 0.006)
+  // a subagent step is no HQ day
+  expect(apply(emptyLedger('s1', T0), spawn('a1'), step(0)).hqDays ?? {}).toEqual({})
+})
+
+test('hqDays: a day keeps 16 named models, then other, and old saved state without it still works', () => {
+  const steps: Action[] = []
+  for (let i = 0; i < 17; i++) steps.push(hqStep(i, T0, { model: `m${i}`, usage: stepUsage(`m${i}`) }))
+  const day = apply(emptyLedger('s1', T0), ...steps).hqDays!['2026-10-09']!
+  expect(Object.keys(day).filter(k => k !== 'other').length).toBe(16)
+  expect(day['other']!.usage.uncached).toBe(1000)
+  const { hqDays: _gone, hqEffort: _none, ...old } = emptyLedger('s1', T0)
+  expect(Object.keys(apply(old, hqStep(0, T0)).hqDays!)).toEqual(['2026-10-09'])
+  expect(totals(old).usage.uncached).toBe(0)
+})
+
+test('totals include HQ usage and cost in the implementer split, and leave the status counters alone', () => {
+  const sub = apply(emptyLedger('s1', T0), spawn('a1'), step(0))
+  const withHq = apply(sub, hqStep(0, T0))
+  const a = totals(sub)
+  const b = totals(withHq)
+  expect(b.usage.uncached).toBe(a.usage.uncached + 1000)
+  expect(b.usage.output).toBe(a.usage.output + 100)
+  near(b.cost, (a.cost ?? 0) + 0.006)
+  near(b.byImplementer['claude-code'], (a.byImplementer['claude-code'] ?? 0) + 0.006)
+  expect([b.running, b.done, b.failed, b.killed, b.ended, b.unknown]).toEqual([a.running, a.done, a.failed, a.killed, a.ended, a.unknown])
+  expect(b.costPartial).toBe(false)
+  // with pricing the HQ cost is the one shown (the estimate of its model's list rate)
+  near(totals(withHq, { table: PRICES, mode: 'auto' }).cost, b.cost ?? 0)
+})
+
+test('totals: HQ alone counts, and an unpriced HQ model makes the cost partial', () => {
+  const l = apply(emptyLedger('s1', T0), hqStep(0, T0))
+  expect(totals(l).usage.uncached).toBe(1000)
+  near(totals(l).byImplementer['claude-code'], 0.006)
+  expect(totals(emptyLedger('s1', T0)).byImplementer).toEqual({})
+  const odd = apply(emptyLedger('s1', T0), hqStep(0, T0, { model: 'mystery-1', usage: stepUsage('mystery-1') }))
+  expect(totals(odd).costPartial).toBe(true)
+  expect(totals(odd).cost).toBeNull()
+})

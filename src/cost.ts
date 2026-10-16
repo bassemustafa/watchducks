@@ -126,3 +126,19 @@ export function shownHq(ledger: Pick<Ledger, 'hq' | 'hqByModel'>, mode: CostMode
   }
   return { cost, source, ...(partial ? { partial: true as const } : {}) }
 }
+
+/** The model of the main loop's requests: the one with the most tokens among `hqByModel` (the overflow `'other'` key aside), ties by name. */
+export function hqModelOf(ledger: Pick<Ledger, 'hqByModel'>): string | undefined {
+  let best: string | undefined
+  let most = -1
+  for (const [model, spend] of Object.entries(ledger.hqByModel ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    if (model === 'other') continue
+    const u = spend.usage
+    const tokens = u.uncached + u.output + u.cacheRead + u.cacheWrite
+    if (tokens > most) {
+      most = tokens
+      best = model
+    }
+  }
+  return best
+}

@@ -81,6 +81,10 @@ export type Ledger = {
   hq: Spend
   /** The main loop's spend by model (at most 16 models, then `'other'`); live only, never written to history. Absent in state saved before v0.2. */
   hqByModel?: Record<string, Spend>
+  /** The latest `effort` a main-loop step carried (the HQ card and dossier show it). Absent until one did, and in older saved state. */
+  hqEffort?: string | number
+  /** The main loop's spend by UTC day, then by model (each day capped like `hqByModel`); the history record takes HQ from it. Absent in older saved state. */
+  hqDays?: Record<string, Record<string, Spend>>
   overhead: Spend
   /** `${loop}|${turnId}` for every turn that reported step usage (loop = agentId or 'main'). */
   turnsWithSteps: Record<string, true>
@@ -90,7 +94,7 @@ export type Ledger = {
   findings: Record<string, { runId: string; count: number }>
   /** Background task ids seen in any snapshot, mapped to their run id. */
   bgSeen: Record<string, string>
-  /** Delegated tokens per minute, oldest first, at most 30 entries ending at `seriesEndMinute`. */
+  /** Tokens per minute of HQ and the runs, oldest first, at most 30 entries ending at `seriesEndMinute`. */
   tokenSeries: number[]
   seriesEndMinute: number
   /** History days of runs /clear removed from the live ledger, so the session's record keeps them. */

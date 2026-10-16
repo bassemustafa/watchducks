@@ -385,6 +385,21 @@ test('reportUsage leaves the report as it was', () => {
   expect(JSON.stringify(r)).toBe(before)
 })
 
+test('a ledger with HQ spend and a subagent gives the same report rows as before: HQ is counted once', () => {
+  const l = apply(emptyLedger('s1', T0),
+    stepOf(OPUS, 1000),
+    { type: 'spawn', id: 'a1', agentType: 'Explore', requestedModel: OPUS, at: T0 },
+    stepOf(OPUS, 900, { loop: 'a1', turnId: 't2', at: T0 + 2000 }),
+    stepOf('claude-sonnet-5-5', 400, { turnId: 't3', at: T0 + 3000 }))
+  const out = projectReport(buildReport(l, T0, undefined, 'running', NOW), NOW)!
+  const opus = out.rows.find(r => r.implementer === 'claude-code' && r.model === OPUS)!
+  expect(opus.usage.uncached).toBe(1900)
+  expect(out.rows.find(r => r.model === 'claude-sonnet-5-5')!.usage.uncached).toBe(400)
+  expect(out.rows.length).toBe(2)
+  expect(out.rows.reduce((n, r) => n + r.usage.uncached, 0)).toBe(2300)
+  expect(out.hqModel).toBe(OPUS)
+})
+
 test('CHILD_ID accepts a UUID and rejects anything that is not a plain file name', () => {
   expect(CHILD_ID.test('3f2b8c1e-9a4d-4e6f-b1c2-0d5e7a8b9c10')).toBe(true)
   for (const bad of ['..', 'a/b', 'a.b', '', 'a'.repeat(129)]) expect(CHILD_ID.test(bad)).toBe(false)

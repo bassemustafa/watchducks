@@ -618,3 +618,78 @@ test('the dossier names where the numbers came from, and marks approximate ones'
     expect(await dossierText($, surface, 'a1')).toContain('per request')
   }
 })
+
+// ---- HQ, the main loop, is an operative with its own card and dossier
+
+function mainLoop(on: On): void {
+  on('turn.step', async function* () {
+    return { turnId: 't1', index: 0, answer: '', toolUses: [], stopReason: 'end_turn', usage: BIG_USAGE } as never
+  })
+}
+
+async function mainStep($: Engine): Promise<void> {
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-sonnet-5-5', effort: 'high' } as never)) {
+    /* chunks are never read */
+  }
+}
+
+test('after a main-loop step the pane shows an HQ card, not the old dim line, and the card has no status words', async ($, on) => {
+  mainLoop(on)
+  await mainStep($)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const text = await view($, surface, 52)
+    expect(text).toContain('HQ  claude-code · claude-sonnet-5-5 · high')
+    expect(text).toContain('220k tok')
+    expect(text).not.toMatch(/HQ  [0-9.]+k tok/)
+    // the only status words are the counters' own: the HQ card adds none
+    expect(text.match(/IN FIELD/g)?.length).toBe(1)
+    expect(text.match(/DEBRIEFED/g)?.length).toBe(1)
+    // HQ has tokens, so the empty-state text is gone, and the card sits under OPERATIVES
+    expect(text).not.toContain('No operatives yet')
+    expect(text.indexOf('OPERATIVES')).toBeLessThan(text.indexOf('HQ  claude-code'))
+  }
+})
+
+test('there is no HQ card before HQ has any tokens', async ($, on) => {
+  mock.clock(on)
+  const text = await view($, 'terminal', 52)
+  expect(text).not.toContain('HQ  claude-code')
+  expect(text).toContain('No operatives yet')
+})
+
+test('the HQ card is first above the runs, and pressing it opens the HQ dossier', async ($, on) => {
+  const state = watchUi(on)
+  runningAgent(on)
+  await stepAgent($)
+  await mainStep($)
+  const ui = await pane($, 'terminal', 52)
+  const text = await drawn(ui)
+  // the card buttons after the two tabs: HQ's first, then the subagent's
+  const labels = (text.match(/"label":"[^"]*"/g) ?? []).slice(2)
+  expect(labels.length).toBe(2)
+  expect(labels[0]).toBe('"label":"HQ  claude-code · claude-sonnet-5-5 · high"')
+  expect(labels[1]).toContain('claude-code · claude-sonnet-5-5')
+  await ui.press({ key: 'hq' })
+  expect(state().view).toBe('dossier')
+  expect(state().dossierId).toBe('hq')
+  const dossier = await drawn(ui)
+  expect(dossier).toContain('main loop')
+  expect(dossier).toContain('cache hit')
+  expect(dossier).toContain('claude-sonnet-5-5')
+  expect(dossier).toContain('high (observed)')
+  expect(dossier).toContain('Back')
+  expect(dossier).not.toContain('IN FIELD')
+  expect(dossier).not.toContain('handler')
+  expect(dossier).not.toContain('read-only')
+  expect(dossier).not.toContain('ended')
+})
+
+test('the station board shows the HQ model as a claude-code row', async ($, on) => {
+  mock.store(on)
+  mainLoop(on)
+  await mainStep($)
+  const ui = await pane($, 'terminal', 52)
+  await ui.press({ key: 'station' })
+  expect(await drawn(ui)).toContain('claude-code · claude-sonnet-5-5')
+})
+

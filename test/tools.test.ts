@@ -80,6 +80,25 @@ test('roster with no runs answers No operatives yet.', async $ => {
   expect(JSON.stringify(answer)).toContain('No operatives yet.')
 })
 
+test('the roster starts with the HQ line once HQ has tokens, and has none before', async ($, on) => {
+  const ledger = watchLedger(on)
+  on('agent.spawn', async () => ({ model: 'claude-sonnet-5-5', agentId: 'a10' }))
+  on('turn.step', async function* () {
+    const usage = { model: 'claude-sonnet-5-5', input_tokens: 1000, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    return { turnId: 't1', index: 0, answer: '', toolUses: [], stopReason: 'end_turn', usage } as never
+  })
+  await $.agent.spawn({ subagentType: 'Explore' } as never)
+  const code = ledger().runs['a10']!.codename
+  const before = JSON.stringify(await $.tool.call({ tool: 'mcp__watchducks__roster' } as never))
+  expect(before).not.toContain('HQ · main loop')
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-sonnet-5-5' } as never)) {
+    /* chunks are never read */
+  }
+  const after = JSON.stringify(await $.tool.call({ tool: 'mcp__watchducks__roster' } as never))
+  expect(after).toContain('HQ · main loop · claude-code · claude-sonnet-5-5 · — · —')
+  expect(after.indexOf('HQ · main loop')).toBeLessThan(after.indexOf(code))
+})
+
 test('an Edit whose result is an error does not count as a patch', async ($, on) => {
   const ledger = watchLedger(on)
   on('agent.spawn', async () => ({ model: 'claude-sonnet-5-5', agentId: 'a4' }))

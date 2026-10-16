@@ -1,7 +1,7 @@
 import type { Elements } from 'claude-code'
 
 import type { Ledger, Run, UiState, Usage } from '../../types'
-import { shownCost, storedCost, type Pricing } from '../cost'
+import { shownCost, shownHq, storedCost, type Pricing } from '../cost'
 import { utcDay } from '../history'
 import { LITELLM_DATE } from '../prices-litellm'
 import { cachePct, fmtCost, fmtDuration, fmtTokens } from './format'
@@ -174,6 +174,52 @@ export function dossierView(
       {reviews.length === 0 && suspects.length === 0 && row('handler', 'none recorded')}
       {reviews.map(line => row('handler', line, PALETTE.handler))}
       {suspects.length > 0 && row('suspected', 'handler? ' + suspects.join(', '), PALETTE.handler)}
+    </Box>
+  )
+}
+
+/** HQ's dossier (id `hq`): the main loop has no status, end, lane or handlers, only its model, effort, time and figures. */
+export function hqDossierView(t: Table, ledger: Ledger, now: number, inner: number, press: Press, pricing?: Pricing): ReturnType<Table['Box']> {
+  const { Box, Text, Button } = t
+  const back = <Button key="back" hotkey="b" plain label="← Back" onPress={() => press({ view: 'field', dossierId: undefined })} />
+  const row = (label: string, value: string, valueColor?: string) => (
+    <Text wrap="truncate">
+      <Text dimColor>{label.padEnd(LABEL)}</Text>
+      <Text color={valueColor}>{fit(value, inner - LABEL)}</Text>
+    </Text>
+  )
+  const u = ledger.hq.usage
+  const total = totalTokens(u) ?? 0
+  const shown = pricing ? shownHq(ledger, pricing.mode, pricing.table, pricing.fetched) : storedCost({ cost: ledger.hq.cost, costSource: ledger.hq.cost === null ? null : 'estimated', costPartial: ledger.hq.costPartial })
+  const tokensOf = (s: { usage: Usage }) => totalTokens(s.usage) ?? 0
+  const byTokens = Object.entries(ledger.hqByModel ?? {}).sort(([a, x], [b, y]) => tokensOf(y) - tokensOf(x) || (a < b ? -1 : a > b ? 1 : 0))
+  const models = byTokens.length > 0 ? byTokens.map(([model]) => model).join(', ') : '—'
+  const effort = ledger.hqEffort === undefined ? '—' : `${ledger.hqEffort} (observed)`
+  return (
+    <Box flexDirection="column">
+      {back}
+      <Text> </Text>
+      <Text bold color={PALETTE.accent}>
+        HQ
+      </Text>
+      <Text> </Text>
+      {row('kind', 'main loop')}
+      {row('implementer', 'claude-code')}
+      {row('model', models)}
+      {row('effort', effort)}
+      <Text> </Text>
+      {row('started', clock(ledger.sessionStartedAt))}
+      {row('duration', fmtDuration(now - ledger.sessionStartedAt))}
+      <Text> </Text>
+      {row('input', fmtTokens(u.uncached + u.cacheRead + u.cacheWrite))}
+      {row('  uncached', fmtTokens(u.uncached))}
+      {row('  cache read', fmtTokens(u.cacheRead))}
+      {row('  cache write', fmtTokens(u.cacheWrite))}
+      {row('output', fmtTokens(u.output))}
+      {row('total', fmtTokens(total))}
+      {row('cache hit', cachePct(u))}
+      {row('cost', fmtCost(shown.cost, shown.source, shown.partial === true), PALETTE.accent)}
+      {shown.partial === true && <Text dimColor>{'  some requests had no price'}</Text>}
     </Box>
   )
 }

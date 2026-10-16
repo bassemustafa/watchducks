@@ -1,4 +1,4 @@
-import type { HistoryRecord, Implementer, Ledger, Run, StationRow } from '../types'
+import type { HistoryRecord, Implementer, Ledger, Run, Spend, StationRow, Usage } from '../types'
 
 import { shownCost, storedCost, type Pricing, type Shown } from './cost'
 
@@ -71,7 +71,7 @@ function bucketKey(run: Run): string {
 }
 
 /** One breakdown row of a Claude child: its spend only, no op (the run's op is counted once, on the run's own bucket). */
-function addRow(c: Counters, row: NonNullable<Run['rows']>[number], pricing: Pricing | undefined): void {
+function addRow(c: Counters, row: Parameters<typeof shownCost>[0] & { usage: Usage }, pricing: Pricing | undefined): void {
   const shown = shownOf(row, pricing)
   c.usageOps += 1
   c.uncached += row.usage.uncached
@@ -94,6 +94,15 @@ function addToBuckets(bucketOf: (key: string) => Counters, run: Run, pricing: Pr
     addRun(bucketOf(bucketKey(run)), run, pricing, false)
     for (const row of rows) addRow(bucketOf(`${row.implementer}|${row.model}`), row, pricing)
   }
+}
+
+/** The main loop's spend under one model as spend only on its `claude-code|<model>` bucket: no op, no status (like a child row). */
+function addHqSpend(bucketOf: (key: string) => Counters, model: string, spend: Spend, pricing: Pricing | undefined): void {
+  addRow(
+    bucketOf(`claude-code|${model}`),
+    { cost: spend.cost, costSource: spend.cost === null ? null : 'estimated', costPartial: spend.costPartial, usage: spend.usage, model },
+    pricing,
+  )
 }
 
 function orderedRuns(ledger: Ledger): Run[] {
@@ -149,12 +158,23 @@ export function addRunsToDays(days: HistoryRecord['days'], runs: readonly Run[],
   return out
 }
 
-/** The session's whole record, rebuilt from the ledger (idempotent): runs /clear retired plus the live ones. HQ and overhead are excluded. */
+/** The session's whole record, rebuilt from the ledger (idempotent): runs /clear retired plus the live ones, and HQ's spend by day. Overhead is excluded. */
 export function recordFromLedger(ledger: Ledger, pricing?: Pricing): HistoryRecord {
-  return { v: 1, sessionStartedAt: ledger.sessionStartedAt, days: addRunsToDays(ledger.retired ?? {}, orderedRuns(ledger), pricing) }
+  const days = addRunsToDays(ledger.retired ?? {}, orderedRuns(ledger), pricing)
+  // HQ's days past the 30-day window are dropped as everywhere else; the window ends at HQ's newest day
+  const hqDays = ledger.hqDays ?? {}
+  const newest = Object.keys(hqDays).sort().pop()
+  const kept = newest === undefined ? {} : dropOldDays(Object.fromEntries(Object.keys(hqDays).map(day => [day, {}])), Date.parse(`${newest}T00:00:00Z`))
+  for (const day of Object.keys(kept)) {
+    const bucket = (days[day] ??= {})
+    for (const [model, spend] of Object.entries(hqDays[day]!)) {
+      addHqSpend(key => (bucket[key] ??= emptyCounters()) as Counters, model, spend, pricing)
+    }
+  }
+  return { v: 1, sessionStartedAt: ledger.sessionStartedAt, days }
 }
 
-/** Station rows for the live session (all runs, no day split). */
+/** Station rows for the live session (all runs and the main loop's spend, no day split). */
 export function stationRowsFromLedger(ledger: Ledger, pricing?: Pricing): StationRow[] {
   const buckets = new Map<string, Counters>()
   const bucketOf = (key: string): Counters => {
@@ -163,6 +183,7 @@ export function stationRowsFromLedger(ledger: Ledger, pricing?: Pricing): Statio
     return c
   }
   for (const run of orderedRuns(ledger)) addToBuckets(bucketOf, run, pricing)
+  for (const [model, spend] of Object.entries(ledger.hqByModel ?? {})) addHqSpend(bucketOf, model, spend, pricing)
   return rowsFromBuckets(buckets)
 }
 

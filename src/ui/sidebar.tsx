@@ -2,13 +2,13 @@ import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, On, PluginOptions } from 'claude-code'
 
 import type { HistoryRecord, Implementer, Ledger, Run, StationRow, UiState } from '../../types'
-import { shownCost, shownHq, type Pricing } from '../cost'
+import { hqModelOf, shownCost, shownHq, type Pricing } from '../cost'
 import { HISTORY_PREFIX, aggregateHistory, stationRowsFromLedger } from '../history'
 import { seriesWindow, totals, type Totals } from '../ledger'
 import { PRICES_KEY, fetchedPrices } from '../price'
 import { INITIAL_LEDGER, INITIAL_UI, isHistoryRecord, pricing, withFetched } from '../state'
 import { RADAR_FULL, RADAR_SMALL, blipsFor, radar, svgBlipsFor } from './animate'
-import { codenameOf, dossierView, fit, runCost, runElapsed, runTokens, totalTokens, type Glyphs, type Press, type Table } from './dossier'
+import { codenameOf, dossierView, hqDossierView, fit, runCost, runElapsed, runTokens, totalTokens, type Glyphs, type Press, type Table } from './dossier'
 import { cachePct, fmtCost, fmtDuration, fmtElapsedCoarse, fmtTokens, sparkline } from './format'
 import { STAMP_MS, STAMP_TEXT, TICK_MS, dotFrame, dotRaster, motion as motionState, stampRaster, tickerValue, type StampKind } from './motion'
 import { duckLogo, gradientBar, hex, radarFrame, type RasterSpec } from './raster'
@@ -391,6 +391,27 @@ function card(t: Table, ledger: Ledger, run: Run, now: number, inner: number, g:
   )
 }
 
+/** HQ, the main loop, as the first card: a fixed dot, no status words (it has no end), its own figures; null before it has any tokens. */
+function hqCard(t: Table, ledger: Ledger, now: number, inner: number, g: Glyphs, press: Press, coarse: boolean, pr: Pricing): El | null {
+  const tokens = totalTokens(ledger.hq.usage) ?? 0
+  if (tokens === 0) return null
+  const { Box, Text, Button } = t
+  const shown = shownHq(ledger, pr.mode, pr.table, pr.fetched)
+  const rest = fit(`HQ  claude-code · ${hqModelOf(ledger) ?? '—'} · ${ledger.hqEffort ?? '—'}`, Math.max(1, inner - (Array.from(g.on).length + 1)))
+  const figures = [(coarse ? fmtElapsedCoarse : fmtDuration)(now - ledger.sessionStartedAt), `${fmtTokens(tokens)} tok`, fmtCost(shown.cost, shown.source, shown.partial === true)]
+  const whole = figures.join('   ')
+  const lines = Array.from(whole).length <= inner ? [whole] : packFigures(figures, inner)
+  return (
+    <Box key="card-hq" flexDirection="column">
+      <Box>
+        <Text color={PALETTE.accent}>{`${g.on} `}</Text>
+        <Button key="hq" plain label={rest} onPress={() => press({ view: 'dossier', dossierId: 'hq' })} />
+      </Box>
+      <Text dimColor>{lines.join('\n')}</Text>
+    </Box>
+  )
+}
+
 function fieldView(
   t: Table,
   ledger: Ledger,
@@ -405,7 +426,7 @@ function fieldView(
   const blank = <Text> </Text>
   const tot = totals(ledger, lay.pricing)
   const runs = orderedRuns(ledger)
-  const delegated = totalTokens(tot.usage) ?? 0
+  const signalTokens = totalTokens(tot.usage) ?? 0
   const series = sparkline(seriesWindow(ledger, now, 30), Math.min(15, Math.max(4, inner - LABEL - 2)))
   const parts = spendParts(tot)
 
@@ -417,10 +438,7 @@ function fieldView(
       </Text>
     </Text>
   )
-  const hq = ledger.hq
-  const hqTokens = totalTokens(hq.usage) ?? 0
-  const hqShown = shownHq(ledger, lay.pricing.mode, lay.pricing.table, lay.pricing.fetched)
-  const hqLine = `HQ  ${hqTokens > 0 ? fmtTokens(hqTokens) + ' tok' : '—'} · ${hqTokens > 0 ? fmtCost(hqShown.cost, hqShown.source, hqShown.partial === true) : '—'}`
+  const hq = hqCard(t, ledger, now, inner, g, press, lay.coarse, lay.pricing)
   const ohTokens = totalTokens(ledger.overhead.usage) ?? 0
 
   return (
@@ -437,7 +455,7 @@ function fieldView(
           <Text color={PALETTE.accent}>{series}</Text>
         </Text>
       )}
-      {kv('tokens', fmtTokens(delegated), PALETTE.accent)}
+      {kv('tokens', fmtTokens(signalTokens), PALETTE.accent)}
       {kv('cache', cachePct(tot.usage), PALETTE.accent)}
       {art.cacheBar}
       {blank}
@@ -450,10 +468,7 @@ function fieldView(
           <Text>{fmtCost(v, null, false).padStart(8)}</Text>
         </Text>
       ))}
-      {blank}
-      <Text dimColor wrap="truncate">
-        {hqLine}
-      </Text>
+      {lay.showOverhead && blank}
       {lay.showOverhead && (
         <Text dimColor wrap="truncate">
           {`engine  ${ohTokens > 0 ? fmtTokens(ohTokens) + ' tok' : '—'}`}
@@ -464,7 +479,8 @@ function fieldView(
         OPERATIVES
       </Text>
       {blank}
-      {runs.length === 0 && <Text dimColor>No operatives yet — the flock is watching.</Text>}
+      {hq !== null && <Box flexDirection="column" marginBottom={runs.length === 0 ? 0 : 1}>{hq}</Box>}
+      {runs.length === 0 && hq === null && <Text dimColor>No operatives yet — the flock is watching.</Text>}
       {runs.map((run, i) => (
         <Box flexDirection="column" key={'card:' + run.id} marginBottom={i === runs.length - 1 ? 0 : 1}>
           {card(t, ledger, run, now, inner, g, stampOf(ui, run.id, now), lay.stampTable, press, lay.coarse, lay.pricing)}
@@ -537,7 +553,7 @@ export function registerSidebar(on: On, options: PluginOptions): void {
     let body: El
     if (ui.view === 'dossier') {
       const run = ui.dossierId !== undefined && Object.hasOwn(ledger.runs, ui.dossierId) ? ledger.runs[ui.dossierId] : undefined
-      body = dossierView(t, run, ledger, now, lay.inner, g, press, pr)
+      body = ui.dossierId === 'hq' ? hqDossierView(t, ledger, now, lay.inner, press, pr) : dossierView(t, run, ledger, now, lay.inner, g, press, pr)
     } else if (ui.view === 'station') {
       const rows =
         ui.span === '30d'

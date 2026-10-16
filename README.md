@@ -162,8 +162,8 @@ The ducks talk in code. Here's the decoder ring.
 
 1. **Header:** a pixel-art duck in a fedora and shades, a radar with one blip per running operative, and the title THE FLOCK.
 2. **Counters:** IN FIELD, DEBRIEFED and WENT DARK counts. RETURNED and OFF RADAR appear when they are not zero. (Status words are explained in the [Glossary](#-spy-lingo).)
-3. **Signal:** a tokens-per-minute sparkline for the last 30 minutes, total tokens, a cache hit bar, spend by implementer, and a dim line for HQ (the main loop).
-4. **Operative cards:** one two-line card per tracked run (an "operative"). Line 1: status dot, codename, implementer · model · effort. Line 2: elapsed time, tokens and cost, or the review line. Press a card to open its dossier.
+3. **Signal:** a tokens-per-minute sparkline for the last 30 minutes, total tokens, a cache hit bar and spend by implementer. HQ (the main loop) counts in all of it, like any Claude model.
+4. **Operative cards:** an HQ card first (once the main loop has used tokens), then one two-line card per tracked run (an "operative"). Line 1: status dot, codename, implementer · model · effort. Line 2: elapsed time, tokens and cost, or the review line. The HQ card has a fixed dot and no status words: its line 2 is time since the session started, tokens and cost. Press a card to open its dossier.
 5. **Station board:** see below.
 
 A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
@@ -176,8 +176,12 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
 
   tokens/min  ⣀⣤⣶⣿⣷⣤⣀   412k total
   cache       ████████░░░░  61%
-  spend       ██████▒▒▒░░   claude ■ opencode ■
-  HQ          96k tok · $0.71
+  spend       ██████▒▒▒░░   claude-code ■ claude ■ opencode ■
+
+  OPERATIVES
+
+  ● HQ  claude-code · claude-opus-5-5 · high
+    38m   96k tok   $0.71
 
   ● GOLDENEYE-7Q   claude · claude-sonnet-5-5 · high
     4m 12s · 88k tok · $0.42 reported
@@ -192,7 +196,7 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
   claude × sonnet-5-5   ████████   4 ops  …
 ```
 
-**The dossier** is the detail view of one operative: codename, kind, agent type, lane, implementer, model or models, effort and where it came from, read-only flag, status, start, end and duration, tokens, cache %, cost with its source, handler reviews, patches and leaks. Tokens show `input` (uncached + cache read + cache write) with those three parts under it, then `output` and `total`. It has a Back button. The Agent call's description is not shown.
+**The dossier** is the detail view of one operative (HQ's has no status, end, lane or handlers: kind `main loop`, its models, effort as observed, start, duration, tokens and cost): codename, kind, agent type, lane, implementer, model or models, effort and where it came from, read-only flag, status, start, end and duration, tokens, cache %, cost with its source, handler reviews, patches and leaks. Tokens show `input` (uncached + cache read + cache write) with those three parts under it, then `output` and `total`. It has a Back button. The Agent call's description is not shown.
 
 **The station board** has one row per implementer × model, with a proportional bar (by cost, or by tokens when cost is unknown). Columns: ops, done, failed, tokens, cache %, cost, vetted/ops, and leaks per vetted op. Each row also shows `in` and `out` totals and, when tokens were measured, the `uncached · read · write` split. This works for both the Session and the 30 days span. Use the **Session | 30 days** toggle to switch between this session and the last 30 days.
 
@@ -239,9 +243,9 @@ A sketch of the layout (not a screenshot; exact glyphs and spacing differ):
 | `opencode` relay | from the command and result.json (`tool`, `model`, `variant`) | from result.json | — (with `opencodeStats` on: from `opencode stats`) | reported by the relay, or from `opencode stats` with `opencodeStats` on; `$0 reported` under subscription plans |
 | `codex` relay | from the command and result.json, when present | from result.json | — | — |
 | Other relay scripts (a `relay*` script, or one under a `*delegate*` folder) | from the path, `--tool`, or result.json `tool` (`unknown` until then) | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise from the Bash result only | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — | from result.json when its schema is `delegate-relay.result.v<N>`, otherwise — |
-| Raw CLIs: `codex exec`, `opencode run`, `claude -p`, `gemini -p` | implementer, plus `--model`/`-m` if given literally | tool result (foreground) or background snapshots | — (`opencode run` with `opencodeStats` on: `opencode stats`; `claude -p` with watchducks loaded in it: its child report) | — (same sources as tokens) |
-| Other background shell | implementer `shell` | background snapshots | — | — |
-| HQ (main loop) | session model | — | yes, per request | estimated; shown separately, never in delegated totals |
+| Raw CLIs: `codex exec`, `opencode run`, `claude -p`, `gemini -p` | implementer, plus `--model`/`-m` if given literally | tool result (foreground), or the task notification (background snapshots when none is drawn) | — (`opencode run` with `opencodeStats` on: `opencode stats`; `claude -p` with watchducks loaded in it: its child report) | — (same sources as tokens) |
+| Other background shell | implementer `shell` | the task notification (background snapshots when none is drawn) | — | — |
+| HQ (main loop) | session model, effort seen per request | — | yes, per request | estimated; counted in Signal, the station board and history like any Claude model |
 
 > **`--out-dir` is optional.** With it, watchducks reads `<out-dir>/result.json`. Without it, watchducks finds the result itself (discovery). While a relay without an out-dir runs (up to 3 h) and for less than 2 minutes after it ends, it scans the allowed folders about every 9 s and pairs a `result.json` with the run by start time, tool and working directory. The out-dir, or the folder discovery finds, must be under the system temp dir, `/tmp`, the session root or a `relayRoots` entry.
 

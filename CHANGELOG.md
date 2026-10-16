@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- HQ (the main loop) is an operative: its own card, first under OPERATIVES, with model, effort, time since the session started, tokens and cost (no status words, since it never ends), and a dossier with its models, effort, token breakdown, cache hit and cost. Signal's tokens, tok/min, cache, spend and the per-implementer split now include HQ; the station board and the 30-day history count its spend in the `claude-code · <model>` rows like any Claude model (as spend, not as ops); the `roster` tool lists it first. The dim HQ line under Signal is gone.
+
 ### Fixed
 
 - Background shells (a command started with `run_in_background`, such as `sleep 40` or an `opencode run`) now end DEBRIEFED, WENT DARK or BURNED, from the status their task notification reports, instead of RETURNED (outcome unknown). Only the status and ids are read, never the notification's text. RETURNED remains for a task whose notification is never drawn.

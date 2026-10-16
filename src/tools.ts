@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, ToolSpec } from 'claude-code'
 
 import type { Ledger } from '../types'
+import { hqModelOf } from './cost'
 import { reduce, resolveRun, type Action } from './ledger'
 import type { PriceTable } from './price'
 import { INITIAL_LEDGER } from './state'
@@ -18,7 +19,7 @@ const MAX_EDITS = 100000
 
 export const ROSTER_SPEC: ToolSpec = {
   name: 'roster',
-  description: "Lists this session's delegated runs, one line each: codename · kind · implementer · model · lane · status. Read-only.",
+  description: "Lists this session's main loop (HQ) and delegated runs, one line each: codename · kind · implementer · model · lane · status. Read-only.",
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
 }
 
@@ -39,9 +40,11 @@ export const VERDICT_SPEC: ToolSpec = {
   },
 }
 
-/** One line per run in creation order; 'No operatives yet.' when there are none. */
+/** HQ's line first once it has tokens, then one line per run in creation order; 'No operatives yet.' when there are none. */
 export function rosterLines(ledger: Ledger): string {
   const lines: string[] = []
+  const hq = ledger.hq.usage
+  if (hq.uncached + hq.output + hq.cacheRead + hq.cacheWrite > 0) lines.push(`HQ · main loop · claude-code · ${hqModelOf(ledger) ?? '—'} · — · —`)
   for (const id of ledger.order) {
     const run = Object.hasOwn(ledger.runs, id) ? ledger.runs[id] : undefined
     if (!run) continue

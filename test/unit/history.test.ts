@@ -214,3 +214,52 @@ test('a run with child rows adds its spend to the rows implementer × model and 
   expect(bucket['opencode|openai/gpt-6.1-sol']!.costReported).toBe(0.5)
   expect(stationRowsFromLedger(ledgerOf([child])).length).toBe(2)
 })
+
+// ---- HQ's spend lands on the claude-code buckets as spend only
+
+const HQ_SONNET = { usage: { uncached: 500, output: 50, cacheRead: 0, cacheWrite: 0 }, cost: 0.25, costPartial: false }
+const SUB = run('s1', {
+  kind: 'agent', implementer: 'claude-code', model: 'claude-sonnet-5-5', status: 'done',
+  usage: { uncached: 100, output: 10, cacheRead: 0, cacheWrite: 0 }, usageSource: 'steps', cost: 0.05, costSource: 'estimated',
+})
+
+test('stationRowsFromLedger adds HQ spend to claude-code|model, merged with a subagent, and counts ops for the subagent only', () => {
+  const l: Ledger = { ...ledgerOf([SUB]), hqByModel: { 'claude-sonnet-5-5': HQ_SONNET, 'claude-opus-5-5': { ...HQ_SONNET, cost: null } } }
+  const rows = stationRowsFromLedger(l)
+  const sonnet = rows.find(r => r.implementer === 'claude-code' && r.model === 'claude-sonnet-5-5')!
+  expect(sonnet.ops).toBe(1)
+  expect(sonnet.done).toBe(1)
+  expect(sonnet.uncached).toBe(600)
+  expect(sonnet.output).toBe(60)
+  expect(sonnet.usageOps).toBe(2)
+  expect(sonnet.costOps).toBe(2)
+  expect(Math.abs(sonnet.costEstimated - 0.3) < 1e-9).toBe(true)
+  // an HQ-only model is a row with spend and no op, status or unknown-cost op
+  const opus = rows.find(r => r.model === 'claude-opus-5-5')!
+  expect([opus.ops, opus.done, opus.failed, opus.unknownCostOps]).toEqual([0, 0, 0, 0])
+  expect(opus.uncached).toBe(500)
+  expect(opus.usageOps).toBe(1)
+  expect(opus.costOps).toBe(0)
+})
+
+test('recordFromLedger carries hqDays into each day bucket, merged with that day\'s runs, and drops days past 30', () => {
+  const l: Ledger = {
+    ...ledgerOf([SUB]),
+    hqDays: {
+      '2026-10-09': { 'claude-sonnet-5-5': HQ_SONNET },
+      '2026-10-11': { 'claude-opus-5-5': HQ_SONNET },
+      '2026-08-01': { 'claude-opus-5-5': HQ_SONNET },
+    },
+  }
+  const days = recordFromLedger(l).days
+  expect(Object.keys(days).sort()).toEqual(['2026-10-09', '2026-10-11'])
+  const merged = days['2026-10-09']!['claude-code|claude-sonnet-5-5']!
+  expect(merged.ops).toBe(1)
+  expect(merged.uncached).toBe(600)
+  expect(merged.usageOps).toBe(2)
+  const later = days['2026-10-11']!['claude-code|claude-opus-5-5']!
+  expect([later.ops, later.done, later.uncached, later.costOps]).toEqual([0, 0, 500, 1])
+  expect(Math.abs(later.costEstimated - 0.25) < 1e-9).toBe(true)
+  // rebuilt twice, the same
+  expect(recordFromLedger(l)).toEqual(recordFromLedger(l))
+})
